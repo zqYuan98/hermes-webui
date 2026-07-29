@@ -5227,13 +5227,19 @@ let _notesSelectedSource = 'joplin';
 let _notesPreviewNote = null;
 let _notesSearchError = '';
 let _notesSearchLoading = false;
-let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'project_context' | 'external_notes'
+let _externalMemoryData = null;
+let _externalMemoryQuery = '';
+let _externalMemoryLoading = false;
+let _externalMemoryError = '';
+let _externalMemoryRequestSeq = 0;
+let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'external_memory' | 'project_context' | 'external_notes'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
 const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'user',   labelKey: 'user_profile', emptyKey: 'no_profile_yet', iconKey: 'user' },
   { key: 'soul',   labelKey: 'agent_soul', emptyKey: 'no_soul_yet', iconKey: 'sparkles' },
+  { key: 'external_memory', labelKey: 'external_memory_provider', emptyKey: 'external_memory_disabled', iconKey: 'plug', readOnly: true },
   { key: 'project_context', label: 'Project Context', empty: 'No project context file found for this workspace.', iconKey: 'file-text', readOnly: true },
   { key: 'external_notes', labelKey: 'external_notes_sources', emptyKey: 'external_notes_empty', iconKey: 'book-open' },
 ];
@@ -5364,9 +5370,132 @@ function _renderExternalNotesSources() {
   _setMemoryHeaderButtons('read');
 }
 
+async function loadExternalMemories(force, query) {
+  const requestSeq = ++_externalMemoryRequestSeq;
+  const status = (_memoryData && _memoryData.external_memory) || {};
+  if (!status.enabled || status.health !== 'online') {
+    _externalMemoryData = {memories: [], total: 0, query: ''};
+    _externalMemoryError = '';
+    _externalMemoryLoading = false;
+    return _externalMemoryData;
+  }
+  const nextQuery = typeof query === 'string' ? query.trim() : _externalMemoryQuery;
+  if (_externalMemoryData && !force && nextQuery === _externalMemoryQuery) return _externalMemoryData;
+  _externalMemoryQuery = nextQuery;
+  _externalMemoryLoading = true;
+  _externalMemoryError = '';
+  if (_currentMemorySection === 'external_memory') _renderExternalMemoryStatus();
+  try {
+    const suffix = nextQuery ? `?q=${encodeURIComponent(nextQuery)}&limit=20` : '?limit=20';
+    const data = await api(`/api/memory/external${suffix}`, {timeoutMs: 10000, timeoutToast: false});
+    if (requestSeq === _externalMemoryRequestSeq) _externalMemoryData = data;
+  } catch (e) {
+    if (requestSeq === _externalMemoryRequestSeq) {
+      _externalMemoryData = {memories: [], total: 0, query: nextQuery};
+      _externalMemoryError = t('external_memory_load_error');
+    }
+  } finally {
+    if (requestSeq === _externalMemoryRequestSeq) _externalMemoryLoading = false;
+  }
+  return _externalMemoryData;
+}
+
+async function searchExternalMemories() {
+  const input = $('externalMemoryQuery');
+  const query = input ? input.value.trim() : '';
+  await loadExternalMemories(true, query);
+  _renderExternalMemoryStatus();
+  const nextInput = $('externalMemoryQuery');
+  if (nextInput) { nextInput.value = query; nextInput.focus(); }
+}
+
+async function clearExternalMemorySearch() {
+  _externalMemoryQuery = '';
+  await loadExternalMemories(true, '');
+  _renderExternalMemoryStatus();
+}
+
+function _externalMemoryHealthMeta(status) {
+  if (status === 'online') return {label: t('external_memory_online'), className: 'ok'};
+  if (status === 'offline') return {label: t('external_memory_offline'), className: 'err'};
+  if (status === 'configured') return {label: t('source_configured'), className: 'active'};
+  return {label: t('external_memory_disabled'), className: ''};
+}
+
+function _renderExternalMemoryStatus() {
+  const title = $('memoryDetailTitle');
+  const body = $('memoryDetailBody');
+  const empty = $('memoryDetailEmpty');
+  if (!title || !body) return;
+  title.textContent = t('external_memory_provider');
+  const status = (_memoryData && _memoryData.external_memory) || {};
+  const health = _externalMemoryHealthMeta(status.health);
+  const rows = [
+    [t('external_memory_provider_name'), status.display_name || t('external_memory_builtin_only')],
+    [t('external_memory_status'), `<span class="detail-badge ${health.className}">${esc(health.label)}</span>`],
+  ];
+  if (status.enabled && status.mode) rows.push([t('external_memory_mode'), `<code>${esc(status.mode)}</code>`]);
+  if (status.enabled && status.llm_model) rows.push([t('external_memory_llm'), `<code>${esc(status.llm_model)}</code>`]);
+  if (status.enabled && status.embedder_model) {
+    const dims = status.embedding_dims ? ` · ${esc(String(status.embedding_dims))}D` : '';
+    rows.push([t('external_memory_embedding'), `<code>${esc(status.embedder_model)}</code>${dims}`]);
+  }
+  if (status.enabled && status.vector_store) rows.push([t('external_memory_store'), `<code>${esc(status.vector_store)}</code>`]);
+  const rowsHtml = rows.map(([label, value]) => `<div class="detail-row"><div class="detail-row-label">${esc(label)}</div><div class="detail-row-value">${value}</div></div>`).join('');
+  const hint = status.enabled ? t('external_memory_active_hint') : t('external_memory_disabled_hint');
+  const statusCard = `<section class="notes-source-card external-memory-status-card"><div class="notes-source-card-head"><strong>${li('plug',16)}${esc(status.display_name || t('external_memory_builtin_only'))}</strong><span class="detail-badge ${health.className}">${esc(health.label)}</span></div><div class="memory-detail-mtime">${esc(hint)}</div><div class="detail-rows">${rowsHtml}</div></section>`;
+
+  let library = '';
+  if (status.enabled && status.health === 'online') {
+    const data = _externalMemoryData || {memories: [], total: 0, query: _externalMemoryQuery};
+    const memories = Array.isArray(data.memories) ? data.memories : [];
+    const isSearch = !!_externalMemoryQuery;
+    const controls = `<section class="notes-source-card external-memory-library-card">
+      <div class="notes-source-card-head"><strong>${li('database',16)}${esc(t('external_memory_library'))}</strong><span class="detail-badge">${esc(t('external_memory_read_only'))}</span></div>
+      <div class="memory-detail-mtime">${esc(t('external_memory_recall_trace_hint'))}</div>
+      <form class="notes-search-form external-memory-search-form" onsubmit="event.preventDefault(); searchExternalMemories();">
+        <input id="externalMemoryQuery" type="search" maxlength="500" value="${esc(_externalMemoryQuery)}" placeholder="${esc(t('external_memory_search_placeholder'))}" aria-label="${esc(t('external_memory_search_placeholder'))}" />
+        <button type="submit" ${_externalMemoryLoading?'disabled':''}>${esc(_externalMemoryLoading ? t('loading') : t('search'))}</button>
+        ${isSearch ? `<button type="button" onclick="clearExternalMemorySearch()">${esc(t('external_memory_clear_search'))}</button>` : ''}
+      </form>
+      <div class="memory-detail-mtime">${esc(t('external_memory_search_hint'))}</div>
+      ${_externalMemoryError ? `<div class="detail-form-error">${esc(_externalMemoryError)}</div>` : ''}
+    </section>`;
+    let results = '';
+    if (_externalMemoryLoading && !_externalMemoryData) {
+      results = `<div class="memory-empty">${esc(t('loading'))}</div>`;
+    } else if (!memories.length) {
+      results = `<div class="memory-empty">${esc(isSearch ? t('external_memory_no_results') : t('external_memory_empty'))}</div>`;
+    } else {
+      const cards = memories.map(memory => {
+        const score = typeof memory.score === 'number' ? `<span class="detail-badge active">${esc(t('external_memory_score', Math.round(memory.score * 100) + '%'))}</span>` : '';
+        const layer = memory.layer ? `<span class="detail-badge">${esc(memory.layer)}</span>` : '';
+        const statusBadge = memory.status ? `<span class="detail-badge ${memory.status === 'active' ? 'ok' : ''}">${esc(memory.status)}</span>` : '';
+        const tags = Array.isArray(memory.tags) && memory.tags.length ? `<div class="external-memory-tags">${memory.tags.map(tag => `<span>${esc(tag)}</span>`).join('')}</div>` : '';
+        const timestamp = Number(memory.memory_at || memory.gmt_created || 0);
+        const meta = timestamp ? new Date(timestamp * 1000).toLocaleString() : '';
+        return `<article class="notes-source-card external-memory-item"><div class="notes-source-card-head"><div class="external-memory-badges">${layer}${statusBadge}${score}</div>${meta ? `<time>${esc(meta)}</time>` : ''}</div><div class="external-memory-content">${esc(memory.content || '')}</div>${tags}<div class="external-memory-id">${esc(memory.memory_id || '')}</div></article>`;
+      }).join('');
+      results = `<section class="external-memory-results"><div class="external-memory-results-head"><strong>${esc(t(isSearch ? 'external_memory_results' : 'external_memory_recent'))}</strong><span>${esc(t('external_memory_count', data.total || memories.length))}</span></div>${cards}</section>`;
+    }
+    library = `${controls}${results}`;
+  } else if (status.enabled) {
+    library = `<div class="memory-empty">${esc(t('external_memory_load_error'))}</div>`;
+  }
+  body.innerHTML = `<div class="main-view-content external-memory-view">${statusCard}${library}</div>`;
+  body.style.display = '';
+  if (empty) empty.style.display = 'none';
+  _memoryMode = 'read';
+  _setMemoryHeaderButtons('read');
+}
+
 function _renderMemoryDetail(section) {
   if (section === 'external_notes') {
     _renderExternalNotesSources();
+    return;
+  }
+  if (section === 'external_memory') {
+    _renderExternalMemoryStatus();
     return;
   }
 
@@ -5493,6 +5622,9 @@ async function openMemorySection(section, el) {
   if (el) el.classList.add('active');
   if (section === 'external_notes') {
     await loadNotesSources(false);
+  }
+  if (section === 'external_memory') {
+    await loadExternalMemories(false, _externalMemoryQuery);
   }
   _renderMemoryDetail(section);
   _closeMobileSidebarAfterPanelSelection();
@@ -7380,6 +7512,12 @@ async function deleteProfile(name) {
 // ── Memory panel ──
 async function loadMemory(force) {
   const panel = $('memoryPanel');
+  if (force) {
+    _externalMemoryRequestSeq++;
+    _externalMemoryData = null;
+    _externalMemoryError = '';
+    _externalMemoryLoading = false;
+  }
   try {
     const memoryUrl = S.session && S.session.session_id
       ? `/api/memory?session_id=${encodeURIComponent(S.session.session_id)}`
@@ -7392,6 +7530,9 @@ async function loadMemory(force) {
     if (_currentMemorySection === 'external_notes') {
       await loadNotesSources(!!force);
     }
+    if (_currentMemorySection === 'external_memory') {
+      await loadExternalMemories(!!force, _externalMemoryQuery);
+    }
     if (panel) {
       panel.innerHTML = '';
       for (const s of MEMORY_SECTIONS) {
@@ -7400,7 +7541,14 @@ async function loadMemory(force) {
         el.type = 'button';
         el.className = 'side-menu-item';
         if (_currentMemorySection === s.key) el.classList.add('active');
-        el.innerHTML = `${li(s.iconKey,16)}<span>${esc(_memorySectionLabel(s))}</span>`;
+        if (s.key === 'external_memory') el.classList.add('memory-provider-item');
+        let statusBadge = '';
+        if (s.key === 'external_memory' && _memoryData && _memoryData.external_memory) {
+          const externalStatus = _memoryData.external_memory;
+          const health = _externalMemoryHealthMeta(externalStatus.health);
+          statusBadge = `<span id="externalMemoryBadge" class="memory-provider-badge ${health.className}" title="${esc(health.label)}">${esc(externalStatus.display_name || t('external_memory_builtin_only'))}</span>`;
+        }
+        el.innerHTML = `${li(s.iconKey,16)}<span>${esc(_memorySectionLabel(s))}</span>${statusBadge}`;
         const sectionPath = _memorySectionPath(s.key);
         if (sectionPath) el.title = sectionPath;
         el.onclick = () => openMemorySection(s.key, el);

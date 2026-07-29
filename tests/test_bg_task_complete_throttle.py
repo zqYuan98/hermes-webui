@@ -171,6 +171,42 @@ def test_coalesced_bg_task_complete_payload_replace_uses_latest_payload(monkeypa
     assert canonical_payloads[-1]["summary"].endswith("latest completed (exit_code=0).")
 
 
+def test_process_completion_does_not_auto_wake_by_default(monkeypatch):
+    """A completion remains visible but cannot become an unsolicited user turn."""
+    bp, fake, emits, _clock, _timers = _install_emit_harness(monkeypatch)
+    calls: list[tuple[str, str, str]] = []
+
+    def _capture_wakeup(session_id, prompt, *, process_id=""):
+        calls.append((session_id, prompt, process_id))
+
+    monkeypatch.delenv("HERMES_WEBUI_PROCESS_AUTO_WAKE", raising=False)
+    monkeypatch.setattr(bp, "_start_server_side_wakeup_turn", _capture_wakeup)
+
+    _process_completion(bp, fake, "notification-only")
+
+    assert [payload["task_id"] for payload in _canonical_payloads(emits)] == [
+        "notification-only"
+    ]
+    assert calls == []
+
+
+def test_process_completion_auto_wake_requires_explicit_opt_in(monkeypatch):
+    bp, fake, _emits, _clock, _timers = _install_emit_harness(monkeypatch)
+    calls: list[tuple[str, str, str]] = []
+
+    def _capture_wakeup(session_id, prompt, *, process_id=""):
+        calls.append((session_id, prompt, process_id))
+
+    monkeypatch.setenv("HERMES_WEBUI_PROCESS_AUTO_WAKE", "1")
+    monkeypatch.setattr(bp, "_start_server_side_wakeup_turn", _capture_wakeup)
+
+    _process_completion(bp, fake, "explicit-opt-in")
+
+    assert len(calls) == 1
+    assert calls[0][0] == "sess-throttle"
+    assert calls[0][2] == "explicit-opt-in"
+
+
 def test_outside_window_arrival_flushes_immediately_even_with_pending_timer(monkeypatch):
     bp, fake, emits, clock, timers = _install_emit_harness(monkeypatch)
 

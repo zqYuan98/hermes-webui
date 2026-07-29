@@ -302,7 +302,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - **Chat** -- session list, search, pin, archive, projects, new conversation
 - **Tasks** -- view, create, edit, run, pause/resume, delete cron jobs; run history; completion alerts
 - **Skills** -- list all skills by category, search, preview, create/edit/delete; linked files viewer
-- **Memory** -- view and edit MEMORY.md and USER.md inline
+- **Memory** -- view and edit built-in memory files inline; when an external provider such as Hy-Memory is active, view its health/configuration plus a read-only recent-memory list and semantic search results
 - **Profiles** -- create, switch, delete agent profiles; clone config
 - **Todos** -- live task list from the current session
 - **Spaces** -- add, rename, remove workspaces; quick-switch from topbar

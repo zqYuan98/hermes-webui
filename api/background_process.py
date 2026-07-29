@@ -42,6 +42,7 @@ this module routes them to the same listener so the frontend's single
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -59,6 +60,23 @@ from api.process_event_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def process_auto_wake_enabled() -> bool:
+    """Return whether a completion may start a follow-up WebUI agent turn.
+
+    WebUI completion events are always delivered to their owning session as SSE
+    notifications. Replaying command output as a synthetic user message can
+    otherwise let an unrelated long-running task take over a conversation after
+    the user has moved on, so autonomous wakeups require explicit opt-in.
+    """
+    return os.getenv("HERMES_WEBUI_PROCESS_AUTO_WAKE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 _DRAIN_THREAD: Optional[threading.Thread] = None
 _DRAIN_STOP = threading.Event()
@@ -1244,7 +1262,7 @@ def _process_one(evt: dict) -> None:
     if process_id:
         _mark_registry_completion_consumed(process_id)
 
-    # ── Option Z (PRIMARY): server-side wakeup, NO browser round-trip ──────
+    # ── Optional server-side wakeup, NO browser round-trip ─────────────────
     # The SSE emit above is now demoted to a pure live-view layer (an open tab
     # streams the turn live via the per-session SSE channel). The ACTUAL agent
     # wakeup is started HERE, server-side, so a CLOSED tab still gets the turn
@@ -1265,6 +1283,18 @@ def _process_one(evt: dict) -> None:
     # Idempotency is already guaranteed above: BG_TASK_COMPLETE_EVENTS_SEEN +
     # the registry _completion_consumed marker mean this process_id reached
     # here at most once, so the wakeup turn starts at most once.
+    if not process_auto_wake_enabled():
+        # The marker only exists to coordinate automatic wakeup delivery. Do
+        # not retain it when the completion is notification-only, otherwise the
+        # per-session dedup state is needlessly kept alive by the reaper.
+        _cfg.PENDING_BG_TASK_COMPLETIONS.discard(session_id)
+        logger.debug(
+            "process completion delivered as notification only for session %s; "
+            "set HERMES_WEBUI_PROCESS_AUTO_WAKE=1 to enable agent wakeup",
+            session_id,
+        )
+        return
+
     try:
         # ``wakeup_prompt`` is server-internal state used only by the
         # Option Z server-side wakeup; it was previously surfaced on the

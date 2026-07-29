@@ -13,6 +13,7 @@ import gzip
 import json
 from api.sse_chunked import end_sse_headers
 import logging
+import math
 import os
 import queue
 import re
@@ -13640,6 +13641,8 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, data)
 
     # ── Memory API (GET) ──
+    if parsed.path == "/api/memory/external":
+        return _handle_external_memory_read(handler, parsed)
     if parsed.path == "/api/memory":
         return _handle_memory_read(handler, parsed)
 
@@ -20568,6 +20571,320 @@ def _read_active_project_context(workspace: Path | None) -> dict:
     return payload
 
 
+_EXTERNAL_MEMORY_SAFE_ENV_KEYS = {
+    "HY_MEMORY_MODE",
+    "HY_MEMORY_SERVER_URL",
+    "HY_MEMORY_USER_ID",
+    "HY_MEMORY_AGENT_ID",
+    "HY_MEMORY_BUILTIN_POINTER",
+    "MEMORY_LLM_MODEL",
+    "MEMORY_EMBEDDER_MODEL",
+    "MEMORY_EMBEDDING_DIMS",
+    "MEMORY_VECTOR_STORE",
+}
+
+_EXTERNAL_MEMORY_UNAVAILABLE = "External memory is temporarily unavailable."
+_EXTERNAL_MEMORY_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_EXTERNAL_MEMORY_MAX_CONTENT_CHARS = 8000
+_EXTERNAL_MEMORY_MAX_TAGS = 12
+_EXTERNAL_MEMORY_MAX_TAG_CHARS = 80
+
+
+def _read_external_memory_safe_env(home: Path) -> dict[str, str]:
+    """Read only display-safe memory settings; never return credentials."""
+    values: dict[str, str] = {}
+    env_path = home / ".env"
+    if not env_path.exists():
+        return values
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key not in _EXTERNAL_MEMORY_SAFE_ENV_KEYS:
+                continue
+            values[key] = value.strip().strip('"').strip("'")
+    except OSError:
+        logger.debug("Could not read external-memory display settings", exc_info=True)
+    return values
+
+
+def _external_memory_agent_ids(home: Path, safe_env: dict[str, str]) -> list[str]:
+    """Return primary + validated active built-in mirror agent IDs."""
+    import re as _re
+
+    primary = safe_env.get("HY_MEMORY_AGENT_ID", "hermes").strip() or "hermes"
+    agent_ids = [primary]
+    pointer_value = safe_env.get("HY_MEMORY_BUILTIN_POINTER", "").strip()
+    pointer = Path(pointer_value).expanduser() if pointer_value else home / "hy-memory-builtin-active.json"
+    try:
+        resolved_home = home.resolve()
+        resolved_pointer = pointer.resolve()
+        if resolved_pointer.parent != resolved_home:
+            return agent_ids
+        data = json.loads(resolved_pointer.read_text(encoding="utf-8"))
+        builtin = str(data.get("agent_id") or "").strip() if isinstance(data, dict) else ""
+    except (OSError, ValueError, json.JSONDecodeError):
+        return agent_ids
+    if _re.fullmatch(rf"{_re.escape(primary)}-builtin-[0-9a-f]{{12}}", builtin):
+        agent_ids.append(builtin)
+    return agent_ids
+
+
+def _loopback_hy_memory_target(server_url: str) -> tuple[str, int, str] | None:
+    """Resolve an HTTP loopback target without accepting credentials or fragments."""
+    try:
+        parsed = urlsplit(server_url or "http://127.0.0.1:19527")
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        return parsed.hostname, parsed.port or 19527, parsed.path.rstrip("/")
+    except ValueError:
+        return None
+
+
+def _probe_hy_memory_health(server_url: str) -> bool:
+    """Probe a loopback Hy-Memory sidecar without allowing an SSRF target."""
+    target = _loopback_hy_memory_target(server_url)
+    if not target:
+        return False
+    host, port, base_path = target
+    try:
+        conn = http.client.HTTPConnection(host, port, timeout=0.6)
+        conn.request("GET", f"{base_path}/health" or "/health")
+        response = conn.getresponse()
+        response.read(4096)
+        conn.close()
+        return 200 <= response.status < 300
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+def _hy_memory_post(server_url: str, path: str, payload: dict) -> dict:
+    """Send a bounded JSON request to an approved loopback Hy-Memory sidecar."""
+    target = _loopback_hy_memory_target(server_url)
+    if not target:
+        raise ValueError("invalid Hy-Memory target")
+    host, port, base_path = target
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    conn = http.client.HTTPConnection(host, port, timeout=5.0)
+    try:
+        conn.request(
+            "POST",
+            f"{base_path}{path}",
+            body=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        response = conn.getresponse()
+        raw = response.read(_EXTERNAL_MEMORY_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > _EXTERNAL_MEMORY_MAX_RESPONSE_BYTES:
+            raise ValueError("Hy-Memory response too large")
+        if not 200 <= response.status < 300:
+            raise OSError("Hy-Memory request failed")
+        parsed = json.loads(raw.decode("utf-8")) if raw else {}
+        if not isinstance(parsed, dict):
+            raise ValueError("invalid Hy-Memory response")
+        return parsed
+    finally:
+        conn.close()
+
+
+def _safe_external_memory_item(raw: object) -> dict | None:
+    """Reduce a sidecar memory object to the fields safe for browser display."""
+    if not isinstance(raw, dict):
+        return None
+    memory_id = str(raw.get("memory_id") or "").strip()[:160]
+    content = str(raw.get("content") or "").strip()[:_EXTERNAL_MEMORY_MAX_CONTENT_CHARS]
+    if not memory_id or not content:
+        return None
+    item: dict = {"memory_id": memory_id, "content": content}
+    for key in ("layer", "status"):
+        value = str(raw.get(key) or "").strip()[:80]
+        if value:
+            item[key] = value
+    score = raw.get("score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool) and math.isfinite(float(score)):
+        item["score"] = round(float(score), 6)
+    tags = raw.get("tags")
+    if isinstance(tags, list):
+        safe_tags = []
+        for tag in tags[:_EXTERNAL_MEMORY_MAX_TAGS]:
+            value = str(tag or "").strip()[:_EXTERNAL_MEMORY_MAX_TAG_CHARS]
+            if value:
+                safe_tags.append(value)
+        if safe_tags:
+            item["tags"] = safe_tags
+    for key in ("memory_at", "gmt_created"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+            item[key] = value
+    return item
+
+
+def _normalize_external_memories(payload: dict, *, search: bool) -> tuple[list[dict], int]:
+    raw_memories: list = []
+    total = 0
+    if search:
+        groups = payload.get("memories")
+        if isinstance(groups, dict):
+            for key in ("profile", "proactive", "normal"):
+                values = groups.get(key)
+                if isinstance(values, list):
+                    raw_memories.extend(values)
+    else:
+        vdb = payload.get("vdb")
+        if isinstance(vdb, dict):
+            values = vdb.get("memories")
+            if isinstance(values, list):
+                raw_memories = values
+            if isinstance(vdb.get("total"), int):
+                total = max(vdb["total"], 0)
+    normalized = []
+    seen = set()
+    for raw in raw_memories:
+        item = _safe_external_memory_item(raw)
+        if not item or item["memory_id"] in seen:
+            continue
+        seen.add(item["memory_id"])
+        normalized.append(item)
+    return normalized, (len(normalized) if search else max(total, len(normalized)))
+
+
+def _external_memory_status(home: Path) -> dict:
+    provider = ""
+    try:
+        import yaml as _yaml
+
+        config_path = home / "config.yaml"
+        config = _yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+        memory_cfg = config.get("memory", {}) if isinstance(config, dict) else {}
+        if isinstance(memory_cfg, dict):
+            provider = str(memory_cfg.get("provider") or "").strip()
+    except Exception:
+        logger.debug("Could not read external-memory provider config", exc_info=True)
+
+    safe_env = _read_external_memory_safe_env(home)
+    enabled = bool(provider)
+    health = "configured" if enabled else "disabled"
+    if provider == "hy-memory":
+        server_url = safe_env.get("HY_MEMORY_SERVER_URL", "http://127.0.0.1:19527")
+        health = "online" if _probe_hy_memory_health(server_url) else "offline"
+
+    display_name = "Built-in only" if not provider else (
+        "Hy-Memory" if provider == "hy-memory" else provider.replace("-", " ").title()
+    )
+    try:
+        embedding_dims = int(safe_env["MEMORY_EMBEDDING_DIMS"]) if safe_env.get("MEMORY_EMBEDDING_DIMS") else None
+    except ValueError:
+        embedding_dims = None
+    return {
+        "provider": provider,
+        "display_name": display_name,
+        "enabled": enabled,
+        "health": health,
+        "mode": safe_env.get("HY_MEMORY_MODE", "") if provider == "hy-memory" else "",
+        "llm_model": safe_env.get("MEMORY_LLM_MODEL", "") if provider == "hy-memory" else "",
+        "embedder_model": safe_env.get("MEMORY_EMBEDDER_MODEL", "") if provider == "hy-memory" else "",
+        "embedding_dims": embedding_dims if provider == "hy-memory" else None,
+        "vector_store": safe_env.get("MEMORY_VECTOR_STORE", "") if provider == "hy-memory" else "",
+    }
+
+
+def _handle_external_memory_read(handler, parsed=None):
+    """Return a safe, read-only Hy-Memory list or semantic-search result."""
+    from api.profiles import get_active_hermes_home
+
+    home = get_active_hermes_home()
+    status = _external_memory_status(home)
+    if status.get("provider") != "hy-memory" or not status.get("enabled"):
+        return j(handler, {"error": "External memory is not available."}, status=409)
+
+    safe_env = _read_external_memory_safe_env(home)
+    server_url = safe_env.get("HY_MEMORY_SERVER_URL", "http://127.0.0.1:19527")
+    if not _loopback_hy_memory_target(server_url):
+        return j(handler, {"error": _EXTERNAL_MEMORY_UNAVAILABLE}, status=503)
+    user_id = safe_env.get("HY_MEMORY_USER_ID", "").strip()
+    agent_ids = _external_memory_agent_ids(home, safe_env)
+    if not user_id:
+        return j(handler, {"error": _EXTERNAL_MEMORY_UNAVAILABLE}, status=503)
+
+    query_params = parse_qs(getattr(parsed, "query", "") or "")
+    query = str((query_params.get("q") or [""])[0] or "").strip()
+    if len(query) > 500:
+        return j(handler, {"error": "Search query is too long."}, status=400)
+    try:
+        limit = int((query_params.get("limit") or ["20"])[0])
+    except (TypeError, ValueError):
+        limit = 20
+    limit = min(max(limit, 1), 100)
+
+    search = bool(query)
+    try:
+        if search:
+            result = _hy_memory_post(
+                server_url,
+                "/api/v1/search",
+                {
+                    "query": query,
+                    "user_ids": [user_id],
+                    "agent_ids": agent_ids,
+                    "limit": limit,
+                },
+            )
+            memories, total = _normalize_external_memories(result, search=True)
+            elapsed_values = [result.get("elapsed_ms")]
+        else:
+            memories = []
+            total = 0
+            elapsed_values = []
+            seen_ids = set()
+            for agent_id in agent_ids:
+                result = _hy_memory_post(
+                    server_url,
+                    "/api/v1/list",
+                    {"user_id": user_id, "agent_id": agent_id, "limit": limit},
+                )
+                namespace_memories, namespace_total = _normalize_external_memories(
+                    result, search=False
+                )
+                total += namespace_total
+                elapsed_values.append(result.get("elapsed_ms"))
+                for item in namespace_memories:
+                    if item["memory_id"] in seen_ids:
+                        continue
+                    seen_ids.add(item["memory_id"])
+                    memories.append(item)
+            memories = memories[:limit]
+    except Exception:
+        logger.warning("External memory read failed", exc_info=False)
+        return j(handler, {"error": _EXTERNAL_MEMORY_UNAVAILABLE}, status=503)
+
+    payload = {
+        "provider": "hy-memory",
+        "query": query,
+        "memories": memories,
+        "total": total,
+    }
+    finite_elapsed = [
+        float(value)
+        for value in elapsed_values
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    ]
+    if finite_elapsed:
+        payload["elapsed_ms"] = round(sum(finite_elapsed), 3)
+    return j(handler, payload)
+
+
 def _handle_memory_read(handler, parsed=None):
     try:
         from api.profiles import get_active_hermes_home
@@ -20614,6 +20931,7 @@ def _handle_memory_read(handler, parsed=None):
             "soul_mtime": soul_file.stat().st_mtime if soul_file.exists() else None,
             "project_context_mtime": project_context["mtime"],
             "project_context_shadowed": project_context["shadowed"],
+            "external_memory": _external_memory_status(home),
             "external_notes_enabled": _external_notes_sources_enabled(),
         },
     )
