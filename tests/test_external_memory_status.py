@@ -1,4 +1,6 @@
 import json
+import re
+import subprocess
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -158,6 +160,7 @@ def test_external_memory_list_normalizes_safe_fields_and_drops_internal_data(tmp
             "content": "A durable fact",
             "layer": "l2_fact",
             "status": "active",
+            "category": "normal",
             "tags": ["one", "two"],
             "memory_at": 123,
             "gmt_created": 124,
@@ -191,6 +194,7 @@ def test_external_memory_search_merges_layers_deduplicates_and_keeps_score(tmp_p
     )
 
     assert [item["memory_id"] for item in payload["memories"]] == ["same", "pro", "normal"]
+    assert [item["category"] for item in payload["memories"]] == ["profile", "proactive", "normal"]
     assert payload["memories"][0]["score"] == 0.91
     assert payload["query"] == "what matters"
     assert calls[0][1:] == ("/api/v1/search", {
@@ -317,3 +321,112 @@ def test_memory_panel_declares_external_memory_list_and_semantic_search_ui():
     assert "external_memory_recall_trace_hint" in panels
     assert "_externalMemoryRequestSeq" in panels
     assert "if (force)" in panels
+
+
+def test_external_memory_card_actions_use_safe_dataset_attributes():
+    panels = (routes.Path(__file__).parent.parent / "static" / "panels.js").read_text(encoding="utf-8")
+
+    assert "data-memory-content=" in panels
+    assert "data-memory-id=" in panels
+    assert "copyExternalMemoryText(this.closest('.external-memory-item').dataset.memoryContent)" in panels
+    assert "quoteExternalMemoryInChat(this.closest('.external-memory-item').dataset.memoryContent)" in panels
+    assert "onclick=\"copyExternalMemoryText(${JSON.stringify" not in panels
+    assert "onclick=\"quoteExternalMemoryInChat(${JSON.stringify" not in panels
+
+
+def test_external_memory_frontend_defaults_legacy_items_to_normal_category():
+    panels = (routes.Path(__file__).parent.parent / "static" / "panels.js").read_text(encoding="utf-8")
+
+    assert "const memoryCategory = memory =>" in panels
+    assert "allMemories.filter(m => memoryCategory(m) === 'normal').length" in panels
+    assert "allMemories.filter(m => memoryCategory(m) === currentFilter)" in panels
+
+
+def test_external_memory_quote_targets_real_composer_and_existing_ui_helpers():
+    panels = (routes.Path(__file__).parent.parent / "static" / "panels.js").read_text(encoding="utf-8")
+
+    assert "$('msg')" in panels
+    assert "switchPanel('chat')" in panels
+    assert "showToast(t('external_memory_inserted')" in panels
+    assert "dispatchEvent(new Event('input',{bubbles:true}))" in panels
+    assert "openPanel('chat')" not in panels
+    assert "toast(t('external_memory_inserted'))" not in panels
+
+
+def test_external_memory_quote_appends_to_composer_and_dispatches_input():
+    panels = (routes.Path(__file__).parent.parent / "static" / "panels.js").read_text(encoding="utf-8")
+    match = re.search(
+        r"function quoteExternalMemoryInChat\(content\) \{.*?\n\}\n\nasync function filterExternalMemoryByTag",
+        panels,
+        re.S,
+    )
+    assert match, "quoteExternalMemoryInChat function must remain extractable"
+    function_source = match.group(0).rsplit("\n\nasync function", 1)[0]
+    harness = f"""
+const input = {{
+  value: 'existing draft',
+  focused: false,
+  selection: null,
+  events: [],
+  focus() {{ this.focused = true; }},
+  setSelectionRange(start, end) {{ this.selection = [start, end]; }},
+  dispatchEvent(event) {{ this.events.push({{type:event.type, bubbles:event.bubbles}}); }}
+}};
+let panel = '';
+let resized = 0;
+const toasts = [];
+global.$ = id => id === 'msg' ? input : null;
+global.switchPanel = name => {{ panel = name; }};
+global.Event = class {{ constructor(type, options) {{ this.type = type; this.bubbles = !!options.bubbles; }} }};
+global.autoResize = () => {{ resized += 1; }};
+global.t = key => key;
+global.showToast = (...args) => toasts.push(args);
+{function_source}
+quoteExternalMemoryInChat('first line\\nsecond line');
+console.log(JSON.stringify({{input, panel, resized, toasts}}));
+"""
+    result = subprocess.run(
+        ["node", "-e", harness],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["panel"] == "chat"
+    assert state["input"]["value"] == (
+        "existing draft\n\n> [Memory]\n> first line\n> second line\n\n"
+    )
+    assert state["input"]["focused"] is True
+    assert state["input"]["events"] == [{"type": "input", "bubbles": True}]
+    assert state["resized"] == 1
+    assert state["toasts"] == [["external_memory_inserted", 1800, "success"]]
+
+
+def test_external_memory_interactions_and_visual_tokens_are_localized():
+    repo = routes.Path(__file__).parent.parent
+    panels = (repo / "static" / "panels.js").read_text(encoding="utf-8")
+    i18n = (repo / "static" / "i18n.js").read_text(encoding="utf-8")
+    css = (repo / "static" / "style.css").read_text(encoding="utf-8")
+
+    for key in (
+        "external_memory_filter_all",
+        "external_memory_filter_profile",
+        "external_memory_filter_proactive",
+        "external_memory_filter_normal",
+        "external_memory_copy_content",
+        "external_memory_copy_id",
+        "external_memory_send_to_chat",
+        "external_memory_copied",
+        "external_memory_inserted",
+    ):
+        assert i18n.count(f"{key}:") >= 2
+
+    assert "setExternalMemoryLayerFilter" in panels
+    assert "filterExternalMemoryByTag" in panels
+    assert "external_memory_copy_id" in panels
+    assert "layer-${category}" in panels
+    assert ".external-memory-filter-bar" in css
+    assert ".external-memory-actions" in css
+    assert ".status-pulse-dot" in css
+    assert "@media(prefers-reduced-motion:reduce)" in css

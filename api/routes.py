@@ -20730,7 +20730,7 @@ def _safe_external_memory_item(raw: object) -> dict | None:
 
 
 def _normalize_external_memories(payload: dict, *, search: bool) -> tuple[list[dict], int]:
-    raw_memories: list = []
+    raw_memories: list[tuple[object, str]] = []
     total = 0
     if search:
         groups = payload.get("memories")
@@ -20738,21 +20738,26 @@ def _normalize_external_memories(payload: dict, *, search: bool) -> tuple[list[d
             for key in ("profile", "proactive", "normal"):
                 values = groups.get(key)
                 if isinstance(values, list):
-                    raw_memories.extend(values)
+                    raw_memories.extend((value, key) for value in values)
     else:
         vdb = payload.get("vdb")
         if isinstance(vdb, dict):
             values = vdb.get("memories")
             if isinstance(values, list):
-                raw_memories = values
+                raw_memories = [(value, "") for value in values]
             if isinstance(vdb.get("total"), int):
                 total = max(vdb["total"], 0)
     normalized = []
     seen = set()
-    for raw in raw_memories:
+    for raw, category in raw_memories:
         item = _safe_external_memory_item(raw)
         if not item or item["memory_id"] in seen:
             continue
+        if category:
+            item["category"] = category
+        else:
+            layer = str(item.get("layer") or "").lower()
+            item["category"] = layer if layer in {"profile", "proactive", "normal"} else "normal"
         seen.add(item["memory_id"])
         normalized.append(item)
     return normalized, (len(normalized) if search else max(total, len(normalized)))
