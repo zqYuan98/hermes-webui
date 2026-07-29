@@ -1,0 +1,11 @@
+{
+  "extensions": [
+    {
+      "id": "hermes-hub",
+      "name": "Hermes Hub",
+      "enabled": true,
+      "stylesheets": ["hub/hub.css"],
+      "scripts": ["hub/hub-store.js", "hub/hub.js"]
+    }
+  ]
+}
