@@ -403,6 +403,81 @@ console.log(JSON.stringify({{input, panel, resized, toasts}}));
     assert state["toasts"] == [["external_memory_inserted", 1800, "success"]]
 
 
+def test_external_memory_async_results_do_not_overwrite_newer_input_or_search_state():
+    panels = (routes.Path(__file__).parent.parent / "static" / "panels.js").read_text(encoding="utf-8")
+    match = re.search(
+        r"async function loadExternalMemories\(force, query\) \{.*?\n\}\n\nfunction _externalMemoryHealthMeta",
+        panels,
+        re.S,
+    )
+    assert match, "external memory async functions must remain extractable"
+    function_source = match.group(0).rsplit("\n\nfunction _externalMemoryHealthMeta", 1)[0]
+    harness = f"""
+let _externalMemoryData = {{memories:Array.from({{length:20}},(_,i)=>({{memory_id:'old-'+i}})),total:78,query:''}};
+let _externalMemoryQuery = '';
+let _externalMemoryLoading = false;
+let _externalMemoryError = '';
+let _externalMemoryRequestSeq = 0;
+let _externalMemoryLimit = 20;
+let _externalMemorySearchTimer = null;
+let _externalMemoryLoadingMore = false;
+let _externalMemoryExhausted = false;
+let _currentMemorySection = 'external_memory';
+const _memoryData = {{external_memory:{{enabled:true,health:'online'}}}};
+const input = {{value:'',focused:false,focus(){{this.focused=true;}}}};
+let renders = 0;
+const pending = [];
+global.$ = id => id === 'externalMemoryQuery' ? input : null;
+global.t = key => key;
+global._renderExternalMemoryStatus = () => {{ renders += 1; }};
+global.api = url => new Promise(resolve => pending.push({{url,resolve}}));
+{function_source}
+(async()=>{{
+  const oldSearch = searchExternalMemories('old');
+  input.value = 'new';
+  pending[0].resolve({{memories:[{{memory_id:'old-result'}}],total:1,query:'old'}});
+  await oldSearch;
+  const staleInputState = {{value:input.value,focused:input.focused,renders,data:_externalMemoryData.query}};
+
+  input.value = '';
+  _externalMemoryQuery = '';
+  _externalMemoryData = {{memories:Array.from({{length:20}},(_,i)=>({{memory_id:'base-'+i}})),total:78,query:''}};
+  _externalMemoryLimit = 20;
+  _externalMemoryExhausted = false;
+  const more = loadMoreExternalMemories();
+  const newer = searchExternalMemories('new');
+  pending[2].resolve({{memories:[{{memory_id:'new-result'}}],total:1,query:'new'}});
+  await newer;
+  pending[1].resolve({{memories:Array.from({{length:40}},(_,i)=>({{memory_id:'stale-more-'+i}})),total:78,query:''}});
+  await more;
+  console.log(JSON.stringify({{
+    staleInputState,
+    final:{{query:_externalMemoryQuery,data:_externalMemoryData.query,first:_externalMemoryData.memories[0].memory_id,limit:_externalMemoryLimit,loadingMore:_externalMemoryLoadingMore,exhausted:_externalMemoryExhausted,input:input.value}}
+  }}));
+}})().catch(error=>{{console.error(error);process.exit(1);}});
+"""
+    result = subprocess.run(
+        ["node", "-e", harness],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    state = json.loads(result.stdout)
+    assert state["staleInputState"]["value"] == "new"
+    assert state["staleInputState"]["focused"] is False
+    assert state["staleInputState"]["renders"] == 1
+    assert state["final"] == {
+        "query": "new",
+        "data": "new",
+        "first": "new-result",
+        "limit": 20,
+        "loadingMore": False,
+        "exhausted": False,
+        "input": "new",
+    }
+
+
 def test_external_memory_interactions_and_visual_tokens_are_localized():
     repo = routes.Path(__file__).parent.parent
     panels = (repo / "static" / "panels.js").read_text(encoding="utf-8")
@@ -419,6 +494,12 @@ def test_external_memory_interactions_and_visual_tokens_are_localized():
         "external_memory_send_to_chat",
         "external_memory_copied",
         "external_memory_inserted",
+        "external_memory_expand",
+        "external_memory_collapse",
+        "external_memory_load_more",
+        "external_memory_loading_more",
+        "external_memory_showing_count",
+        "external_memory_provider_details",
     ):
         assert i18n.count(f"{key}:") >= 2
 
@@ -430,3 +511,41 @@ def test_external_memory_interactions_and_visual_tokens_are_localized():
     assert ".external-memory-actions" in css
     assert ".status-pulse-dot" in css
     assert "@media(prefers-reduced-motion:reduce)" in css
+
+
+def test_external_memory_supports_debounced_search_progressive_loading_and_collapsible_content():
+    repo = routes.Path(__file__).parent.parent
+    panels = (repo / "static" / "panels.js").read_text(encoding="utf-8")
+    css = (repo / "static" / "style.css").read_text(encoding="utf-8")
+
+    assert "let _externalMemoryLimit = 20" in panels
+    assert "let _externalMemorySearchTimer = null" in panels
+    assert "function scheduleExternalMemorySearch(" in panels
+    assert "setTimeout" in panels and "400" in panels
+    assert "function loadMoreExternalMemories(" in panels
+    assert "Math.min(_externalMemoryLimit + 20, 100)" in panels
+    assert "limit=${_externalMemoryLimit}" in panels
+    assert "function toggleExternalMemoryContent(" in panels
+    assert "toggleAttribute('aria-expanded'" not in panels
+    assert "setAttribute('aria-expanded'" in panels
+    assert "<details class=\"notes-source-card external-memory-status-card\"" in panels
+    assert ".external-memory-content.is-collapsible" in css
+    assert ".external-memory-load-more" in css
+    assert "<section class=\"external-memory-results\"><div class=\"memory-empty\"" in panels
+    assert "${loadMore}</section>" in panels
+    assert "isSearch || currentFilter !== 'all'" in panels
+    assert "currentInput.value.trim() !== query" in panels
+    assert "const latestInput = $('externalMemoryQuery');" in panels
+    assert "inputQuery !== query" in panels
+    assert "if (input) input.value = '';" in panels
+
+
+def test_external_memory_new_search_resets_progressive_limit():
+    panels = (routes.Path(__file__).parent.parent / "static" / "panels.js").read_text(encoding="utf-8")
+
+    assert "_externalMemoryLimit = 20;" in panels
+    assert "async function searchExternalMemories(queryOverride" in panels
+    assert "const queryChanged = query !== _externalMemoryQuery" in panels
+    assert "if (queryChanged) {" in panels
+    assert "_externalMemoryLimit = 20;" in panels
+    assert "_externalMemoryExhausted = false;" in panels

@@ -5233,10 +5233,33 @@ let _externalMemoryLoading = false;
 let _externalMemoryError = '';
 let _externalMemoryRequestSeq = 0;
 let _externalMemoryLayerFilter = 'all';
+let _externalMemoryLimit = 20;
+let _externalMemorySearchTimer = null;
+let _externalMemoryLoadingMore = false;
+let _externalMemoryExhausted = false;
 
 function setExternalMemoryLayerFilter(layer) {
   _externalMemoryLayerFilter = layer || 'all';
   _renderExternalMemoryStatus();
+}
+
+function toggleExternalMemoryContent(button) {
+  const item = button && button.closest('.external-memory-item');
+  const content = item && item.querySelector('.external-memory-content');
+  if (!content) return;
+  const expanded = !content.classList.contains('expanded');
+  content.classList.toggle('expanded', expanded);
+  button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+  const label = button.querySelector('span');
+  if (label) label.textContent = t(expanded ? 'external_memory_collapse' : 'external_memory_expand');
+}
+
+function scheduleExternalMemorySearch(value) {
+  if (_externalMemorySearchTimer) clearTimeout(_externalMemorySearchTimer);
+  _externalMemorySearchTimer = setTimeout(() => {
+    _externalMemorySearchTimer = null;
+    searchExternalMemories(value);
+  }, 400);
 }
 
 function copyExternalMemoryText(text) {
@@ -5271,9 +5294,7 @@ function quoteExternalMemoryInChat(content) {
 async function filterExternalMemoryByTag(tag) {
   if (!tag) return;
   _externalMemoryLayerFilter = 'all';
-  _externalMemoryQuery = tag;
-  await loadExternalMemories(true, tag);
-  _renderExternalMemoryStatus();
+  await searchExternalMemories(tag);
 }
 let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'external_memory' | 'project_context' | 'external_notes'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
@@ -5429,7 +5450,7 @@ async function loadExternalMemories(force, query) {
   _externalMemoryError = '';
   if (_currentMemorySection === 'external_memory') _renderExternalMemoryStatus();
   try {
-    const suffix = nextQuery ? `?q=${encodeURIComponent(nextQuery)}&limit=20` : '?limit=20';
+    const suffix = nextQuery ? `?q=${encodeURIComponent(nextQuery)}&limit=${_externalMemoryLimit}` : `?limit=${_externalMemoryLimit}`;
     const data = await api(`/api/memory/external${suffix}`, {timeoutMs: 10000, timeoutToast: false});
     if (requestSeq === _externalMemoryRequestSeq) _externalMemoryData = data;
   } catch (e) {
@@ -5443,18 +5464,82 @@ async function loadExternalMemories(force, query) {
   return _externalMemoryData;
 }
 
-async function searchExternalMemories() {
+async function searchExternalMemories(queryOverride) {
+  if (_externalMemorySearchTimer) {
+    clearTimeout(_externalMemorySearchTimer);
+    _externalMemorySearchTimer = null;
+  }
   const input = $('externalMemoryQuery');
-  const query = input ? input.value.trim() : '';
-  await loadExternalMemories(true, query);
+  const hasQueryOverride = typeof queryOverride === 'string';
+  const query = hasQueryOverride
+    ? queryOverride.trim()
+    : (input ? input.value.trim() : '');
+  if (hasQueryOverride && input) input.value = query;
+  const queryChanged = query !== _externalMemoryQuery;
+  if (queryChanged) {
+    _externalMemoryLimit = 20;
+    _externalMemoryExhausted = false;
+    _externalMemoryLoadingMore = false;
+  }
+  const request = loadExternalMemories(true, query);
+  const requestSeq = _externalMemoryRequestSeq;
+  await request;
+  const currentInput = $('externalMemoryQuery');
+  const inputQuery = currentInput ? currentInput.value.trim() : query;
+  if (requestSeq !== _externalMemoryRequestSeq || query !== _externalMemoryQuery || inputQuery !== query) return;
   _renderExternalMemoryStatus();
   const nextInput = $('externalMemoryQuery');
   if (nextInput) { nextInput.value = query; nextInput.focus(); }
 }
 
 async function clearExternalMemorySearch() {
+  if (_externalMemorySearchTimer) {
+    clearTimeout(_externalMemorySearchTimer);
+    _externalMemorySearchTimer = null;
+  }
+  const input = $('externalMemoryQuery');
+  if (input) input.value = '';
   _externalMemoryQuery = '';
-  await loadExternalMemories(true, '');
+  _externalMemoryLimit = 20;
+  _externalMemoryExhausted = false;
+  _externalMemoryLoadingMore = false;
+  const request = loadExternalMemories(true, '');
+  const requestSeq = _externalMemoryRequestSeq;
+  await request;
+  const currentInput = $('externalMemoryQuery');
+  const inputQuery = currentInput ? currentInput.value.trim() : '';
+  if (requestSeq !== _externalMemoryRequestSeq || _externalMemoryQuery !== '' || inputQuery !== '') return;
+  _renderExternalMemoryStatus();
+}
+
+async function loadMoreExternalMemories() {
+  if (_externalMemoryLoading || _externalMemoryLoadingMore || _externalMemoryLimit >= 100) return;
+  const query = _externalMemoryQuery;
+  const currentInput = $('externalMemoryQuery');
+  if (currentInput && currentInput.value.trim() !== query) return;
+  const previousLimit = _externalMemoryLimit;
+  const previousData = _externalMemoryData;
+  const previousCount = previousData && Array.isArray(previousData.memories) ? previousData.memories.length : 0;
+  _externalMemoryLimit = Math.min(_externalMemoryLimit + 20, 100);
+  _externalMemoryLoadingMore = true;
+  _renderExternalMemoryStatus();
+  const request = loadExternalMemories(true, query);
+  const requestSeq = _externalMemoryRequestSeq;
+  await request;
+  const latestInput = $('externalMemoryQuery');
+  const inputQuery = latestInput ? latestInput.value.trim() : query;
+  if (requestSeq !== _externalMemoryRequestSeq || query !== _externalMemoryQuery || inputQuery !== query) {
+    if (query === _externalMemoryQuery) _externalMemoryLoadingMore = false;
+    return;
+  }
+  if (_externalMemoryError && previousData) {
+    _externalMemoryData = previousData;
+    _externalMemoryLimit = previousLimit;
+  } else {
+    const nextCount = _externalMemoryData && Array.isArray(_externalMemoryData.memories) ? _externalMemoryData.memories.length : 0;
+    _externalMemoryExhausted = nextCount <= previousCount;
+  }
+  _externalMemoryLoadingMore = false;
   _renderExternalMemoryStatus();
 }
 
@@ -5474,10 +5559,7 @@ function _renderExternalMemoryStatus() {
   const status = (_memoryData && _memoryData.external_memory) || {};
   const health = _externalMemoryHealthMeta(status.health);
   const pulse = status.health === 'online' ? '<span class="status-pulse-dot"></span>' : '';
-  const rows = [
-    [t('external_memory_provider_name'), status.display_name || t('external_memory_builtin_only')],
-    [t('external_memory_status'), `<span class="detail-badge ${health.className}">${pulse}${esc(health.label)}</span>`],
-  ];
+  const rows = [];
   if (status.enabled && status.mode) rows.push([t('external_memory_mode'), `<code>${esc(status.mode)}</code>`]);
   if (status.enabled && status.llm_model) rows.push([t('external_memory_llm'), `<code>${esc(status.llm_model)}</code>`]);
   if (status.enabled && status.embedder_model) {
@@ -5487,7 +5569,7 @@ function _renderExternalMemoryStatus() {
   if (status.enabled && status.vector_store) rows.push([t('external_memory_store'), `<code>${esc(status.vector_store)}</code>`]);
   const rowsHtml = rows.map(([label, value]) => `<div class="detail-row"><div class="detail-row-label">${esc(label)}</div><div class="detail-row-value">${value}</div></div>`).join('');
   const hint = status.enabled ? t('external_memory_active_hint') : t('external_memory_disabled_hint');
-  const statusCard = `<section class="notes-source-card external-memory-status-card"><div class="notes-source-card-head"><strong>${li('plug',16)}${esc(status.display_name || t('external_memory_builtin_only'))}</strong><span class="detail-badge ${health.className}">${pulse}${esc(health.label)}</span></div><div class="memory-detail-mtime">${esc(hint)}</div><div class="detail-rows">${rowsHtml}</div></section>`;
+  const statusCard = `<details class="notes-source-card external-memory-status-card"><summary title="${esc(t('external_memory_provider_details'))}"><strong>${li('plug',16)}${esc(status.display_name || t('external_memory_builtin_only'))}</strong><span class="detail-badge ${health.className}">${pulse}${esc(health.label)}</span>${li('chevron-down',14)}</summary><div class="external-memory-status-details"><div class="memory-detail-mtime">${esc(hint)}</div>${rowsHtml ? `<div class="detail-rows">${rowsHtml}</div>` : ''}</div></details>`;
 
   let library = '';
   if (status.enabled && status.health === 'online') {
@@ -5529,7 +5611,7 @@ function _renderExternalMemoryStatus() {
       <form class="notes-search-form external-memory-search-form" onsubmit="event.preventDefault(); searchExternalMemories();">
         <div class="search-input-wrapper">
           <span class="search-icon">${li('search',14)}</span>
-          <input id="externalMemoryQuery" type="search" maxlength="500" value="${esc(_externalMemoryQuery)}" placeholder="${esc(t('external_memory_search_placeholder'))}" aria-label="${esc(t('external_memory_search_placeholder'))}" />
+          <input id="externalMemoryQuery" type="search" maxlength="500" value="${esc(_externalMemoryQuery)}" placeholder="${esc(t('external_memory_search_placeholder'))}" aria-label="${esc(t('external_memory_search_placeholder'))}" oninput="scheduleExternalMemorySearch(this.value)" />
         </div>
         <button type="submit" class="btn-search-submit" ${_externalMemoryLoading?'disabled':''}>${esc(_externalMemoryLoading ? t('loading') : t('search'))}</button>
         ${isSearch ? `<button type="button" class="btn-search-clear" onclick="clearExternalMemorySearch()">${esc(t('external_memory_clear_search'))}</button>` : ''}
@@ -5538,11 +5620,15 @@ function _renderExternalMemoryStatus() {
       <div class="memory-detail-mtime">${esc(t('external_memory_search_hint'))}</div>
       ${_externalMemoryError ? `<div class="detail-form-error">${esc(_externalMemoryError)}</div>` : ''}
     </section>`;
+    const total = Math.max(Number(data.total) || 0, allMemories.length);
+    const canLoadMore = !_externalMemoryExhausted && _externalMemoryLimit < 100 && (allMemories.length < total || allMemories.length >= _externalMemoryLimit);
+    const loadMore = canLoadMore ? `<div class="external-memory-load-more"><span>${esc(t('external_memory_showing_count', allMemories.length, total))}</span><button type="button" class="btn-secondary" onclick="loadMoreExternalMemories()" ${_externalMemoryLoadingMore ? 'disabled' : ''}>${esc(t(_externalMemoryLoadingMore ? 'external_memory_loading_more' : 'external_memory_load_more'))}</button></div>` : '';
     let results = '';
     if (_externalMemoryLoading && !_externalMemoryData) {
       results = `<div class="memory-empty">${esc(t('loading'))}</div>`;
     } else if (!memories.length) {
-      results = `<div class="memory-empty">${esc(isSearch ? t('external_memory_no_results') : t('external_memory_empty'))}</div>`;
+      const emptyKey = isSearch || currentFilter !== 'all' ? 'external_memory_no_results' : 'external_memory_empty';
+      results = `<section class="external-memory-results"><div class="memory-empty">${esc(t(emptyKey))}</div>${loadMore}</section>`;
     } else {
       const cards = memories.map(memory => {
         const scoreVal = typeof memory.score === 'number' ? Math.round(memory.score * 100) : null;
@@ -5558,15 +5644,19 @@ function _renderExternalMemoryStatus() {
         const tags = Array.isArray(memory.tags) && memory.tags.length ? `<div class="external-memory-tags">${memory.tags.map(tag => `<button type="button" class="tag-pill" data-memory-tag="${esc(tag)}" onclick="filterExternalMemoryByTag(this.dataset.memoryTag)">#${esc(tag)}</button>`).join('')}</div>` : '';
         const timestamp = Number(memory.memory_at || memory.gmt_created || 0);
         const meta = timestamp ? new Date(timestamp * 1000).toLocaleString() : '';
-        const safeContent = esc(memory.content || '');
+        const rawContent = String(memory.content || '');
+        const safeContent = esc(rawContent);
         const safeId = esc(memory.memory_id || '');
+        const collapsible = rawContent.length > 220 || rawContent.split(/\r?\n/).length > 4;
+        const expandButton = collapsible ? `<button type="button" class="btn-memory-expand" aria-expanded="false" onclick="toggleExternalMemoryContent(this)">${li('chevron-down',12)}<span>${esc(t('external_memory_expand'))}</span></button>` : '';
 
         return `<article class="notes-source-card external-memory-item" data-memory-content="${safeContent}" data-memory-id="${safeId}">
           <div class="notes-source-card-head">
             <div class="external-memory-badges">${layer}${statusBadge}${score}</div>
             ${meta ? `<time>${esc(meta)}</time>` : ''}
           </div>
-          <div class="external-memory-content">${safeContent}</div>
+          <div class="external-memory-content ${collapsible ? 'is-collapsible' : ''}">${safeContent}</div>
+          ${expandButton}
           ${tags}
           <div class="external-memory-footer">
             <div class="external-memory-id" title="${safeId}">${safeId}</div>
@@ -5584,7 +5674,7 @@ function _renderExternalMemoryStatus() {
           </div>
         </article>`;
       }).join('');
-      results = `<section class="external-memory-results"><div class="external-memory-results-head"><strong>${esc(t(isSearch ? 'external_memory_results' : 'external_memory_recent'))}</strong><span class="external-memory-results-count">${esc(t('external_memory_count', memories.length))}</span></div>${cards}</section>`;
+      results = `<section class="external-memory-results"><div class="external-memory-results-head"><strong>${esc(t(isSearch ? 'external_memory_results' : 'external_memory_recent'))}</strong><span class="external-memory-results-count">${esc(t('external_memory_count', memories.length))}</span></div>${cards}${loadMore}</section>`;
     }
     library = `${controls}${results}`;
   } else if (status.enabled) {
