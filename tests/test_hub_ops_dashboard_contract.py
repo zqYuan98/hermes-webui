@@ -255,6 +255,106 @@ def test_ops_dashboard_static_contract_exposes_machine_visualization_and_filteri
     assert "个人" in js and "公司" in js and "全部" in js
 
 
+def test_ops_dashboard_2_0_exposes_primary_views_filters_table_and_service_drawer():
+    js = HUB_JS.read_text(encoding="utf-8")
+    css = HUB_CSS.read_text(encoding="utf-8")
+
+    for required in (
+        "opsView: 'servers'",
+        "opsStatus: 'all'",
+        "opsKind: 'all'",
+        "opsQuery: ''",
+        "opsSelectedService: ''",
+        "data-hub-ops-view",
+        "data-hub-status-filter",
+        "data-hub-kind-filter",
+        "data-hub-ops-query",
+        "renderServiceTable",
+        "renderServiceDrawer",
+        "hub-ops-view-tabs",
+        "hub-service-table",
+        "hub-service-drawer",
+    ):
+        assert required in js or required in css
+
+    assert "服务器" in js and "服务" in js and "异常" in js
+    assert "搜索服务、主机、IP、端口或 unit" in js
+    assert "启动方式" in js and "监听" in js and "最近采集" in js
+    assert "<th>最近变化</th>" not in js
+
+
+def test_ops_dashboard_2_0_search_filter_is_local_only():
+    js = HUB_JS.read_text(encoding="utf-8")
+
+    on_input = js[js.find("function onInput") : js.find("function onSubmit")]
+
+    assert "data-hub-ops-query" in on_input
+    assert "view.opsQuery = e.target.value" in on_input
+    assert "refreshOpsView();" in on_input
+    assert "HubStore.write" not in on_input
+    assert "save(" not in on_input
+
+
+def test_ops_dashboard_2_0_filters_do_not_discard_unsaved_service_form_input():
+    js = HUB_JS.read_text(encoding="utf-8")
+
+    on_input = js[js.find("function onInput") : js.find("function onSubmit")]
+    on_change = js[js.find("function onChange") : js.find("function onSubmit")]
+    on_click = js[js.find("function onClick") : js.find("function onSubmitQuickCapture")]
+
+    assert "if (view.form) return" in on_input
+    assert "if (view.form)" in on_change and "请先保存或取消当前编辑" in on_change
+    assert "function guardOpsForm" in js
+    assert "guardOpsForm()" in on_click
+    reload = js[js.find("function reload()") : js.find("function render()")]
+    assert "if (view.form)" in reload
+    assert "请先保存或取消当前编辑，再重新读取数据" in reload
+
+
+def test_ops_dashboard_2_0_drawer_and_machine_linkage_are_accessible_read_only():
+    js = HUB_JS.read_text(encoding="utf-8")
+
+    drawer = js[js.find("function renderServiceDrawer") : js.find("function commandRow")]
+    click = js[js.find("function onClick") :]
+    readonly = js[js.find("function isReadOnlyCommand") : js.find("function readOnlyCommandsForService")]
+
+    assert 'role="dialog"' in drawer
+    assert 'aria-modal="true"' in drawer
+    assert 'aria-labelledby="hubServiceDrawerTitle"' in drawer
+    assert 'data-hub-action="close-service-drawer"' in drawer
+    assert "focusServiceDrawerClose" in js
+    assert "e.key === 'Escape'" in js
+    assert "restoreServiceFocus" in js
+    assert "serviceId: id || ''" in js
+    assert "document.querySelectorAll('[data-hub-id]')" in js
+    assert "document.querySelectorAll('[data-hub-service-row]')" in js
+    assert "data-hub-action=\"machine-services\"" in js
+    assert "view.opsMachine = id || ''" in click
+    assert "view.opsView = 'services'" in click
+    assert "clear-machine-filter" in click
+    assert "copy-service-command" in drawer and "copyText(btn.getAttribute('data-hub-copy')" in click
+    assert "systemctl status " in readonly
+    assert "docker ps" in readonly
+    assert "pm2 status " in readonly
+    assert "journalctl " not in js[js.find("function readOnlyCommandsForService") : js.find("function renderServiceFields")]
+    assert "docker logs" not in readonly
+    assert "docker inspect" not in readonly
+    assert "pm2 logs" not in readonly
+    assert "systemctl restart" not in readonly
+    assert "systemctl stop" not in readonly
+    assert "systemctl start" not in readonly
+
+
+def test_ops_dashboard_2_0_service_links_do_not_also_open_the_drawer():
+    js = HUB_JS.read_text(encoding="utf-8")
+
+    on_keydown = js[js.find("function onKeydown") : js.find("function onInput")]
+    on_click = js[js.find("function onClick") : js.find("function onSubmitQuickCapture")]
+
+    assert "e.target.closest('a')" in on_click
+    assert "e.target.closest('a, button, input, select, textarea')" in on_keydown
+
+
 def test_ops_dashboard_static_contract_marks_stale_and_unknown_as_not_healthy():
     js = HUB_JS.read_text(encoding="utf-8")
     css = HUB_CSS.read_text(encoding="utf-8")
