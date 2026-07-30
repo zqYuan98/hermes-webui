@@ -5606,7 +5606,7 @@ function _renderExternalMemoryStatus() {
     </div>`;
 
     const controls = `<section class="notes-source-card external-memory-library-card">
-      <div class="notes-source-card-head"><strong>${li('database',16)}${esc(t('external_memory_library'))}</strong><span class="detail-badge">${esc(t('external_memory_read_only'))}</span></div>
+      <div class="notes-source-card-head"><strong>${li('brain',16)}${esc(t('external_memory_library'))}</strong><span class="detail-badge">${esc(t('external_memory_read_only'))}</span></div>
       <div class="memory-detail-mtime">${esc(t('external_memory_recall_trace_hint'))}</div>
       <form class="notes-search-form external-memory-search-form" onsubmit="event.preventDefault(); searchExternalMemories();">
         <div class="search-input-wrapper">
