@@ -285,6 +285,17 @@ def test_ops_dashboard_static_contract_protects_automatic_services_and_enriches_
     assert "详情" in js[js.find("function servicePrompt") : js.find("function onInput")]
 
 
+def test_ops_dashboard_static_contract_displays_discovery_startup_and_listener_metadata():
+    js = HUB_JS.read_text(encoding="utf-8")
+
+    card = js[js.find("function serviceCard") : js.find("function commandRow")]
+    assert "启动：" in card
+    assert "监听：" in card
+    assert "s.startup" in card
+    assert "s.listen" in card
+    assert "s.kind" in card
+
+
 def test_hub_scaffold_readme_documents_new_ops_contract():
     store = HUB_STORE_JS.read_text(encoding="utf-8")
 

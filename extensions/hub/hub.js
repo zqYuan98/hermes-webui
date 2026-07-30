@@ -829,6 +829,7 @@
     var managed = isManagedService(s);
     var status = serviceStatus(s, ops || view.data.ops);
     var stale = managed && isStale(s, ops || view.data.ops);
+    var listen = Array.isArray(s.listen) ? s.listen.filter(Boolean).slice(0, 12) : [];
     return '<div class="hub-item"><div class="hub-item-main">' +
       '<div class="hub-item-title">' + statusBadge(status, stale) +
       (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(s.name) + '</a>' : esc(s.name)) +
@@ -836,9 +837,13 @@
       '<div class="hub-item-sub">' +
       (managed ? '自动登记' : esc(labelOf(ENVS, s.env, ''))) +
       (s.machineId ? ' · machineId ' + esc(s.machineId) : '') +
+      (s.kind ? ' · 类型 ' + esc(s.kind) : '') +
       (s.owner ? ' · 负责人 ' + esc(s.owner) : '') +
       (s.updatedAt ? ' · 最近采集 ' + esc(fmtDate(s.updatedAt)) : '') +
       (stale ? ' · 数据过期' : '') +
+      (s.startup ? '<br>启动：' + esc(s.startup) : '') +
+      (listen.length ? '<br>监听：' + esc(listen.join(' · ')) : '') +
+      (s.control ? '<br>管理：<code>' + esc(s.control) + '</code>' : '') +
       (s.detail ? '<br>详情：' + esc(s.detail) : '') +
       (s.notes ? '<br>' + esc(s.notes) : '') + '</div></div>' +
       '<div class="hub-item-actions">' +

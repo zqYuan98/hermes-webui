@@ -61,7 +61,7 @@
     '| `hub-profile.json` | 个人档案与今日聚焦 | `{name, role, focus, focusDate}` |',
     '| `hub-design.json` | 产品设计工作台 | `{items:[{id,title,stage,priority,tags,link,notes}]}` |',
     '| `hub-ops.json` | 运维人工数据 | `{services:[手工服务或{id,managed:true,notes}], commands:[{id,label,command,notes}]}` |',
-    '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,status,detail,updatedAt,managed}]}` |',
+    '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,kind,startup,listen,control,status,detail,updatedAt,managed}]}` |',
     '| `hub-resources.json` | 个人资源库 | `{items:[{id,title,url,category,tags,note}]}` |',
     '| `hub-inbox.json` | 快速捕获收件箱 | `{items:[{id,text,done,createdAt}]}` |',
     '',
