@@ -77,9 +77,28 @@
     { id: 'down', label: '故障' }
   ];
 
+  var OWNERS = [
+    { id: 'all', label: '全部' },
+    { id: 'personal', label: '个人' },
+    { id: 'company', label: '公司' }
+  ];
+
+  var OWNER_LABELS = { personal: '个人', company: '公司' };
+
+  var STATUS_LABELS = {
+    ok: '正常',
+    watch: '观察',
+    down: '故障',
+    stale: '过期'
+  };
+
+  var STATUS_WEIGHT = { ok: 0, watch: 1, stale: 1, down: 2 };
+
   /* ── 视图状态 ─────────────────────────────────────────────────────── */
 
   var ready = null;   // HubStore.init() 的 promise，见 mount()
+  var autoRefreshTimer = null;
+  var AUTO_REFRESH_MS = 60000;
 
   var view = {
     module: 'home',
@@ -87,6 +106,7 @@
     form: null,        // { kind, id } — kind 为 design/service/command/resource
     query: '',
     tag: '',
+    opsOwner: 'personal',
     setupError: ''
   };
 
@@ -178,6 +198,7 @@
     // 探测上次绑定的会话要一次网络往返。open() 必须等它落定，否则用户在
     // 探测完成前点进 Hub 会看到"未配置"的引导页，而其实早就配好了。
     ready = HubStore.init();
+    startAutoRefresh();
     ready.then(function () {
       // 冷启动时核心可能已经把 hub 恢复成当前面板（用户上次停在这里）。
       if (document.querySelector('main.main').classList.contains('showing-' + PANEL)) open();
@@ -257,6 +278,23 @@
         renderSidebar();
       });
     });
+  }
+
+  function reloadIfVisible() {
+    var main = document.querySelector('main.main');
+    if (!main || !main.classList.contains('showing-' + PANEL)) return;
+    if (view.form) return; // Never discard unsaved form input during polling.
+    HubStore.invalidate();
+    open();
+  }
+
+  function startAutoRefresh() {
+    if (autoRefreshTimer) return;
+    autoRefreshTimer = setInterval(reloadIfVisible, AUTO_REFRESH_MS);
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) reloadIfVisible();
+    });
+    window.addEventListener('focus', reloadIfVisible);
   }
 
   function reload() {
@@ -538,18 +576,188 @@
 
   /* ── 项目运维 ─────────────────────────────────────────────────────── */
 
+  function statusToHub(status, stale) {
+    var s = String(status || '').toLowerCase();
+    if (s === 'critical' || s === 'unknown' || s === 'down' || s === 'failed') return 'down';
+    if (stale || s === 'stale') return 'stale';
+    if (s === 'ok' || s === 'healthy' || s === 'running') return 'ok';
+    if (s === 'warning' || s === 'watch' || s === 'degraded') return 'watch';
+    return 'down';
+  }
+
+  function worstStatus(items, fallback) {
+    var worst = statusToHub(fallback || 'ok');
+    items.forEach(function (item) {
+      var st = statusToHub(item && item.status, item && item.stale);
+      if ((STATUS_WEIGHT[st] || 0) > (STATUS_WEIGHT[worst] || 0)) worst = st;
+    });
+    return worst;
+  }
+
+  function machineChecks(machine) {
+    var checks = machine && machine.checks;
+    return Array.isArray(checks) ? checks : [];
+  }
+
+  function serviceChecks(service) {
+    var checks = service && service.checks;
+    return Array.isArray(checks) ? checks : [];
+  }
+
+  function machineUpdatedAt(machine) {
+    return machine && (machine.updatedAt || machine.lastCollectedAt || machine.lastSeenAt || '');
+  }
+
+  function serviceUpdatedAt(service) {
+    return service && (service.updatedAt || service.lastCollectedAt || service.lastSeenAt || '');
+  }
+
+  function parseIsoMs(iso) {
+    var d = new Date(iso || '');
+    return isNaN(d.getTime()) ? 0 : d.getTime();
+  }
+
+  function isStale(item, ops) {
+    if (!item) return true;
+    if (item.stale === true) return true;
+    var at = machineUpdatedAt(item) || serviceUpdatedAt(item) || ops.generatedAt || '';
+    var seen = parseIsoMs(at);
+    if (!seen) return true;
+    var itemAge = Number(item.staleAfterMinutes);
+    var opsAge = Number(ops.staleAfterMinutes);
+    var maxAge = Number.isFinite(itemAge) && itemAge > 0 ? itemAge :
+      (Number.isFinite(opsAge) && opsAge > 0 ? opsAge : 180);
+    return (Date.now() - seen) > maxAge * 60 * 1000;
+  }
+
+  function ownerLabel(owner) {
+    return OWNER_LABELS[owner] || owner || '未分类';
+  }
+
+  function statusLabel(status) {
+    return STATUS_LABELS[status] || status || '未知';
+  }
+
+  function statusBadge(status, stale) {
+    var st = statusToHub(status, stale);
+    return '<span class="hub-status ' + esc(st) + '">' +
+      '<span class="hub-dot ' + esc(st) + '"></span>' + esc(statusLabel(st)) + '</span>';
+  }
+
+  function machineStatus(machine, ops) {
+    var checks = machineChecks(machine);
+    return statusToHub(worstStatus(checks, machine && machine.status), isStale(machine, ops));
+  }
+
+  function serviceStatus(service, ops) {
+    return statusToHub(service && service.status, service && service.managed ? isStale(service, ops) : false);
+  }
+
+  function servicesForMachine(ops, machineId) {
+    return ops.services.filter(function (service) { return service.machineId === machineId; });
+  }
+
+  function visibleMachines(ops) {
+    var machines = Array.isArray(ops.machines) ? ops.machines : [];
+    if (view.opsOwner === 'all') return machines;
+    return machines.filter(function (m) { return (m.ownership || 'personal') === view.opsOwner; });
+  }
+
+  function visibleServices(ops) {
+    var machinesById = {};
+    (ops.machines || []).forEach(function (m) { machinesById[m.id] = m; });
+    return (ops.services || []).filter(function (service) {
+      var owner = service.ownership || (machinesById[service.machineId] && machinesById[service.machineId].ownership) || 'personal';
+      return view.opsOwner === 'all' || owner === view.opsOwner;
+    });
+  }
+
+  function specLine(machine) {
+    var r = machine.resources || machine.specs || {};
+    var cpu = r.cpu || machine.cpu || '';
+    if (cpu && typeof cpu === 'object') cpu = cpu.logicalCpus || cpu.logical_cpus || cpu.model || '';
+    var memory = r.memory || r.memoryGiB || r.memory_gib || machine.memoryGiB || machine.memory_gib || machine.memory_gib;
+    var gpu = r.gpu || machine.gpu || '';
+    if (gpu && typeof gpu === 'object') {
+      gpu = [gpu.count ? gpu.count + 'x' : '', gpu.model || gpu.vendor || 'GPU'].filter(Boolean).join(' ');
+    }
+    var disk = r.disk || r.diskGiB || r.rootDiskGiB || machine.rootDiskGiB || machine.root_disk_gib || '';
+    return [
+      cpu ? 'CPU ' + cpu : '',
+      memory ? '内存 ' + memory + (String(memory).match(/[a-z]/i) ? '' : ' GiB') : '',
+      gpu ? 'GPU ' + gpu : '',
+      disk ? '磁盘 ' + disk + (String(disk).match(/[a-z]/i) ? '' : ' GiB') : ''
+    ].filter(Boolean).join(' · ');
+  }
+
+  function osLine(machine) {
+    var os = machine.os || {};
+    if (typeof os === 'string') return os;
+    return [os.family, os.version].filter(Boolean).join(' ');
+  }
+
+  function machineLocation(machine) {
+    return [machine.host, machine.region].filter(Boolean).join(' · ');
+  }
+
+  function metricValueFromDetail(detail) {
+    var m = String(detail || '').match(/(-?\d+(?:\.\d+)?)\s*(?:%|°C|C)/);
+    return m ? Number(m[1]) : null;
+  }
+
+  function metricKind(check) {
+    var key = String(check.key || '').toLowerCase();
+    var label = String(check.label || '').toLowerCase();
+    if (key.indexOf('disk') !== -1 || label.indexOf('磁盘') !== -1) return '磁盘';
+    if (key.indexOf('memory') !== -1 || label.indexOf('内存') !== -1) return '内存';
+    if (key.indexOf('swap') !== -1 || label.indexOf('swap') !== -1) return 'Swap';
+    if (key.indexOf('gpu_temp') !== -1 || label.indexOf('温度') !== -1) return 'GPU 温度';
+    return '';
+  }
+
+  function renderResourceBars(machine) {
+    var checks = machineChecks(machine).filter(function (check) { return metricKind(check) && metricValueFromDetail(check.detail) !== null; });
+    if (!checks.length) return '';
+    return '<div class="hub-resource-bars">' + checks.slice(0, 5).map(function (check) {
+      var value = metricValueFromDetail(check.detail);
+      var pct = Math.max(0, Math.min(100, value));
+      var st = statusToHub(check.status);
+      return '<div class="hub-resource-bar">' +
+        '<div class="hub-resource-bar-head"><span>' + esc(metricKind(check)) + '</span><span>' + esc(check.detail) + '</span></div>' +
+        '<div class="hub-resource-track"><span class="' + esc(st) + '" style="width:' + pct + '%"></span></div>' +
+        '</div>';
+    }).join('') + '</div>';
+  }
+
   function renderOps() {
     var ops = view.data.ops;
     var html = '';
+    var machines = visibleMachines(ops);
+    var services = visibleServices(ops);
+
+    html += renderOpsOverview(ops);
+
+    html += '<div class="hub-ops-filter" role="group" aria-label="归属筛选">' + OWNERS.map(function (owner) {
+      return '<button class="hub-segment' + (view.opsOwner === owner.id ? ' active' : '') + '" data-hub-owner-filter="' + owner.id + '">' +
+        esc(owner.label) + '</button>';
+    }).join('') + '</div>';
 
     html += '<div class="hub-section"><div class="hub-section-head">' +
-      '<span class="hub-section-title">服务清单</span>' +
+      '<span class="hub-section-title">服务器矩阵</span>' +
+      '<div class="hub-section-actions"><button class="hub-btn" data-hub-action="reload">刷新</button></div></div>' +
+      (machines.length
+        ? '<div class="hub-machine-grid">' + machines.map(function (m) { return renderMachineCard(m, ops); }).join('') + '</div>'
+        : '<div class="hub-empty">当前筛选下没有服务器。</div>') +
+      '</div>';
+
+    html += '<div class="hub-section"><div class="hub-section-head">' +
+      '<span class="hub-section-title">个人服务</span>' +
       '<div class="hub-section-actions">' +
-      '<button class="hub-btn primary" data-hub-action="new-service">' + svg(ICON.plus, 13) + '新增服务</button>' +
+      '<button class="hub-btn primary" data-hub-action="new-service">' + svg(ICON.plus, 13) + '新增手工服务</button>' +
       '</div></div>';
     if (view.form && view.form.kind === 'service') html += serviceForm();
-    html += (ops.services.length
-      ? '<div class="hub-services">' + ops.services.map(serviceCard).join('') + '</div>'
+    html += (services.length
+      ? '<div class="hub-services">' + services.map(function (s) { return serviceCard(s, ops); }).join('') + '</div>'
       : '<div class="hub-empty">还没登记服务。把你日常要盯的机器、站点、定时任务放进来。</div>') +
       '</div>';
 
@@ -567,20 +775,77 @@
     return html;
   }
 
-  function serviceCard(s) {
+  function renderOpsOverview(ops) {
+    var machines = ops.machines || [];
+    var services = ops.services || [];
+    var counts = { ok: 0, watch: 0, stale: 0, down: 0 };
+    machines.forEach(function (m) { counts[machineStatus(m, ops)] += 1; });
+    var watch = counts.watch + counts.stale;
+    return '<div class="hub-ops-metrics">' +
+      '<div class="hub-stat"><div class="hub-stat-value">' + machines.length + '</div><div class="hub-stat-label">主机数</div></div>' +
+      '<div class="hub-stat"><div class="hub-stat-value">' + counts.ok + '</div><div class="hub-stat-label">正常</div></div>' +
+      '<div class="hub-stat"><div class="hub-stat-value">' + watch + '</div><div class="hub-stat-label">观察</div></div>' +
+      '<div class="hub-stat"><div class="hub-stat-value">' + counts.down + '</div><div class="hub-stat-label">故障</div></div>' +
+      '<div class="hub-stat"><div class="hub-stat-value">' + services.length + '</div><div class="hub-stat-label">服务数</div></div>' +
+      '<div class="hub-stat wide"><div class="hub-stat-value small">' + esc(fmtDate(ops.generatedAt) || '未知') + '</div><div class="hub-stat-label">最近同步</div></div>' +
+      '</div>';
+  }
+
+  function renderMachineCard(machine, ops) {
+    var stale = isStale(machine, ops);
+    var status = machineStatus(machine, ops);
+    var checks = machineChecks(machine);
+    var services = servicesForMachine(ops, machine.id);
+    return '<div class="hub-machine-card" data-machine-id="' + esc(machine.id) + '">' +
+      '<div class="hub-machine-head">' +
+      '<div class="hub-machine-title">' + esc(machine.name || machine.id) + '</div>' +
+      statusBadge(status, stale) +
+      '</div>' +
+      '<div class="hub-machine-meta">' +
+      '<span>' + esc(ownerLabel(machine.ownership)) + '</span>' +
+      (machine.role ? '<span>' + esc(machine.role) + '</span>' : '') +
+      (machineLocation(machine) ? '<span>' + esc(machineLocation(machine)) + '</span>' : '') +
+      '</div>' +
+      (osLine(machine) ? '<div class="hub-machine-line">' + esc(osLine(machine)) + '</div>' : '') +
+      (specLine(machine) ? '<div class="hub-machine-line">' + esc(specLine(machine)) + '</div>' : '') +
+      '<div class="hub-machine-sync">最近采集：' + esc(fmtDate(machineUpdatedAt(machine)) || '未知') + (stale ? ' · 数据过期' : '') + '</div>' +
+      renderResourceBars(machine) +
+      '<div class="hub-checks">' + (checks.length ? checks.map(function (check) {
+        return '<div class="hub-check-row">' + statusBadge(check.status, false) +
+          '<span>' + esc(check.label || check.key) + '</span><span>' + esc(check.detail || '') + '</span></div>';
+      }).join('') : '<div class="hub-item-sub">暂无检查项</div>') + '</div>' +
+      (services.length ? '<div class="hub-machine-services">' + services.slice(0, 5).map(function (s) {
+        return '<span class="hub-service-chip">' + esc(s.name) + '</span>';
+      }).join('') + '</div>' : '') +
+      '</div>';
+  }
+
+  function isManagedService(service) {
+    return !!(service && service.managed === true);
+  }
+
+  function serviceCard(s, ops) {
     var url = safeUrl(s.url);
+    var managed = isManagedService(s);
+    var status = serviceStatus(s, ops || view.data.ops);
+    var stale = managed && isStale(s, ops || view.data.ops);
     return '<div class="hub-item"><div class="hub-item-main">' +
-      '<div class="hub-item-title"><span class="hub-dot ' + esc(s.status || 'ok') + '"></span>' +
+      '<div class="hub-item-title">' + statusBadge(status, stale) +
       (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(s.name) + '</a>' : esc(s.name)) +
       '</div>' +
-      '<div class="hub-item-sub">' + esc(labelOf(ENVS, s.env, '')) +
-      ' · ' + esc(labelOf(STATUSES, s.status, '正常')) +
+      '<div class="hub-item-sub">' +
+      (managed ? '自动登记' : esc(labelOf(ENVS, s.env, ''))) +
+      (s.machineId ? ' · machineId ' + esc(s.machineId) : '') +
       (s.owner ? ' · 负责人 ' + esc(s.owner) : '') +
+      (s.updatedAt ? ' · 最近采集 ' + esc(fmtDate(s.updatedAt)) : '') +
+      (stale ? ' · 数据过期' : '') +
+      (s.detail ? '<br>详情：' + esc(s.detail) : '') +
       (s.notes ? '<br>' + esc(s.notes) : '') + '</div></div>' +
       '<div class="hub-item-actions">' +
       iconBtn('service-agent', s.id, ICON.send, '让 Agent 检查这个服务') +
-      iconBtn('edit-service', s.id, ICON.edit, '编辑') +
-      iconBtn('del-service', s.id, ICON.trash, '删除', 'danger') +
+      (managed ? iconBtn('edit-service', s.id, ICON.edit, '编辑自动服务备注') +
+        '<span class="hub-managed-lock" title="自动登记服务不可删除或覆盖核心字段">自动</span>' :
+        iconBtn('edit-service', s.id, ICON.edit, '编辑') + iconBtn('del-service', s.id, ICON.trash, '删除', 'danger')) +
       '</div></div>';
   }
 
@@ -599,6 +864,13 @@
 
   function serviceForm() {
     var it = findById(view.data.ops.services, view.form.id) || {};
+    if (isManagedService(it)) {
+      return '<form class="hub-card hub-section" data-hub-form="service">' +
+        '<div class="hub-item-sub">自动登记服务只允许编辑人工备注，不覆盖 machineId、status、detail、updatedAt 等核心自动字段。</div>' +
+        '<div class="hub-field" style="margin:12px 0"><span class="hub-field-label">备注</span>' +
+        '<textarea class="hub-textarea" name="notes">' + esc(it.notes || '') + '</textarea></div>' +
+        formActions() + '</form>';
+    }
     return '<form class="hub-card hub-section" data-hub-form="service">' +
       '<div class="hub-form-grid">' +
       field('name', '服务名', it.name, 'text', true) +
@@ -801,6 +1073,17 @@
       (i.notes ? '\n\n备注：\n' + i.notes : '');
   }
 
+  function servicePrompt(s) {
+    return '帮我检查这个个人中枢服务的状态并给出处理建议：\n\n' +
+      '名称：' + s.name +
+      (s.machineId ? '\nmachineId：' + s.machineId : '') +
+      (s.status ? '\n当前状态：' + statusLabel(serviceStatus(s, view.data.ops)) : '') +
+      (s.updatedAt ? '\n最近采集：' + s.updatedAt : '') +
+      (s.detail ? '\n详情：' + s.detail : '') +
+      (s.url ? '\n地址：' + s.url : '') +
+      (s.notes ? '\n备注：' + s.notes : '');
+  }
+
   /* ── 事件 ─────────────────────────────────────────────────────────── */
 
   function onInput(e) {
@@ -847,6 +1130,12 @@
       var listKey = kind === 'service' ? 'services' : 'commands';
       var list = d.ops[listKey];
       var target = editing ? findById(list, editing) : null;
+      if (kind === 'service' && isManagedService(target)) {
+        target.notes = get('notes');
+        view.form = null;
+        save('ops', '已更新备注');
+        return;
+      }
       var body = kind === 'service'
         ? {
           name: get('name'), env: get('env') || 'prod', status: get('status') || 'ok',
@@ -884,6 +1173,12 @@
       return;
     }
 
+    var ownerFilter = e.target.closest('[data-hub-owner-filter]');
+    if (ownerFilter) {
+      view.opsOwner = ownerFilter.getAttribute('data-hub-owner-filter') || 'personal';
+      render(); renderSidebar();
+      return;
+    }
     var btn = e.target.closest('[data-hub-action]');
     if (!btn) return;
     var action = btn.getAttribute('data-hub-action');
@@ -938,6 +1233,7 @@
         return;
 
       case 'del-service':
+        if (isManagedService(findById(d.ops.services, id))) { toast('自动登记服务不能在界面删除', 'error'); return; }
         if (!confirm('删除这个服务？')) return;
         d.ops.services = d.ops.services.filter(function (x) { return x.id !== id; });
         save('ops', '已删除');
@@ -1018,11 +1314,7 @@
       case 'service-agent': {
         var sv = findById(d.ops.services, id);
         if (!sv) return;
-        askAgent('帮我检查这个服务的状态并给出处理建议：\n\n' +
-          '名称：' + sv.name + '\n环境：' + labelOf(ENVS, sv.env) +
-          '\n当前状态：' + labelOf(STATUSES, sv.status) +
-          (sv.url ? '\n地址：' + sv.url : '') +
-          (sv.notes ? '\n备注：' + sv.notes : ''));
+        askAgent(servicePrompt(sv));
         return;
       }
 
