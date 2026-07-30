@@ -127,6 +127,16 @@
       method: 'POST',
       body: JSON.stringify({ session_id: ctx.sessionId }),
       retries: 0, timeoutToast: false
+    }).catch(function (err) {
+      // Backward compatibility: an already-running old WebUI backend does not
+      // know /api/hub/init yet and returns the generic 404 `not found`. In that
+      // mixed frontend/backend state, keep the existing Hub session usable and
+      // fall back to the legacy scaffold/read path instead of showing the setup
+      // screen forever. Real permission or symlink errors from the new endpoint
+      // must still fail closed.
+      var msg = String((err && err.message) || err || '');
+      if (/not found|404/i.test(msg)) return { ok: true, legacy: true };
+      throw err;
     });
   }
 

@@ -20,6 +20,7 @@ def _run_hub_store_ops(
     write_back: bool = False,
     remote_after_read: dict | None = None,
     local_command: dict | None = None,
+    hub_init_status: int = 200,
 ) -> dict:
     assert NODE, "node is required for hub-store behavioural tests"
     script = f"""
@@ -30,6 +31,7 @@ const manualText = {json.dumps(manual if isinstance(manual, str) else json.dumps
 const automatic = {json.dumps(automatic or {}, ensure_ascii=False)};
 const remoteAfterRead = {json.dumps(remote_after_read, ensure_ascii=False)};
 const localCommand = {json.dumps(local_command, ensure_ascii=False)};
+const hubInitStatus = {json.dumps(hub_init_status)};
 let manualReads = 0;
 let saved = null;
 const storage = {{'hermes-hub.session': 'sid-1', 'hermes-hub.root': '/tmp/hub'}};
@@ -40,7 +42,10 @@ global.localStorage = {{
 }};
 global.window = {{}};
 window.api = function(path, opts) {{
-  if (path === '/api/hub/init') return Promise.resolve({{ok: true}});
+  if (path === '/api/hub/init') {{
+    if (hubInitStatus === 404) return Promise.reject(new Error('not found'));
+    return Promise.resolve({{ok: true}});
+  }}
   if (path.startsWith('/api/list?')) return Promise.resolve({{items: []}});
   if (path.startsWith('/api/file?')) {{
     const decoded = decodeURIComponent(path);
@@ -88,6 +93,16 @@ def test_hub_store_normalizes_legacy_ops_without_losing_manual_rows():
     assert "generatedAt" in data
     assert data["source"]["kind"] == "manual"
 
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_hub_store_keeps_existing_hub_visible_when_secure_init_endpoint_is_absent():
+    result = _run_hub_store_ops(
+        {"services": [{"id": "manual-site", "name": "Manual", "status": "ok"}], "commands": []},
+        hub_init_status=404,
+    )
+
+    assert result["data"]["services"][0]["id"] == "manual-site"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
