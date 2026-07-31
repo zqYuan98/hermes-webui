@@ -1011,7 +1011,121 @@
   }
 
   function renderExceptionsView(ops) {
-    return renderServersView(ops, true) + renderServicesView(ops, true);
+    return renderOpsLifecycle(ops) + renderServersView(ops, true) + renderServicesView(ops, true);
+  }
+
+  function lifecycleEventId(event, index) {
+    return String(event && (event.id || event.eventId) || [
+      event && event.entityType,
+      event && event.entityId,
+      event && event.type,
+      event && event.statusChangedAt,
+      event && event.incidentOpenedAt,
+      event && event.lifecycleSource
+    ].filter(Boolean).join(':') || ('event-' + index));
+  }
+
+  function lifecycleEventTime(event) {
+    return String(event && (
+      event.occurredAt || event.createdAt || event.updatedAt || event.time || event.timestamp ||
+      event.statusChangedAt || event.incidentOpenedAt
+    ) || '');
+  }
+
+  function lifecycleActionLabel(type) {
+    return ({ opened: '首次异常', status_changed: '状态变化', recovered: '已恢复' })[String(type || '').toLowerCase()] || '状态事件';
+  }
+
+  function acknowledgementFor(eventId, ops) {
+    return (ops.acknowledgements || []).filter(function (ack) { return ack && ack.eventId === eventId; })[0] || null;
+  }
+
+  function lifecycleEntityLabel(type, id, ops) {
+    if (type === 'machine') {
+      var machine = findById(ops.machines || [], id);
+      return machine ? (machine.name || machine.id) : id;
+    }
+    if (type === 'service') {
+      var service = findById(ops.services || [], id);
+      return service ? (service.name || service.id) : id;
+    }
+    return id || '未知实体';
+  }
+
+  function renderOpsLifecycle(ops) {
+    var events = (ops.events || []).slice().sort(function (a, b) {
+      return String(lifecycleEventTime(b)).localeCompare(String(lifecycleEventTime(a)));
+    });
+    return '<div class="hub-section hub-lifecycle" aria-labelledby="hubOpsLifecycleTitle">' +
+      '<div class="hub-section-head"><span class="hub-section-title" id="hubOpsLifecycleTitle">事件时间线</span>' +
+      '<div class="hub-section-actions"><button class="hub-btn primary" data-hub-action="new-maintenance">' +
+      svg(ICON.plus, 13) + '维护窗口</button></div></div>' +
+      (view.form && view.form.kind === 'maintenance' ? maintenanceForm() : '') +
+      (events.length ? '<div class="hub-lifecycle-list" role="list">' + events.map(function (event, index) {
+        return renderLifecycleEvent(event, ops, index);
+      }).join('') + '</div>' : '<div class="hub-empty">当前没有自动事件。维护窗口只作为上下文显示，不会隐藏真实故障。</div>') +
+      '</div>';
+  }
+
+  function renderLifecycleEvent(event, ops, index) {
+    var id = lifecycleEventId(event, index);
+    var type = String(event.entityType || event.targetType || '').toLowerCase();
+    var entityId = String(event.entityId || event.targetId || '');
+    var ack = acknowledgementFor(id, ops);
+    var title = event.title || event.summary || event.message || lifecycleActionLabel(event.type);
+    var detail = event.detail || event.description || event.reason || '';
+    var status = statusToHub(event.status || event.toStatus || event.severity || event.level, false);
+    var source = event.lifecycleSource || (event.source && (event.source.name || event.source.kind)) || '';
+    return '<div class="hub-lifecycle-event" role="listitem" data-hub-event-id="' + esc(id) + '">' +
+      '<div class="hub-lifecycle-main">' +
+      '<div class="hub-lifecycle-head">' + statusBadge(status, false) +
+      '<span class="hub-lifecycle-title">' + esc(title) + '</span></div>' +
+      '<div class="hub-lifecycle-meta">' +
+      '<span>事件时间：' + esc(lifecycleEventTime(event) || '未知') + '</span>' +
+      (entityId ? '<span>' + esc(type || 'entity') + '：' + esc(lifecycleEntityLabel(type, entityId, ops)) + '</span>' : '') +
+      (source ? '<span>来源：' + esc(source) + '</span>' : '') +
+      '</div>' +
+      (detail ? '<div class="hub-lifecycle-detail">' + esc(detail) + '</div>' : '') +
+      (ack ? '<div class="hub-lifecycle-ack">已确认：' + esc(ack.note || '无备注') +
+        (ack.createdAt ? ' · ' + esc(ack.createdAt) : '') + '</div>' : '') +
+      '</div>' +
+      '<div class="hub-item-actions">' +
+      (ack ? '<span class="hub-managed-lock">已确认</span>' :
+        '<button class="hub-btn compact" data-hub-action="ack-event" data-hub-id="' + esc(id) + '">确认</button>') +
+      '</div></div>';
+  }
+
+  function maintenanceTimes(row) {
+    return {
+      start: row && (row.start || row.startsAt || ''),
+      end: row && (row.end || row.endsAt || '')
+    };
+  }
+
+  function isActiveMaintenance(row, now) {
+    var times = maintenanceTimes(row);
+    var start = parseIsoMs(times.start);
+    var end = parseIsoMs(times.end);
+    var t = now || Date.now();
+    if (start && t < start) return false;
+    if (end && t > end) return false;
+    return !!(row && row.entityType && row.entityId);
+  }
+
+  function activeMaintenanceFor(entityType, entityId, ops) {
+    return (ops.maintenance || []).filter(function (row) {
+      return row && row.entityType === entityType && row.entityId === entityId && isActiveMaintenance(row);
+    });
+  }
+
+  function maintenanceDetails(entityType, entityId, ops) {
+    var rows = activeMaintenanceFor(entityType, entityId, ops);
+    if (!rows.length) return '';
+    return '<div class="hub-maintenance-details">' + rows.map(function (row) {
+      var times = maintenanceTimes(row);
+      return '<span class="hub-maintenance">' + esc(row.reason || '维护中') + '</span>' +
+        '<span>维护中：' + esc(times.start || '未定') + ' → ' + esc(times.end || '未定') + '</span>';
+    }).join('') + '</div>';
   }
 
   function renderMachineCard(machine, ops) {
@@ -1032,6 +1146,7 @@
       (machineLocation(machine) ? '<span>' + esc(machineLocation(machine)) + '</span>' : '') +
       '</div>' +
       '<div class="hub-machine-sync">最近采集：' + esc(fmtDate(machineUpdatedAt(machine)) || '未知') + (stale ? ' · 数据过期' : '') + '</div>' +
+      maintenanceDetails('machine', machine.id, ops) +
       renderResourceBars(machine) +
       '<div class="hub-machine-summary">' +
       '<span>' + services.length + ' 个服务</span>' +
@@ -1074,7 +1189,8 @@
       (listen.length ? '<br>监听：' + esc(listen.join(' · ')) : '') +
       (s.control ? '<br>管理：<code>' + esc(s.control) + '</code>' : '') +
       (s.detail ? '<br>详情：' + esc(s.detail) : '') +
-      (s.notes ? '<br>' + esc(s.notes) : '') + '</div></div>' +
+      (s.notes ? '<br>' + esc(s.notes) : '') + '</div>' +
+      maintenanceDetails('service', s.id, ops || view.data.ops) + '</div>' +
       '<div class="hub-item-actions">' +
       iconBtn('service-agent', s.id, ICON.send, '让 Agent 检查这个服务') +
       (managed ? iconBtn('edit-service', s.id, ICON.edit, '编辑自动服务备注') +
@@ -1121,7 +1237,8 @@
       '<td data-label="服务"><div class="hub-service-name">' +
       (url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(service.name) + '</a>' : esc(service.name || service.id)) +
       '</div><div class="hub-service-meta">' + esc(managed ? '自动登记' : labelOf(ENVS, service.env, '手工')) +
-      ' · ' + esc(serviceKindLabel(serviceKind(service))) + (service.owner ? ' · ' + esc(service.owner) : '') + '</div></td>' +
+      ' · ' + esc(serviceKindLabel(serviceKind(service))) + (service.owner ? ' · ' + esc(service.owner) : '') + '</div>' +
+      maintenanceDetails('service', service.id, ops) + '</td>' +
       '<td data-label="主机">' + esc(serviceHostLine(service, machinesById) || service.machineId || '未绑定') + '</td>' +
       '<td data-label="启动方式">' + esc(service.startup || '未记录') + '</td>' +
       '<td data-label="监听">' + esc(listen || '未记录') + '</td>' +
@@ -1193,6 +1310,7 @@
       '<button class="hub-icon-btn" data-hub-action="close-service-drawer" title="关闭" aria-label="关闭">' + svg(ICON.close, 16) + '</button>' +
       '</div>' +
       '<div class="hub-drawer-status">' + statusBadge(status, stale) + '<span>' + esc(serviceHostLine(service, machinesById) || '未绑定主机') + '</span></div>' +
+      maintenanceDetails('service', service.id, ops) +
       '<div class="hub-drawer-block"><div class="hub-drawer-block-title">人工备注</div>' +
       '<div class="hub-item-sub">' + esc(service.notes || '未记录') + '</div>' +
       '<div class="hub-drawer-actions">' + iconBtn('edit-service', service.id, ICON.edit, isManagedService(service) ? '编辑自动服务备注' : '编辑') + '</div></div>' +
@@ -1250,6 +1368,21 @@
       '</div>' +
       '<div class="hub-field" style="margin-bottom:12px"><span class="hub-field-label">命令</span>' +
       '<textarea class="hub-textarea" name="command" required>' + esc(it.command || '') + '</textarea></div>' +
+      formActions() + '</form>';
+  }
+
+  function maintenanceForm() {
+    var entityTypes = [{ id: 'service', label: '服务' }, { id: 'machine', label: '服务器' }];
+    return '<form class="hub-card hub-section" data-hub-form="maintenance">' +
+      '<div class="hub-form-grid">' +
+      selectField('entityType', '实体类型', entityTypes, 'service') +
+      field('entityId', '实体 ID', '', 'text', true) +
+      field('start', '开始时间', '', 'text', true) +
+      field('end', '结束时间', '', 'text', true) +
+      '</div>' +
+      '<div class="hub-field" style="margin-bottom:12px"><span class="hub-field-label">原因</span>' +
+      '<textarea class="hub-textarea" name="reason" required></textarea></div>' +
+      '<div class="hub-item-sub" style="margin-bottom:12px">维护窗口只作为界面上下文保存，不会隐藏真实故障，也不会触发任何远端操作。</div>' +
       formActions() + '</form>';
   }
 
@@ -1591,6 +1724,31 @@
       return;
     }
 
+    if (kind === 'maintenance') {
+      var start = get('start');
+      var end = get('end');
+      var startMs = parseIsoMs(start);
+      var endMs = parseIsoMs(end);
+      if (startMs && endMs && endMs < startMs) {
+        toast('维护结束时间不能早于开始时间', 'error');
+        return;
+      }
+      var maintenance = {
+        id: HubStore.newId(),
+        entityType: get('entityType') || 'service',
+        entityId: get('entityId'),
+        start: start,
+        end: end,
+        reason: get('reason'),
+        createdAt: nowIso()
+      };
+      if (!maintenance.entityId || !maintenance.reason) return;
+      d.ops.maintenance.unshift(maintenance);
+      view.form = null;
+      save('ops', '已记录维护窗口');
+      return;
+    }
+
     if (kind === 'resource') {
       var res = editing ? findById(d.resources.items, editing) : null;
       var rp = {
@@ -1658,6 +1816,21 @@
       case 'open-service': openServiceDrawer(id); return;
       case 'close-service-drawer': closeServiceDrawer(); return;
       case 'copy-service-command': copyText(btn.getAttribute('data-hub-copy') || ''); return;
+      case 'new-maintenance': if (guardOpsForm()) return; view.form = { kind: 'maintenance', id: '' }; render(); return;
+      case 'ack-event': {
+        if (guardOpsForm()) return;
+        if (acknowledgementFor(id, d.ops)) return;
+        var note = window.prompt('确认这条事件，可选短备注（最多 80 字）：', '');
+        if (note === null) return;
+        d.ops.acknowledgements.unshift({
+          id: HubStore.newId(),
+          eventId: id,
+          createdAt: nowIso(),
+          note: String(note || '').trim().slice(0, 80)
+        });
+        save('ops', '已确认事件');
+        return;
+      }
 
       case 'new-design': view.form = { kind: 'design', id: '' }; render(); return;
       case 'edit-design': view.form = { kind: 'design', id: id }; render(); return;

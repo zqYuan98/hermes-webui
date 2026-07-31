@@ -43,7 +43,10 @@
         source: { kind: 'manual', name: 'Hermes Hub' },
         machines: [],
         services: [],
-        commands: []
+        commands: [],
+        events: [],
+        maintenance: [],
+        acknowledgements: []
       };
     },
     resources: function () { return { items: [] }; },
@@ -60,8 +63,8 @@
     '| --- | --- | --- |',
     '| `hub-profile.json` | 个人档案与今日聚焦 | `{name, role, focus, focusDate}` |',
     '| `hub-design.json` | 产品设计工作台 | `{items:[{id,title,stage,priority,tags,link,notes}]}` |',
-    '| `hub-ops.json` | 运维人工数据 | `{services:[手工服务或{id,managed:true,notes}], commands:[{id,label,command,notes}]}` |',
-    '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,kind,startup,listen,control,status,detail,updatedAt,managed}]}` |',
+    '| `hub-ops.json` | 运维人工数据 | `{services:[手工服务或{id,managed:true,notes}], commands:[{id,label,command,notes}], maintenance:[{id,entityType,entityId,start,end,reason}], acknowledgements:[{id,eventId,createdAt,note}]}` |',
+    '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,kind,startup,listen,control,status,detail,updatedAt,managed}], events:[{id,entityType,entityId,statusChangedAt,incidentOpenedAt,lifecycleSource,status,detail}]}` |',
     '| `hub-resources.json` | 个人资源库 | `{items:[{id,title,url,category,tags,note}]}` |',
     '| `hub-inbox.json` | 快速捕获收件箱 | `{items:[{id,text,done,createdAt}]}` |',
     '',
@@ -73,7 +76,7 @@
     '- `ops.services[].status` 取值：`ok` | `watch` | `down`',
     '- `ops.machines[].ownership` 取值：`personal` | `company`',
     '- `hub-ops-auto.json` 仅由只读监控原子更新，界面永不写入',
-    '- `hub-ops.json` 仅存手工服务、命令和自动服务 notes；界面读取时按 id 合并',
+    '- `hub-ops.json` 仅存手工服务、命令、自动服务 notes、维护窗口与人工确认；界面读取时按 id 合并',
     '- 时间字段是 ISO 8601 字符串',
     '- 每个条目的 `id` 必须唯一；新增时生成即可',
     '',
@@ -85,7 +88,7 @@
   var cache = Object.create(null);
   var opsManualWriteBlocked = false;
   var opsManualMissing = false;
-  var opsManualBase = { services: [], commands: [] };
+  var opsManualBase = { services: [], commands: [], maintenance: [], acknowledgements: [] };
 
   function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (_) { return ''; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (_) { } }
@@ -282,7 +285,10 @@
       source: automatic.source || { kind: 'manual', name: 'Hermes Hub' },
       machines: automatic.machines || [],
       services: automaticServices.concat(manualServices),
-      commands: (manual.commands || []).map(function (command) { return Object.assign({}, command); })
+      commands: (manual.commands || []).map(function (command) { return Object.assign({}, command); }),
+      events: (automatic.events || []).map(function (event) { return Object.assign({}, event); }),
+      maintenance: (manual.maintenance || []).map(function (row) { return Object.assign({}, row); }),
+      acknowledgements: (manual.acknowledgements || []).map(function (row) { return Object.assign({}, row); })
     };
   }
 
@@ -295,7 +301,7 @@
         readText(FILES.ops).then(parseManualOps, function () {
           opsManualWriteBlocked = false;
           opsManualMissing = true;
-          opsManualBase = { services: [], commands: [] };
+          opsManualBase = { services: [], commands: [], maintenance: [], acknowledgements: [] };
           return DEFAULTS.ops();
         }),
         readText(OPS_AUTO_FILE).then(function (text) { return parseObject(text, DEFAULTS.ops()); }, function () { return DEFAULTS.ops(); })
@@ -332,7 +338,12 @@
       }
       return service;
     }).filter(Boolean);
-    return { services: services, commands: value.commands || [] };
+    return {
+      services: services,
+      commands: value.commands || [],
+      maintenance: value.maintenance || [],
+      acknowledgements: value.acknowledgements || []
+    };
   }
 
   function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
@@ -359,7 +370,9 @@
   function mergeManualOps(base, local, remote) {
     return {
       services: mergeRows(base.services, local.services, remote.services, '服务'),
-      commands: mergeRows(base.commands, local.commands, remote.commands, '命令')
+      commands: mergeRows(base.commands, local.commands, remote.commands, '命令'),
+      maintenance: mergeRows(base.maintenance, local.maintenance, remote.maintenance, '维护窗口'),
+      acknowledgements: mergeRows(base.acknowledgements, local.acknowledgements, remote.acknowledgements, '人工确认')
     };
   }
 
@@ -377,6 +390,8 @@
     });
     value.services = automaticServices.concat(manualServices);
     value.commands = manual.commands || [];
+    value.maintenance = manual.maintenance || [];
+    value.acknowledgements = manual.acknowledgements || [];
     return value;
   }
 

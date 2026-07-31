@@ -20,6 +20,8 @@ def _run_hub_store_ops(
     write_back: bool = False,
     remote_after_read: dict | None = None,
     local_command: dict | None = None,
+    local_maintenance: dict | None = None,
+    local_acknowledgement: dict | None = None,
     hub_init_status: int = 200,
 ) -> dict:
     assert NODE, "node is required for hub-store behavioural tests"
@@ -31,6 +33,8 @@ const manualText = {json.dumps(manual if isinstance(manual, str) else json.dumps
 const automatic = {json.dumps(automatic or {}, ensure_ascii=False)};
 const remoteAfterRead = {json.dumps(remote_after_read, ensure_ascii=False)};
 const localCommand = {json.dumps(local_command, ensure_ascii=False)};
+const localMaintenance = {json.dumps(local_maintenance, ensure_ascii=False)};
+const localAcknowledgement = {json.dumps(local_acknowledgement, ensure_ascii=False)};
 const hubInitStatus = {json.dumps(hub_init_status)};
 let manualReads = 0;
 let saved = null;
@@ -60,7 +64,12 @@ window.api = function(path, opts) {{
 vm.runInThisContext(src, {{filename: 'hub-store.js'}});
 window.HubStore.init()
   .then(() => window.HubStore.read('ops'))
-  .then(data => {{ if (localCommand) data.commands.push(localCommand); return {'window.HubStore.write("ops", data).then(() => ({data, saved: JSON.parse(saved)}), err => ({data, saved, writeError: err.message}))' if write_back else '({data})'}; }})
+  .then(data => {{
+    if (localCommand) data.commands.push(localCommand);
+    if (localMaintenance) data.maintenance.push(localMaintenance);
+    if (localAcknowledgement) data.acknowledgements.push(localAcknowledgement);
+    return {'window.HubStore.write("ops", data).then(() => ({data, saved: JSON.parse(saved)}), err => ({data, saved, writeError: err.message}))' if write_back else '({data})'};
+  }})
   .then(result => process.stdout.write(JSON.stringify(result)))
   .catch(err => {{ console.error(err && err.stack || err); process.exit(1); }});
 """
@@ -135,6 +144,79 @@ def test_hub_store_merges_auto_snapshot_and_persists_only_manual_data():
     assert next(s for s in saved["services"] if s["id"] == "managed:host:docker") == {
         "id": "managed:host:docker", "managed": True, "notes": "人工备注"
     }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_hub_store_preserves_manual_maintenance_and_acknowledgements_when_saving_ops():
+    result = _run_hub_store_ops(
+        {
+            "services": [],
+            "commands": [],
+            "maintenance": [{
+                "id": "maint-1", "entityType": "service", "entityId": "managed:host:docker",
+                "startsAt": "2026-08-01T10:00:00+08:00", "endsAt": "2026-08-01T11:00:00+08:00",
+                "reason": "版本升级",
+            }],
+            "acknowledgements": [{
+                "id": "ack-1", "eventId": "event-1", "createdAt": "2026-08-01T10:01:00+08:00",
+                "note": "已确认",
+            }],
+        },
+        {
+            "events": [{
+                "id": "event-auto-1", "entityType": "service", "entityId": "managed:host:docker",
+                "statusChangedAt": "2026-08-01T10:00:00+08:00", "lifecycleSource": "monitor",
+            }],
+        },
+        write_back=True,
+        local_command={"id": "local", "label": "Local", "command": "uptime"},
+    )
+
+    data, saved = result["data"], result["saved"]
+    assert data["events"][0]["id"] == "event-auto-1"
+    assert data["maintenance"][0]["reason"] == "版本升级"
+    assert data["acknowledgements"][0]["eventId"] == "event-1"
+    assert "events" not in saved
+    assert saved["maintenance"][0]["entityId"] == "managed:host:docker"
+    assert saved["acknowledgements"][0]["note"] == "已确认"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_hub_store_three_way_merges_maintenance_and_acknowledgement_rows():
+    initial = {"services": [], "commands": [], "maintenance": [], "acknowledgements": []}
+    remote = {
+        "services": [], "commands": [],
+        "maintenance": [{"id": "remote-maint", "entityType": "machine", "entityId": "host", "reason": "机房维护"}],
+        "acknowledgements": [{"id": "remote-ack", "eventId": "event-r", "note": "remote"}],
+    }
+    merged = _run_hub_store_ops(
+        initial,
+        write_back=True,
+        remote_after_read=remote,
+        local_maintenance={"id": "local-maint", "entityType": "service", "entityId": "svc", "reason": "deploy"},
+        local_acknowledgement={"id": "local-ack", "eventId": "event-l", "note": "local"},
+    )
+    assert {row["id"] for row in merged["saved"]["maintenance"]} == {"local-maint", "remote-maint"}
+    assert {row["id"] for row in merged["saved"]["acknowledgements"]} == {"local-ack", "remote-ack"}
+
+    base = {
+        "services": [], "commands": [],
+        "maintenance": [{"id": "same-maint", "entityType": "machine", "entityId": "host", "reason": "base"}],
+        "acknowledgements": [{"id": "same-ack", "eventId": "event-1", "note": "base"}],
+    }
+    remote_conflict = {
+        "services": [], "commands": [],
+        "maintenance": [{"id": "same-maint", "entityType": "machine", "entityId": "host", "reason": "remote"}],
+        "acknowledgements": [{"id": "same-ack", "eventId": "event-1", "note": "base"}],
+    }
+    conflict = _run_hub_store_ops(
+        base,
+        write_back=True,
+        remote_after_read=remote_conflict,
+        local_maintenance={"id": "same-maint", "entityType": "machine", "entityId": "host", "reason": "local"},
+    )
+    assert conflict["saved"] is None
+    assert "维护窗口「same-maint」已被其他页面或 Agent 修改" in conflict["writeError"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -394,6 +476,37 @@ def test_ops_dashboard_static_contract_displays_discovery_startup_and_listener_m
     assert "s.startup" in card
     assert "s.listen" in card
     assert "s.kind" in card
+
+
+def test_ops_lifecycle_contract_exposes_fact_only_events_acknowledgements_and_maintenance():
+    js = HUB_JS.read_text(encoding="utf-8")
+    store = HUB_STORE_JS.read_text(encoding="utf-8")
+    css = HUB_CSS.read_text(encoding="utf-8")
+
+    for required in (
+        "events: (automatic.events || [])",
+        "maintenance: (manual.maintenance || [])",
+        "acknowledgements: (manual.acknowledgements || [])",
+        "mergeRows(base.maintenance",
+        "mergeRows(base.acknowledgements",
+        "renderOpsLifecycle",
+        "renderLifecycleEvent",
+        "data-hub-action=\"ack-event\"",
+        "data-hub-action=\"new-maintenance\"",
+        "data-hub-form=\"maintenance\"",
+        "statusChangedAt",
+        "incidentOpenedAt",
+        "lifecycleSource",
+        "hub-lifecycle",
+        "hub-maintenance",
+    ):
+        assert required in js or required in store or required in css
+
+    assert "最近变化" not in js
+    assert "window.api(" not in js[js.find("function renderOpsLifecycle") : js.find("function onSubmit")]
+    assert "systemctl restart" not in js[js.find("function renderOpsLifecycle") :]
+    assert "docker logs" not in js[js.find("function renderOpsLifecycle") :]
+    assert "docker inspect" not in js[js.find("function renderOpsLifecycle") :]
 
 
 def test_hub_scaffold_readme_documents_new_ops_contract():

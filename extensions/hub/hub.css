@@ -732,6 +732,74 @@ main.main.showing-hub > #mainHub { display: flex; }
 .hub-status.down { color: var(--danger); }
 .hub-item-title .hub-status { margin-right: 6px; }
 
+.hub-lifecycle-list {
+  display: grid;
+  gap: 8px;
+}
+
+.hub-lifecycle-event {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.hub-lifecycle-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.hub-lifecycle-head,
+.hub-lifecycle-meta,
+.hub-maintenance-details {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hub-lifecycle-title {
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.hub-lifecycle-meta,
+.hub-lifecycle-detail,
+.hub-lifecycle-ack,
+.hub-maintenance-details {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.hub-lifecycle-detail,
+.hub-lifecycle-ack { color: var(--text2); word-break: break-word; }
+
+.hub-maintenance-details {
+  align-items: baseline;
+}
+
+.hub-maintenance {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 1px 7px;
+  border: 1px solid var(--warning);
+  border-radius: 999px;
+  color: var(--warning);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .hub-services {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -945,6 +1013,8 @@ main.main.showing-hub > #mainHub { display: flex; }
 
   .hub-service-table td:last-child { border-bottom: none; }
   .hub-service-table td:last-child .hub-item-actions { justify-content: flex-start; flex-wrap: wrap; }
+
+  .hub-lifecycle-event { display: grid; }
 }
 
 .hub-cmd {
