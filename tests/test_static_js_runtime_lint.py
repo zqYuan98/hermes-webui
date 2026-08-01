@@ -57,6 +57,10 @@ def test_static_js_has_no_runtime_error_lint():
         "-c", str(CONFIG),
         "-f", "json",
         str(REPO / "static"),
+        # extensions/ ships browser JS through the same <script> path as static/,
+        # so a const-assign there bricks the UI identically. It was outside the
+        # guard until now purely because the guard predates the extensions dir.
+        str(REPO / "extensions"),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO), timeout=120)
 

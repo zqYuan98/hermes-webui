@@ -517,3 +517,22 @@ def test_hub_scaffold_readme_documents_new_ops_contract():
     assert "source" in store
     assert "hub-ops-auto.json" in store
     assert "界面永不写入" in store
+
+
+def test_hub_auto_refresh_is_gated_on_tab_visibility():
+    """A backgrounded tab must not keep polling the file API every 60s.
+
+    `reloadIfVisible` only checked that the Hub panel was the active panel, so a
+    hidden tab left on Hub kept issuing /api/file reads forever. The rest of the
+    codebase gates every poll on `document.hidden`; this pins Hub to that rule.
+    The visibilitychange/focus handlers already re-run the poll on return, so the
+    early return costs no freshness.
+    """
+    js = HUB_JS.read_text(encoding="utf-8")
+
+    body = js[js.find("function reloadIfVisible") : js.find("function startAutoRefresh")]
+    assert body, "reloadIfVisible not found"
+    assert "if (document.hidden) return;" in body
+
+    # The guard must precede the work, otherwise it does not prevent the fetch.
+    assert body.index("document.hidden") < body.index("HubStore.invalidate()")

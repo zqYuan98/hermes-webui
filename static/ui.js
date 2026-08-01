@@ -5101,7 +5101,7 @@ function fetchReasoningChip(keyOverride){
   const key=keyOverride===undefined?_reasoningEffortQuery():keyOverride;
   const seq=++_reasoningFetchSeq;
   _lastReasoningFetchKey=key;
-  api('/api/reasoning'+key).then(function(st){
+  api('/api/reasoning'+key,{timeoutToast:false}).then(function(st){
     // Ignore a stale/superseded response: only the most recent dispatch may
     // apply, so an older in-flight GET can't poison the current chip (#4650).
     if(seq!==_reasoningFetchSeq) return;

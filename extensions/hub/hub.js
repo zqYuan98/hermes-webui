@@ -305,6 +305,9 @@
   }
 
   function reloadIfVisible() {
+    // A background tab must not keep polling the file API: the visibilitychange
+    // and focus handlers below re-run this the moment the tab comes back.
+    if (document.hidden) return;
     var main = document.querySelector('main.main');
     if (!main || !main.classList.contains('showing-' + PANEL)) return;
     if (view.form) return; // Never discard unsaved form input during polling.

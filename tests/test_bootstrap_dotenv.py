@@ -31,6 +31,12 @@ class TestLoadRepoDotenv:
 
     def setup_method(self):
         self._saved_env = os.environ.copy()
+        # These tests assert the default "source .env overrides the shell"
+        # semantics. A HERMES_WEBUI_PRESERVE_ENV=1 inherited from the developer's
+        # ambient shell (ctl.sh exports it) would correctly make the loader skip
+        # already-set keys and fail most assertions here. Clear it once per test;
+        # the test that covers the preserve path sets it explicitly afterwards.
+        os.environ.pop("HERMES_WEBUI_PRESERVE_ENV", None)
 
     def teardown_method(self):
         os.environ.clear()

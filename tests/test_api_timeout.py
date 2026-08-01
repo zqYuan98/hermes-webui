@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_JS = ROOT / "static" / "workspace.js"
 SESSIONS_JS = ROOT / "static" / "sessions.js"
 UI_JS = ROOT / "static" / "ui.js"
+BOOT_JS = ROOT / "static" / "boot.js"
 PANELS_JS = ROOT / "static" / "panels.js"
 
 
@@ -262,6 +263,9 @@ def test_passive_background_polls_suppress_timeout_toasts():
     assert "api('/api/dashboard/status',{timeoutToast:false})" in ui
     assert "api('/api/system/health',{timeoutToast:false})" in ui
     assert "api('/api/health/agent',{timeoutToast:false})" in ui
+    assert "api('/api/reasoning'+key,{timeoutToast:false})" in ui
+    boot = _source(BOOT_JS)
+    assert "api(_checkUrl,{method:_testUpdates?'GET':'POST',body:_testUpdates?undefined:JSON.stringify({force:false}),timeoutToast:false})" in boot
     assert "api(`/api/crons/status?job_id=${encodeURIComponent(jobId)}`,{timeoutToast:false})" in panels
 
 

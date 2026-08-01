@@ -24,6 +24,16 @@ This file tracks UI bugs and polish items. Fixed items are kept for reference.
 
 ## Fixed
 
+### ~~Hub auto-refresh polled the file API from a hidden tab~~ -- Fixed
+
+- **Was:** `reloadIfVisible` (extensions/hub/hub.js) gated its 60s poll only on the Hub panel being the active panel, not on `document.hidden`. A backgrounded tab left on Hub kept issuing `/api/file` reads forever — every other poll in the codebase gates on `document.hidden`.
+- **Fix:** Early-return on `document.hidden`. The existing `visibilitychange`/`focus` handlers already re-run the poll on return, so no freshness is lost. Pinned by `test_hub_auto_refresh_is_gated_on_tab_visibility`.
+
+### ~~ESLint runtime guard did not cover extensions/~~ -- Fixed
+
+- **Was:** The `no-const-assign` brick-class guard (#3162) ran only over `static/**/*.js`. `extensions/**/*.js` ships browser JS through the same `<script>` path, so an identical bug there was unguarded.
+- **Fix:** Added `extensions/` to the guard in `tests/test_static_js_runtime_lint.py`, `package.json`, TESTING.md and the config header. Tree is clean under the widened scope.
+
 ### ~~Session title truncation / hover actions~~ -- Fixed (Sprint 16)
 
 - **Was:** Action icons reserved ~30px of space even when invisible, truncating titles.

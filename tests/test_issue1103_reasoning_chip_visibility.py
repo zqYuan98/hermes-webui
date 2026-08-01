@@ -63,7 +63,9 @@ def test_ui_js_passes_model_context_to_reasoning_api():
     inlined = "api('/api/reasoning'+_reasoningEffortQuery())" in src
     captured = (
         "_reasoningEffortQuery()" in fetch_body
-        and "api('/api/reasoning'+key)" in fetch_body
+        # The call may carry an options object (e.g. {timeoutToast:false}), so
+        # match the URL argument rather than the whole call expression.
+        and re.search(r"api\('/api/reasoning'\+key[,)]", fetch_body) is not None
     )
     assert inlined or captured, (
         "fetchReasoningChip must pass _reasoningEffortQuery() (model/provider context) "
@@ -76,7 +78,10 @@ def test_fetchReasoningChip_calls_apply():
     with open("static/ui.js") as f:
         src = f.read()
     # Find fetchReasoningChip function
-    func_match = re.search(r"function fetchReasoningChip\([^)]*\)\{(.+?)\}", src, re.DOTALL)
+    # Match to the function's closing brace at column 0, not the first `}` — an
+    # inline options object like {timeoutToast:false} would otherwise truncate
+    # the captured body before the _applyReasoningChip call.
+    func_match = re.search(r"function fetchReasoningChip\([^)]*\)\{(.+?)\n\}", src, re.DOTALL)
     assert func_match, "fetchReasoningChip function must exist"
     func_body = func_match.group(1)
     assert "_applyReasoningChip" in func_body, \
