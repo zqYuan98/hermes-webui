@@ -1954,6 +1954,17 @@ Each has automated API-level tests in `tests/test_sprint{N}.py`.
 
 ---
 
+## Hermes Hub meeting minutes (manual checklist)
+
+- [ ] Configure a Hub workspace, open **会议纪要**, and verify the new module appears immediately after Home on desktop and mobile navigation.
+- [ ] Create a text-only meeting with a title, time, participants, tags, and transcript. Save, reload the page, search for it, and open its full detail view.
+- [ ] On HTTPS or localhost, start recording, confirm the timer and recording state are visible, stop, and verify the original audio is playable after upload.
+- [ ] With STT configured, verify stopping a recording or importing audio fills the editable transcript. With STT unavailable, verify the audio remains saved and the UI clearly allows manual text entry.
+- [ ] Click **AI 总结** and verify the generated Markdown is saved on the meeting, the visible chat history is unchanged, and reloading preserves the summary.
+- [ ] Test a narrow viewport (390px): recorder controls, audio player, history cards, and meeting actions remain usable without horizontal overflow.
+- [ ] Replace a meeting recording and delete a meeting; verify the old/owned files are removed from `hub-recordings/` while unrelated Hub files remain untouched.
+- [ ] Deny microphone permission and verify the UI reports the permission/security-context issue without losing the meeting draft.
+
 ## Slash command parity (manual checklist)
 
 For each batch-1 command, run via webui slash menu AND via `hermes` CLI in the
