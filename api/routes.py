@@ -15437,6 +15437,10 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/git/stash-checkout":
         return _handle_git_stash_checkout(handler, body)
 
+    # ── Hub private data bootstrap (POST) ──
+    if parsed.path == "/api/hub/init":
+        return _handle_hub_init(handler, body)
+
     # ── File ops (POST) ──
     if parsed.path == "/api/file/delete":
         return _handle_file_delete(handler, body)
@@ -23626,6 +23630,65 @@ def _handle_git_stash_checkout(handler, body):
         return bad(handler, str(e))
     except GitWorkspaceError as e:
         return _git_bad(handler, e)
+
+
+_HUB_PRIVATE_DEFAULTS = {
+    "hub-profile.json": {"name": "", "role": "", "focus": "", "focusDate": "", "updatedAt": ""},
+    "hub-design.json": {"items": []},
+    "hub-ops.json": {"services": [], "commands": []},
+    "hub-ops-auto.json": {
+        "generatedAt": "",
+        "staleAfterMinutes": 130,
+        "source": {"kind": "automatic", "name": "gpu-server-ops", "mode": "read-only"},
+        "machines": [],
+        "services": [],
+    },
+    "hub-resources.json": {"items": []},
+    "hub-inbox.json": {"items": []},
+}
+
+
+def _handle_hub_init(handler, body):
+    """Create/tighten the fixed Hub JSON set without accepting arbitrary paths."""
+    try:
+        require(body, "session_id")
+    except ValueError as e:
+        return bad(handler, str(e))
+    try:
+        session = get_session_for_file_ops(body["session_id"])
+    except KeyError:
+        return bad(handler, "Session not found", 404)
+    try:
+        ws_root = Path(session.workspace)
+        if ws_root.is_symlink() or not ws_root.is_dir():
+            return bad(handler, "Hub workspace must be a real directory")
+        os.chmod(ws_root, 0o700)
+        for name, default in _HUB_PRIVATE_DEFAULTS.items():
+            requested = ws_root / name
+            if requested.is_symlink():
+                return bad(handler, f"Cannot initialize symlinked Hub file: {name}")
+            target = safe_resolve(ws_root, name)
+            if target.exists():
+                if not target.is_file():
+                    return bad(handler, f"Hub path is not a file: {name}")
+                fd = open_anchored_fd(ws_root, target, want_dir=False)
+                try:
+                    os.fchmod(fd, 0o600)
+                finally:
+                    os.close(fd)
+                continue
+            data = (json.dumps(default, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            fd = open_anchored_create_fd(ws_root, target)
+            with os.fdopen(fd, "wb", closefd=True) as fh:
+                os.fchmod(fh.fileno(), 0o600)
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+        return j(handler, {"ok": True, "files": list(_HUB_PRIVATE_DEFAULTS)})
+    except FileExistsError:
+        return bad(handler, "Hub file changed during initialization; retry")
+    except (ValueError, FileNotFoundError, PermissionError, OSError) as e:
+        return bad(handler, _sanitize_error(e))
 
 
 def _handle_file_delete(handler, body):

@@ -8,7 +8,8 @@
  *   HUB.md              给 agent 看的目录说明
  *   hub-profile.json    个人档案 / 今日聚焦
  *   hub-design.json     产品设计工作台
- *   hub-ops.json        项目运维工作台
+ *   hub-ops.json        人工维护的服务、命令和自动服务备注
+ *   hub-ops-auto.json   只读监控生成的服务器与服务快照
  *   hub-resources.json  个人资源库
  *   hub-inbox.json      快速捕获收件箱
  *
@@ -29,13 +30,25 @@
     resources: 'hub-resources.json',
     inbox: 'hub-inbox.json'
   };
+  var OPS_AUTO_FILE = 'hub-ops-auto.json';
 
   var DEFAULTS = {
     profile: function () {
       return { name: '', role: '', focus: '', focusDate: '', updatedAt: '' };
     },
     design: function () { return { items: [] }; },
-    ops: function () { return { services: [], commands: [] }; },
+    ops: function () {
+      return {
+        generatedAt: '',
+        source: { kind: 'manual', name: 'Hermes Hub' },
+        machines: [],
+        services: [],
+        commands: [],
+        events: [],
+        maintenance: [],
+        acknowledgements: []
+      };
+    },
     resources: function () { return { items: [] }; },
     inbox: function () { return { items: [] }; }
   };
@@ -44,13 +57,14 @@
     '# Hermes Hub',
     '',
     '这是本人的个人中枢数据目录，由 Hermes WebUI 的 Hub 扩展读写。',
-    '**你（agent）可以直接读取和修改这些文件**，界面会在下次打开时读到最新内容。',
+    '**你（agent）可以直接读取和修改人工数据文件**；`hub-ops-auto.json` 由只读监控独占写入，agent 和界面只读。',
     '',
     '| 文件 | 内容 | 结构 |',
     '| --- | --- | --- |',
     '| `hub-profile.json` | 个人档案与今日聚焦 | `{name, role, focus, focusDate}` |',
     '| `hub-design.json` | 产品设计工作台 | `{items:[{id,title,stage,priority,tags,link,notes}]}` |',
-    '| `hub-ops.json` | 项目运维工作台 | `{services:[{id,name,env,url,status,owner,notes}], commands:[{id,label,command,notes}]}` |',
+    '| `hub-ops.json` | 运维人工数据 | `{services:[手工服务或{id,managed:true,notes}], commands:[{id,label,command,notes}], maintenance:[{id,entityType,entityId,start,end,reason}], acknowledgements:[{id,eventId,createdAt,note}]}` |',
+    '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,kind,startup,listen,control,status,detail,updatedAt,managed}], events:[{id,entityType,entityId,statusChangedAt,incidentOpenedAt,lifecycleSource,status,detail}]}` |',
     '| `hub-resources.json` | 个人资源库 | `{items:[{id,title,url,category,tags,note}]}` |',
     '| `hub-inbox.json` | 快速捕获收件箱 | `{items:[{id,text,done,createdAt}]}` |',
     '',
@@ -60,6 +74,9 @@
     '- `design.priority` 取值：`high` | `normal` | `low`',
     '- `ops.services[].env` 取值：`prod` | `staging` | `dev`',
     '- `ops.services[].status` 取值：`ok` | `watch` | `down`',
+    '- `ops.machines[].ownership` 取值：`personal` | `company`',
+    '- `hub-ops-auto.json` 仅由只读监控原子更新，界面永不写入',
+    '- `hub-ops.json` 仅存手工服务、命令、自动服务 notes、维护窗口与人工确认；界面读取时按 id 合并',
     '- 时间字段是 ISO 8601 字符串',
     '- 每个条目的 `id` 必须唯一；新增时生成即可',
     '',
@@ -69,6 +86,9 @@
 
   var ctx = { sessionId: '', root: '', ready: false, reason: 'uninitialized' };
   var cache = Object.create(null);
+  var opsManualWriteBlocked = false;
+  var opsManualMissing = false;
+  var opsManualBase = { services: [], commands: [], maintenance: [], acknowledgements: [] };
 
   function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (_) { return ''; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (_) { } }
@@ -105,6 +125,24 @@
 
   /* ── 配置与引导 ─────────────────────────────────────────────────────── */
 
+  function secureInit() {
+    return api('/api/hub/init', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: ctx.sessionId }),
+      retries: 0, timeoutToast: false
+    }).catch(function (err) {
+      // Backward compatibility: an already-running old WebUI backend does not
+      // know /api/hub/init yet and returns the generic 404 `not found`. In that
+      // mixed frontend/backend state, keep the existing Hub session usable and
+      // fall back to the legacy scaffold/read path instead of showing the setup
+      // screen forever. Real permission or symlink errors from the new endpoint
+      // must still fail closed.
+      var msg = String((err && err.message) || err || '');
+      if (/not found|404/i.test(msg)) return { ok: true, legacy: true };
+      throw err;
+    });
+  }
+
   function markReady(sid, root) {
     ctx.sessionId = sid;
     ctx.root = root || '';
@@ -125,9 +163,12 @@
     var root = lsGet(LS_ROOT);
     if (!sid) { markUnready('unconfigured'); return Promise.resolve(ctx); }
     return probe(sid).then(function (ok) {
-      if (ok) markReady(sid, root);
-      else markUnready('session_lost');
-      return ctx;
+      if (!ok) { markUnready('session_lost'); return ctx; }
+      markReady(sid, root);
+      return secureInit().then(function () { return ctx; }, function () {
+        markUnready('permission_init_failed');
+        return ctx;
+      });
     });
   }
 
@@ -166,8 +207,11 @@
       if (!sid) throw new Error('未能创建 Hub 会话');
       markReady(sid, root);
       cache = Object.create(null);
-      return scaffold();
-    }).then(function () { return ctx; });
+      return secureInit().then(scaffold);
+    }).then(function () { return ctx; }, function (err) {
+      markUnready('permission_init_failed');
+      throw err;
+    });
   }
 
   /* 初始文件：缺什么补什么，已有内容一律不覆盖。 */
@@ -193,16 +237,81 @@
 
   /* ── 领域读写 ───────────────────────────────────────────────────────── */
 
-  /* 读不到或解析失败一律回落到默认结构，保证界面永远有东西可渲染。 */
+  function parseObject(text, fallback) {
+    var value;
+    try { value = text ? JSON.parse(text) : fallback; }
+    catch (_) { value = fallback; }
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : fallback;
+  }
+
+  function parseManualOps(text) {
+    if (!text || !String(text).trim()) {
+      // A known 404 is handled by read(); an existing empty file is corrupted/truncated.
+      opsManualWriteBlocked = true;
+      opsManualMissing = false;
+      return DEFAULTS.ops();
+    }
+    try {
+      var value = JSON.parse(text);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('root is not object');
+      opsManualWriteBlocked = false;
+      opsManualMissing = false;
+      opsManualBase = JSON.parse(JSON.stringify(manualOpsFromMerged(normalize('ops', value))));
+      return value;
+    } catch (_) {
+      // Keep automatic monitoring visible, but never overwrite a corrupted manual file.
+      opsManualWriteBlocked = true;
+      return DEFAULTS.ops();
+    }
+  }
+
+  function mergeOps(manual, automatic) {
+    manual = normalize('ops', manual || {});
+    automatic = normalize('ops', automatic || {});
+    var notes = Object.create(null);
+    var manualServices = [];
+    manual.services.forEach(function (service) {
+      if (service && service.managed === true && service.id) notes[service.id] = service.notes || '';
+      else if (service) manualServices.push(service);
+    });
+    var automaticServices = automatic.services.map(function (service) {
+      var merged = Object.assign({}, service);
+      if (Object.prototype.hasOwnProperty.call(notes, service.id)) merged.notes = notes[service.id];
+      return merged;
+    });
+    return {
+      generatedAt: automatic.generatedAt || '',
+      staleAfterMinutes: automatic.staleAfterMinutes,
+      source: automatic.source || { kind: 'manual', name: 'Hermes Hub' },
+      machines: automatic.machines || [],
+      services: automaticServices.concat(manualServices),
+      commands: (manual.commands || []).map(function (command) { return Object.assign({}, command); }),
+      events: (automatic.events || []).map(function (event) { return Object.assign({}, event); }),
+      maintenance: (manual.maintenance || []).map(function (row) { return Object.assign({}, row); }),
+      acknowledgements: (manual.acknowledgements || []).map(function (row) { return Object.assign({}, row); })
+    };
+  }
+
+  /* 运维自动快照与人工数据分文件读取，避免监控和界面整文件互相覆盖。 */
   function read(key) {
     if (!ctx.ready) return Promise.resolve(DEFAULTS[key]());
     if (cache[key]) return Promise.resolve(cache[key]);
+    if (key === 'ops') {
+      return Promise.all([
+        readText(FILES.ops).then(parseManualOps, function () {
+          opsManualWriteBlocked = false;
+          opsManualMissing = true;
+          opsManualBase = { services: [], commands: [], maintenance: [], acknowledgements: [] };
+          return DEFAULTS.ops();
+        }),
+        readText(OPS_AUTO_FILE).then(function (text) { return parseObject(text, DEFAULTS.ops()); }, function () { return DEFAULTS.ops(); })
+      ]).then(function (values) {
+        cache.ops = mergeOps(values[0], values[1]);
+        return cache.ops;
+      });
+    }
     return readText(FILES[key]).then(function (text) {
-      var value;
-      try { value = text ? JSON.parse(text) : DEFAULTS[key](); }
-      catch (_) { value = DEFAULTS[key](); }
-      if (!value || typeof value !== 'object') value = DEFAULTS[key]();
-      cache[key] = normalize(key, value);
+      cache[key] = normalize(key, parseObject(text, DEFAULTS[key]()));
       return cache[key];
     }, function () {
       cache[key] = DEFAULTS[key]();
@@ -216,14 +325,106 @@
     Object.keys(def).forEach(function (field) {
       if (Array.isArray(def[field]) && !Array.isArray(value[field])) value[field] = [];
       else if (typeof def[field] === 'string' && typeof value[field] !== 'string') value[field] = def[field];
+      else if (def[field] && typeof def[field] === 'object' && !Array.isArray(def[field]) &&
+        (!value[field] || typeof value[field] !== 'object' || Array.isArray(value[field]))) value[field] = def[field];
     });
     return value;
   }
 
+  function manualOpsFromMerged(value) {
+    var services = (value.services || []).map(function (service) {
+      if (service && service.managed === true) {
+        return service.notes ? { id: service.id, managed: true, notes: service.notes } : null;
+      }
+      return service;
+    }).filter(Boolean);
+    return {
+      services: services,
+      commands: value.commands || [],
+      maintenance: value.maintenance || [],
+      acknowledgements: value.acknowledgements || []
+    };
+  }
+
+  function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  function mergeRows(baseRows, localRows, remoteRows, label) {
+    var base = Object.create(null), local = Object.create(null), remote = Object.create(null), ids = Object.create(null);
+    function index(rows, target) {
+      (rows || []).forEach(function (row) {
+        if (!row || !row.id) throw new Error(label + '存在缺少 id 的条目，已拒绝保存');
+        target[row.id] = row; ids[row.id] = true;
+      });
+    }
+    index(baseRows, base); index(localRows, local); index(remoteRows, remote);
+    return Object.keys(ids).sort().map(function (id) {
+      var localChanged = !sameJson(local[id], base[id]);
+      var remoteChanged = !sameJson(remote[id], base[id]);
+      if (localChanged && remoteChanged && !sameJson(local[id], remote[id])) {
+        throw new Error(label + '「' + id + '」已被其他页面或 Agent 修改，请刷新后重试');
+      }
+      return localChanged ? local[id] : remote[id];
+    }).filter(Boolean);
+  }
+
+  function mergeManualOps(base, local, remote) {
+    return {
+      services: mergeRows(base.services, local.services, remote.services, '服务'),
+      commands: mergeRows(base.commands, local.commands, remote.commands, '命令'),
+      maintenance: mergeRows(base.maintenance, local.maintenance, remote.maintenance, '维护窗口'),
+      acknowledgements: mergeRows(base.acknowledgements, local.acknowledgements, remote.acknowledgements, '人工确认')
+    };
+  }
+
+  function applyManualToMerged(value, manual) {
+    var notes = Object.create(null), manualServices = [];
+    (manual.services || []).forEach(function (service) {
+      if (service.managed === true) notes[service.id] = service.notes || '';
+      else manualServices.push(service);
+    });
+    var automaticServices = (value.services || []).filter(function (service) { return service.managed === true; }).map(function (service) {
+      var next = Object.assign({}, service);
+      if (Object.prototype.hasOwnProperty.call(notes, service.id)) next.notes = notes[service.id];
+      else delete next.notes;
+      return next;
+    });
+    value.services = automaticServices.concat(manualServices);
+    value.commands = manual.commands || [];
+    value.maintenance = manual.maintenance || [];
+    value.acknowledgements = manual.acknowledgements || [];
+    return value;
+  }
+
   function write(key, value) {
-    cache[key] = value;
     if (!ctx.ready) return Promise.reject(new Error('Hub 数据目录尚未配置'));
-    return writeText(FILES[key], JSON.stringify(value, null, 2));
+    if (key !== 'ops') {
+      return writeText(FILES[key], JSON.stringify(value, null, 2)).then(function () { cache[key] = value; });
+    }
+    if (opsManualWriteBlocked) {
+      return Promise.reject(new Error('hub-ops.json 无法解析，已禁止覆盖；请先修复或恢复该文件'));
+    }
+    var local = manualOpsFromMerged(value);
+    function mergeAndPersist(text) {
+      var remote;
+      try {
+        remote = text ? JSON.parse(text) : { services: [], commands: [] };
+        if (!remote || typeof remote !== 'object' || Array.isArray(remote)) throw new Error('root');
+        remote = manualOpsFromMerged(normalize('ops', remote));
+      } catch (_) {
+        opsManualWriteBlocked = true;
+        throw new Error('hub-ops.json 无法解析，已禁止覆盖；请先修复或恢复该文件');
+      }
+      var persisted = mergeManualOps(opsManualBase, local, remote);
+      return writeText(FILES.ops, JSON.stringify(persisted, null, 2)).then(function () {
+        opsManualMissing = false;
+        opsManualBase = JSON.parse(JSON.stringify(persisted));
+        cache.ops = applyManualToMerged(value, persisted);
+      });
+    }
+    return readText(FILES.ops).then(mergeAndPersist, function () {
+      if (opsManualMissing) return mergeAndPersist('');
+      throw new Error('保存前无法重新读取 hub-ops.json，已拒绝覆盖；请稍后重试');
+    });
   }
 
   function readAll() {

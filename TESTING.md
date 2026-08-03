@@ -25,7 +25,7 @@ messages" on every mobile message (v0.51.161–166).
 
 The guard is a curated, zero-false-positive ESLint config (`eslint.runtime-guard.config.mjs`)
 that runs ONLY runtime-error rules (`no-const-assign`, `no-import-assign`) over
-`static/**/*.js`. It is NOT a style linter and has no formatting rules.
+`static/**/*.js` and `extensions/**/*.js`. It is NOT a style linter and has no formatting rules.
 
 ```bash
 # one-time dev setup (ESLint is a dev-only tool; the app stays pure Python + vanilla JS):
@@ -33,7 +33,7 @@ npm install --no-save --before=<a-date-≥48h-ago> eslint   # package-age guard
 # run the guard:
 npm run lint:runtime
 # or directly:
-npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js"
+npx eslint --no-config-lookup -c eslint.runtime-guard.config.mjs "static/**/*.js" "extensions/**/*.js"
 ```
 
 ## Python lint gate (ruff) — forward-looking, new-code-only

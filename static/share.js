@@ -19,6 +19,11 @@ function _shareRoleLabel(role){
   return 'System';
 }
 
+function _shareRoleBadgeHtml(role){
+  if(role==='assistant') return '<span class="share-role-badge agent-avatar"><img class="agent-avatar-image" src="/static/favicon.svg" alt=""></span><span>'+_shareEscapeHtml(_shareRoleLabel(role))+'</span>';
+  return '<span class="share-role-badge">'+_shareEscapeHtml(_shareRoleLabel(role))+'</span>';
+}
+
 function _shareRenderMessages(messages){
   const wrap=$('shareTranscript');
   if(!wrap) return;
@@ -35,7 +40,7 @@ function _shareRenderMessages(messages){
       ? renderMd(String(msg.content||''))
       : `<p>${_shareEscapeHtml(msg.content||'')}</p>`;
     row.innerHTML=
-      `<div class="share-role"><span class="share-role-badge">${_shareEscapeHtml(_shareRoleLabel(msg.role))}</span></div>`+
+      `<div class="share-role">${_shareRoleBadgeHtml(msg.role)}</div>`+
       `<div class="msg-body share-message-body">${bodyHtml}</div>`;
     wrap.appendChild(row);
   });

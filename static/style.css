@@ -1533,6 +1533,7 @@
   .app-titlebar-profile.active{background:var(--accent-bg);color:var(--accent-text);border-color:var(--accent-bg-strong);}
   .app-titlebar-profile.switching{opacity:.6;pointer-events:none;}
   .app-titlebar-profile-icon{display:inline-flex;align-items:center;flex-shrink:0;}
+  .agent-profile-icon{width:14px;height:14px;display:block;border-radius:50%;object-fit:cover;object-position:center;}
   .app-titlebar-profile-label{max-width:80px;overflow:hidden;text-overflow:ellipsis;}
   .app-titlebar-profile-chevron{display:inline-flex;align-items:center;flex-shrink:0;opacity:.5;}
   .system-health-panel.insights-card{display:flex;flex-direction:column;gap:12px;color:var(--muted);}
@@ -1550,6 +1551,8 @@
   .system-health-bar-fill{height:100%;width:0%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),var(--accent-hover));transition:width .25s ease;}
   .system-health-foot{font-size:11px;color:var(--muted);line-height:1.45;opacity:.82;}
   .app-titlebar-icon{display:inline-flex;align-items:center;color:var(--accent);}
+  .agent-brand-icon{width:18px;height:18px;display:block;border-radius:5px;object-fit:cover;}
+  .app-titlebar-icon .agent-brand-icon{width:16px;height:16px;}
   .app-titlebar-title{font-size:12px;font-weight:600;color:var(--text);letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:60vw;}
   .app-titlebar-sub{font-size:10px;color:var(--muted);background:var(--hover-bg);padding:2px 7px;border-radius:4px;font-family:'SF Mono',ui-monospace,monospace;white-space:nowrap;flex-shrink:0;}
   .app-titlebar-sub[hidden]{display:none;}
@@ -2301,6 +2304,8 @@
   .role-icon{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;}
   .role-icon.user{background:var(--accent-bg);color:var(--accent-text);border:1px solid var(--accent-bg-strong);}
   .role-icon.assistant{background:var(--accent-bg-strong);color:var(--accent-text);border:1px solid var(--accent-bg-strong);}
+  .role-icon.assistant.agent-avatar{padding:0;overflow:hidden;background:#020617;border-color:var(--border2);}
+  .agent-avatar-image{width:100%;height:100%;display:block;border-radius:inherit;object-fit:cover;object-position:center;}
   .msg-body{font-size:var(--message-body-font-size);line-height:var(--message-body-line-height);color:var(--text);padding-left:30px;max-width:680px;overflow-wrap:anywhere;}
   .msg-body p{margin-bottom:10px;}.msg-body p:last-child{margin-bottom:0;}
   .msg-body td p,.msg-body th p{margin:0;}
@@ -2547,7 +2552,7 @@
      tuned separately for dark vs light themes (see --logo-glow / .hm-g* below). */
   .empty-logo{position:relative;display:flex;align-items:center;justify-content:center;margin-bottom:10px;background:none;border:none;border-radius:0;box-shadow:none;}
   .empty-logo::before{content:"";position:absolute;left:50%;top:50%;width:190px;height:190px;transform:translate(-50%,-50%);border-radius:50%;background:var(--logo-glow);z-index:0;pointer-events:none;}
-  .empty-logo svg{position:relative;z-index:1;width:88px;height:88px;display:block;}
+  .empty-logo .agent-welcome-icon{position:relative;z-index:1;width:96px;height:96px;display:block;border-radius:24px;object-fit:cover;box-shadow:0 14px 38px rgba(0,0,0,.28);}
   /* Light themes (default :root): deeper, richer gradient holds contrast on
      a pale background; cooler, restrained bloom. */
   :root .empty-logo .hm-g0{stop-color:#0AA6CC;}
@@ -2558,7 +2563,7 @@
   :root.dark .empty-logo .hm-g1{stop-color:#3889FD;}
   :root.dark{--logo-glow:radial-gradient(circle,rgba(8,235,241,0.20) 0%,rgba(56,137,253,0.15) 38%,transparent 72%);}
   @media (prefers-reduced-motion: no-preference){
-    .empty-logo svg{animation:emptyLogoRise .5s ease-out both;}
+    .empty-logo .agent-welcome-icon{animation:emptyLogoRise .5s ease-out both;}
     @keyframes emptyLogoRise{from{opacity:0;transform:translateY(6px) scale(.96);}to{opacity:1;transform:none;}}
   }
   .empty-state h2{font-size:20px;color:var(--text);font-weight:700;letter-spacing:-.02em;}
@@ -7384,3 +7389,18 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 /* Settings field highlight (mirrors msg-question-highlight / _highlightQuestionRow pattern) */
 .settings-field-highlight { animation: settings-field-pulse 1.6s ease-out; }
 @keyframes settings-field-pulse { 0% { box-shadow: 0 0 0 0 var(--focus-ring); } 35% { box-shadow: 0 0 0 4px var(--focus-ring); } 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } }
+
+/* Unified agent identity artwork in public shared transcripts. */
+.share-message[data-role="assistant"] .share-role-badge{width:26px;min-width:26px;padding:0;overflow:hidden;border-radius:50%;background:#020617;}
+
+/* Compact-height windows must not auto-scroll the welcome avatar under the titlebar. */
+@media (max-height:700px){
+  .empty-state{gap:8px;padding:14px 32px;}
+  .empty-logo{margin-bottom:2px;}
+  .empty-logo::before{width:132px;height:132px;}
+  .empty-logo .agent-welcome-icon{width:72px;height:72px;border-radius:18px;}
+  .empty-state h2{font-size:18px;}
+  .empty-state p{font-size:12px;}
+  .suggestion-grid{gap:6px;margin-top:4px;}
+  .suggestion{padding:8px 12px;}
+}
