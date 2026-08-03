@@ -4,9 +4,10 @@
  * /api/file/* 接口。这样做的关键收益：Hermes agent 读写的就是同一批文件，
  * 你在界面上记的东西 agent 直接能看见 —— 这是"数字分身"能成立的前提。
  *
- * 文件全部平铺在 Hub 根目录（不建子目录），因此不需要 mkdir 权限:
+ * JSON 数据文件平铺在 Hub 根目录；会议原始录音单独存放在 `hub-recordings/`:
  *   HUB.md              给 agent 看的目录说明
  *   hub-profile.json    个人档案 / 今日聚焦
+ *   hub-meetings.json   会议录音、转写文本与总结索引
  *   hub-design.json     产品设计工作台
  *   hub-ops.json        人工维护的服务、命令和自动服务备注
  *   hub-ops-auto.json   只读监控生成的服务器与服务快照
@@ -25,6 +26,7 @@
 
   var FILES = {
     profile: 'hub-profile.json',
+    meetings: 'hub-meetings.json',
     design: 'hub-design.json',
     ops: 'hub-ops.json',
     resources: 'hub-resources.json',
@@ -36,6 +38,7 @@
     profile: function () {
       return { name: '', role: '', focus: '', focusDate: '', updatedAt: '' };
     },
+    meetings: function () { return { items: [] }; },
     design: function () { return { items: [] }; },
     ops: function () {
       return {
@@ -62,6 +65,7 @@
     '| 文件 | 内容 | 结构 |',
     '| --- | --- | --- |',
     '| `hub-profile.json` | 个人档案与今日聚焦 | `{name, role, focus, focusDate}` |',
+    '| `hub-meetings.json` | 会议纪要索引 | `{items:[{id,title,occurredAt,participants,tags,audioPath,audioMime,audioBytes,durationSeconds,transcript,summary,createdAt,updatedAt,summaryUpdatedAt}]}` |',
     '| `hub-design.json` | 产品设计工作台 | `{items:[{id,title,stage,priority,tags,link,notes}]}` |',
     '| `hub-ops.json` | 运维人工数据 | `{services:[手工服务或{id,managed:true,notes}], commands:[{id,label,command,notes}], maintenance:[{id,entityType,entityId,start,end,reason}], acknowledgements:[{id,eventId,createdAt,note}]}` |',
     '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,kind,startup,listen,control,status,detail,updatedAt,managed}], events:[{id,entityType,entityId,statusChangedAt,incidentOpenedAt,lifecycleSource,status,detail}]}` |',
@@ -77,6 +81,7 @@
     '- `ops.machines[].ownership` 取值：`personal` | `company`',
     '- `hub-ops-auto.json` 仅由只读监控原子更新，界面永不写入',
     '- `hub-ops.json` 仅存手工服务、命令、自动服务 notes、维护窗口与人工确认；界面读取时按 id 合并',
+    '- 会议录音保存在 `hub-recordings/`；`hub-meetings.json` 只保存相对路径和文本，不内嵌音频',
     '- 时间字段是 ISO 8601 字符串',
     '- 每个条目的 `id` 必须唯一；新增时生成即可',
     '',
@@ -121,6 +126,56 @@
       .catch(function () {
         return api('/api/file/create', { method: 'POST', body: body, retries: 0, timeoutToast: false });
       });
+  }
+
+  function uploadRecording(file) {
+    if (!ctx.ready) return Promise.reject(new Error('Hub 数据目录尚未配置'));
+    if (!file || !file.name) return Promise.reject(new Error('请选择音频文件'));
+    var form = new FormData();
+    form.append('session_id', ctx.sessionId);
+    form.append('path', 'hub-recordings');
+    form.append('file', file, file.name);
+    return api('/api/workspace/upload', {
+      method: 'POST', body: form, headers: {}, retries: 0,
+      timeoutToast: false, timeoutMs: 120000
+    }).then(function (data) {
+      var row = data && data.filename ? data : (data && data.files && data.files[0]);
+      if (!row || !row.filename) throw new Error('录音上传没有返回文件名');
+      return {
+        path: 'hub-recordings/' + row.filename,
+        filename: row.filename,
+        size: Number(row.size || file.size || 0),
+        mime: row.mime || file.type || 'application/octet-stream'
+      };
+    });
+  }
+
+  function transcribeRecording(file) {
+    if (!file || !file.name) return Promise.reject(new Error('请选择音频文件'));
+    var form = new FormData();
+    form.append('file', file, file.name);
+    return api('/api/transcribe', {
+      method: 'POST', body: form, headers: {}, retries: 0,
+      timeoutToast: false, timeoutMs: 120000
+    }).then(function (data) {
+      return String((data && data.transcript) || '').trim();
+    });
+  }
+
+  function deleteFile(relPath) {
+    var path = String(relPath || '').trim();
+    var filename = path.slice('hub-recordings/'.length);
+    if (!/^hub-recordings\/[^/]+$/.test(path) || filename === '.' || filename === '..') {
+      return Promise.reject(new Error('只允许删除 Hub 录音文件'));
+    }
+    return api('/api/file/delete', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: ctx.sessionId, path: path }),
+      retries: 0, timeoutToast: false
+    }).catch(function (err) {
+      if (err && err.status === 404) return { ok: true, missing: true };
+      throw err;
+    });
   }
 
   /* ── 配置与引导 ─────────────────────────────────────────────────────── */
@@ -449,6 +504,9 @@
     setup: setup,
     reset: reset,
     listWorkspaces: listWorkspaces,
+    uploadRecording: uploadRecording,
+    transcribeRecording: transcribeRecording,
+    deleteFile: deleteFile,
     read: read,
     write: write,
     readAll: readAll,

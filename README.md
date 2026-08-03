@@ -250,6 +250,14 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Appends to existing textarea content (doesn't replace)
 - Hidden when browser doesn't support Web Speech API (Chrome, Edge, Safari)
 
+### Personal Hub meeting minutes
+- A dedicated **会议纪要** workspace inside the existing Hermes Hub navigation
+- Record from the browser microphone or import an existing audio file; original audio stays in the private Hub workspace under `hub-recordings/`
+- Browser recording uses a speech-oriented bitrate; each recording/import remains subject to the server's configured upload-size limit
+- Reuses the configured Hermes speech-to-text provider to produce an editable transcript, while still allowing text-only notes when STT is unavailable
+- One-click AI summary uses an ephemeral Agent turn, then saves the result back to `hub-meetings.json` without adding the prompt or answer to the visible chat history
+- Search and filter meeting history, replay recordings, inspect full transcripts, edit summaries, and delete a meeting together with its owned recording
+
 ### Profiles
 - Profile chip in the **composer footer** -- dropdown showing all profiles with gateway status and model info
 - Gateway status dots (green = running), model info, skill count per profile

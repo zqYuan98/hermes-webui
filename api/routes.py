@@ -23634,6 +23634,7 @@ def _handle_git_stash_checkout(handler, body):
 
 _HUB_PRIVATE_DEFAULTS = {
     "hub-profile.json": {"name": "", "role": "", "focus": "", "focusDate": "", "updatedAt": ""},
+    "hub-meetings.json": {"items": []},
     "hub-design.json": {"items": []},
     "hub-ops.json": {"services": [], "commands": []},
     "hub-ops-auto.json": {

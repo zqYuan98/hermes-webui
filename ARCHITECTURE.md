@@ -84,6 +84,10 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       login.js             Login page + open-redirect guard
       icons.js             Lucide icon path registry
       sw.js                Service worker: offline shell cache, version-pinned assets
+    extensions/hub/
+      hub-store.js         Workspace-backed personal Hub data, recordings, and transcription bridge
+      hub.js               Personal Hub views, including meeting recording, transcript, summary, and history UI
+      hub.css              Token-based responsive styling for Hub modules
     tests/
       conftest.py          Isolated test server/state fixtures
       ~1,150 test files    ~11,500 tests collected via pytest (run `pytest --collect-only -q` for exact)
