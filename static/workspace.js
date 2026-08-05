@@ -267,21 +267,35 @@ async function authorizeWorkspaceEscapeUpload(path){
   }
   const current = _workspaceEscapeUploadGrantForPath(normalizedPath);
   if(current) return current;
-  const ok = await showConfirmDialog({
-    title: t('external_upload_title'),
-    message: t('external_upload_confirm') + '\n\n' + normalizedPath,
-    confirmLabel: t('workspace_upload_file'),
-    danger: false,
-    focusCancel: true,
-  });
-  if(!ok) return null;
   try{
+    const prepared = await api('/api/escape/upload-authorize', {
+      method: 'POST',
+      body: JSON.stringify({
+        session_id: S.session.session_id,
+        path: normalizedPath,
+        token: grant.token,
+        phase: 'prepare',
+      }),
+    });
+    if(!prepared || !prepared.prepare_token || prepared.capability !== 'upload-prepare'){
+      throw new Error('Missing upload preparation');
+    }
+    const ok = await showConfirmDialog({
+      title: t('external_upload_title'),
+      message: t('external_upload_confirm') + '\n\n' + normalizedPath,
+      confirmLabel: t('workspace_upload_file'),
+      danger: false,
+      focusCancel: true,
+    });
+    if(!ok) return null;
     const data = await api('/api/escape/upload-authorize', {
       method: 'POST',
       body: JSON.stringify({
         session_id: S.session.session_id,
         path: normalizedPath,
         token: grant.token,
+        phase: 'activate',
+        prepare_token: prepared.prepare_token,
       }),
     });
     if(!data || !data.token || data.capability !== 'upload') throw new Error('Missing upload capability');

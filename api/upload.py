@@ -706,27 +706,37 @@ def handle_workspace_upload(handler):
                 continue
 
             safe_name = _sanitize_upload_name(filename)
-            dest = safe_resolve_ws(target_dir, safe_name)
+            if external is not None:
+                # External capabilities may create exactly one new leaf in the
+                # already-authorized directory. Do not resolve the leaf: doing
+                # so would follow an existing/dangling symlink and could turn a
+                # flat upload into an implicit nested write. Existing leaves of
+                # any kind are rejected rather than overwritten or deduplicated.
+                dest = target_dir / safe_name
+                if dest.parent != target_dir or os.path.lexists(dest):
+                    return j(handler, {'error': f'Upload destination already exists: {safe_name}'}, status=409)
+            else:
+                dest = safe_resolve_ws(target_dir, safe_name)
 
-            # Path traversal guard (belt-and-suspenders: safe_resolve_ws above is
-            # the authoritative guard and raises ValueError on traversal; this
-            # check catches any edge case where the resolved path escapes).
-            if not dest.resolve().is_relative_to(write_root.resolve()):
-                return j(handler, {'error': f'Path traversal blocked: {safe_name}'}, status=403)
+                # Path traversal guard (belt-and-suspenders: safe_resolve_ws above is
+                # the authoritative guard and raises ValueError on traversal; this
+                # check catches any edge case where the resolved path escapes).
+                if not dest.resolve().is_relative_to(write_root.resolve()):
+                    return j(handler, {'error': f'Path traversal blocked: {safe_name}'}, status=403)
 
-            # Deduplicate: append -1, -2, etc. if file already exists
-            if dest.exists():
-                stem = dest.stem
-                suffix = dest.suffix
-                for idx in range(1, 1000):
-                    candidate = safe_resolve_ws(target_dir, f'{stem}-{idx}{suffix}')
-                    if not candidate.resolve().is_relative_to(write_root.resolve()):
-                        return j(handler, {'error': 'Path traversal blocked'}, status=403)
-                    if not candidate.exists():
-                        dest = candidate
-                        break
-                else:
-                    return j(handler, {'error': 'Too many uploads with the same filename'}, status=400)
+                # Normal workspace uploads retain deduplication.
+                if dest.exists():
+                    stem = dest.stem
+                    suffix = dest.suffix
+                    for idx in range(1, 1000):
+                        candidate = safe_resolve_ws(target_dir, f'{stem}-{idx}{suffix}')
+                        if not candidate.resolve().is_relative_to(write_root.resolve()):
+                            return j(handler, {'error': 'Path traversal blocked'}, status=403)
+                        if not candidate.exists():
+                            dest = candidate
+                            break
+                    else:
+                        return j(handler, {'error': 'Too many uploads with the same filename'}, status=400)
 
             # #3398 TOCTOU hardening: create the destination via an anchored
             # openat-walk from the true workspace root with O_CREAT|O_EXCL|
@@ -736,7 +746,7 @@ def handle_workspace_upload(handler):
             try:
                 _wfd = open_anchored_create_fd(
                     write_anchor,
-                    dest.resolve(),
+                    dest if external is not None else dest.resolve(),
                     expected_root_identity=expected_anchor_identity,
                 )
             except FileExistsError:

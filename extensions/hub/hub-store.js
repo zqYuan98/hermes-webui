@@ -310,17 +310,17 @@
       next.actionItems = (Array.isArray(meeting.actionItems) ? meeting.actionItems : []).filter(function (action) {
         return action && typeof action === 'object' && !Array.isArray(action);
       }).map(function (action, actionIndex) {
-        return {
-          id: stringValue(action.id, 'action-legacy-' + meetingIndex + '-' + actionIndex),
-          title: stringValue(action.title),
-          owner: stringValue(action.owner),
-          due: stringValue(action.due),
-          deliverable: stringValue(action.deliverable),
-          acceptance: stringValue(action.acceptance),
-          dependencies: stringValue(action.dependencies),
-          status: actionStatuses[action.status] ? action.status : 'open',
-          updatedAt: stringValue(action.updatedAt)
-        };
+        var normalizedAction = Object.assign({}, action);
+        normalizedAction.id = stringValue(action.id, 'action-legacy-' + meetingIndex + '-' + actionIndex);
+        normalizedAction.title = stringValue(action.title);
+        normalizedAction.owner = stringValue(action.owner);
+        normalizedAction.due = stringValue(action.due);
+        normalizedAction.deliverable = stringValue(action.deliverable);
+        normalizedAction.acceptance = stringValue(action.acceptance);
+        normalizedAction.dependencies = stringValue(action.dependencies);
+        normalizedAction.status = actionStatuses[action.status] ? action.status : 'open';
+        normalizedAction.updatedAt = stringValue(action.updatedAt);
+        return normalizedAction;
       });
       return next;
     });
@@ -442,6 +442,38 @@
 
   function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 
+  function validateMeetingIds(value) {
+    var meetingIds = Object.create(null);
+    (value.items || []).forEach(function (meeting) {
+      if (!meeting.id) throw new Error('会议存在缺少 id 的条目，已拒绝保存');
+      if (meetingIds[meeting.id]) throw new Error('会议存在重复 id「' + meeting.id + '」，已拒绝保存');
+      meetingIds[meeting.id] = true;
+      var actionIds = Object.create(null);
+      (meeting.actionItems || []).forEach(function (action) {
+        if (!action.id) throw new Error('会议「' + meeting.id + '」存在缺少 id 的行动项，已拒绝保存');
+        if (actionIds[action.id]) throw new Error('会议「' + meeting.id + '」行动项存在重复 id「' + action.id + '」，已拒绝保存');
+        actionIds[action.id] = true;
+      });
+    });
+  }
+
+  function mergeObjectFields(base, local, remote, excluded, label) {
+    var result = {}, keys = Object.create(null);
+    [base, local, remote].forEach(function (source) {
+      Object.keys(source || {}).forEach(function (key) { if (!excluded[key]) keys[key] = true; });
+    });
+    Object.keys(keys).forEach(function (key) {
+      var localChanged = !sameJson(local && local[key], base && base[key]);
+      var remoteChanged = !sameJson(remote && remote[key], base && base[key]);
+      if (localChanged && remoteChanged && !sameJson(local && local[key], remote && remote[key])) {
+        throw new Error(label + '字段「' + key + '」已被其他页面或 Agent 修改，请刷新后重试');
+      }
+      var value = localChanged ? local[key] : remote[key];
+      if (typeof value !== 'undefined') result[key] = value;
+    });
+    return result;
+  }
+
   function mergeRows(baseRows, localRows, remoteRows, label) {
     var base = Object.create(null), local = Object.create(null), remote = Object.create(null), ids = Object.create(null);
     function index(rows, target) {
@@ -506,9 +538,10 @@
           meetingsWriteBlocked = true;
           throw new Error('hub-meetings.json 无法解析，已禁止覆盖；请先修复或恢复该文件');
         }
-        var persisted = {
-          items: mergeRows(meetingsBase.items, localMeetings.items, remote.items, '会议')
-        };
+        validateMeetingIds(localMeetings);
+        validateMeetingIds(remote);
+        var persisted = mergeObjectFields(meetingsBase, localMeetings, remote, { items: true }, '会议文件');
+        persisted.items = mergeRows(meetingsBase.items, localMeetings.items, remote.items, '会议');
         return writeText(FILES.meetings, JSON.stringify(persisted, null, 2)).then(function () {
           meetingsMissing = false;
           meetingsBase = JSON.parse(JSON.stringify(persisted));

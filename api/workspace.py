@@ -25,9 +25,11 @@ from pathlib import Path, PurePosixPath
 logger = logging.getLogger(__name__)
 
 _ESCAPE_AUTH_TTL_SECONDS = 300
+_ESCAPE_UPLOAD_PREPARE_TTL_SECONDS = 30
 _ESCAPE_UPLOAD_AUTH_TTL_SECONDS = 120
 _ESCAPE_AUTH_LOCK = threading.Lock()
 _ESCAPE_AUTH_TOKENS: dict[str, dict[str, str | int | float]] = {}
+_ESCAPE_UPLOAD_PREPARE_TOKENS: dict[str, dict[str, str | int | float]] = {}
 _ESCAPE_UPLOAD_AUTH_TOKENS: dict[str, dict[str, str | int | float]] = {}
 
 from api.config import (
@@ -1070,6 +1072,29 @@ def open_anchored_fd(workspace: Path, target: Path, *, want_dir: bool) -> int:
         raise
 
 
+def open_anchored_dir_identity(root: Path, target: Path) -> tuple[Path, tuple[int, int]]:
+    """Open an existing directory through an anchored walk and return its identity.
+
+    The canonical path and ``(st_dev, st_ino)`` are derived from the same target
+    that was opened with ``O_NOFOLLOW``. External upload capabilities require
+    this race-safe primitive and therefore fail closed when ``dir_fd`` support
+    is unavailable.
+    """
+    if not _DIR_FD_OK:
+        raise OSError("Race-safe external directory authorization is unavailable on this platform")
+    root_resolved = root.resolve()
+    # ``target`` is the canonical path produced by the caller's containment
+    # resolution. Do not resolve it again here: a pathname replacement in that
+    # interval must be rejected by the anchored O_NOFOLLOW walk, not followed.
+    target_resolved = target
+    fd = open_anchored_fd(root_resolved, target_resolved, want_dir=True)
+    try:
+        stat = os.fstat(fd)
+        return target_resolved, (int(stat.st_dev), int(stat.st_ino))
+    finally:
+        os.close(fd)
+
+
 def open_anchored_create_fd(
     root: Path,
     dest: Path,
@@ -1085,8 +1110,10 @@ def open_anchored_create_fd(
     must not already exist (callers dedup first). Raises ValueError if ``dest``
     is not under ``root``, FileExistsError if it exists, FileNotFoundError if a
     component was swapped to a symlink. Caller owns and must close the returned
-    write fd. On platforms without dir_fd support (Windows) falls back to a plain
-    exclusive create — no new race protection but no regression.
+    write fd. On platforms without ``dir_fd`` support, ordinary workspace writes
+    retain the legacy exclusive-create fallback; callers supplying
+    ``expected_root_identity`` (external capabilities) fail closed because
+    pathname creation cannot enforce identity race-safely.
     """
     root_resolved = root.resolve()
     try:
@@ -1097,11 +1124,11 @@ def open_anchored_create_fd(
         raise ValueError(f"Invalid destination: {dest}")
 
     if not _DIR_FD_OK:
-        # Windows / no openat: create parent dirs then exclusively create the leaf.
+        # Normal workspace writes retain the portability fallback. External
+        # upload capabilities carry an expected directory identity and must fail
+        # closed: pathname creation cannot enforce that identity race-safely.
         if expected_root_identity is not None:
-            root_stat = root_resolved.stat()
-            if (int(root_stat.st_dev), int(root_stat.st_ino)) != expected_root_identity:
-                raise FileNotFoundError(f"Not found: {root}")
+            raise OSError("Race-safe anchored creation is unavailable on this platform")
         dest.parent.mkdir(parents=True, exist_ok=True)
         return os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o644)
 
@@ -1604,6 +1631,13 @@ def _escape_prune_tokens(now: float | None = None) -> None:
     expired = [token for token, record in _ESCAPE_AUTH_TOKENS.items() if float(record.get("expires_at") or 0.0) <= cutoff]
     for token in expired:
         _ESCAPE_AUTH_TOKENS.pop(token, None)
+    expired_prepares = [
+        token
+        for token, record in _ESCAPE_UPLOAD_PREPARE_TOKENS.items()
+        if float(record.get("expires_at") or 0.0) <= cutoff
+    ]
+    for token in expired_prepares:
+        _ESCAPE_UPLOAD_PREPARE_TOKENS.pop(token, None)
     expired_uploads = [
         token
         for token, record in _ESCAPE_UPLOAD_AUTH_TOKENS.items()
@@ -1700,14 +1734,73 @@ def resolve_authorized_escape_request(workspace: Path, session_id: str, token: s
     }
 
 
-def authorize_escape_upload(workspace: Path, session_id: str, read_token: str, rel: str) -> dict:
-    """Mint an upload-only capability for one existing external directory."""
+def prepare_escape_upload(workspace: Path, session_id: str, read_token: str, rel: str) -> dict:
+    """Record the exact external directory identity before browser confirmation."""
     resolved = resolve_authorized_escape_request(workspace, session_id, read_token, rel)
     target = safe_resolve_ws(resolved["external_root"], resolved["external_rel"])
-    if not target.is_dir():
-        raise ValueError("External upload target must be a directory")
-    target_stat = target.stat()
+    target, target_identity = open_anchored_dir_identity(resolved["external_root"], target)
     now = time.time()
+    read_expires_at = float(resolved["record"].get("expires_at") or 0.0)
+    expires_at = min(now + _ESCAPE_UPLOAD_PREPARE_TTL_SECONDS, read_expires_at)
+    if expires_at <= now:
+        raise EscapeAuthorizationExpiredError("Escape authorization expired")
+    token = secrets.token_urlsafe(24)
+    record = {
+        "session_id": str(session_id or ""),
+        "workspace_root": str(workspace.resolve()),
+        "surface_path": str(resolved["surface_path"]),
+        "authorized_path": str(resolved["request_path"]),
+        "target_path": str(target),
+        "target_dev": target_identity[0],
+        "target_ino": target_identity[1],
+        "read_token": str(read_token),
+        "expires_at": expires_at,
+        "capability": "upload-prepare",
+    }
+    with _ESCAPE_AUTH_LOCK:
+        _escape_prune_tokens(now)
+        _ESCAPE_UPLOAD_PREPARE_TOKENS[token] = record
+    return {
+        "prepare_token": token,
+        "path": record["authorized_path"],
+        "expires_at": expires_at,
+        "expires_in": max(0, int(expires_at - now)),
+        "capability": "upload-prepare",
+        "read_only": True,
+    }
+
+
+def authorize_escape_upload(
+    workspace: Path,
+    session_id: str,
+    read_token: str,
+    rel: str,
+    prepare_token: str,
+) -> dict:
+    """Activate upload authority only if the pre-confirmation directory is unchanged."""
+    resolved = resolve_authorized_escape_request(workspace, session_id, read_token, rel)
+    target = safe_resolve_ws(resolved["external_root"], resolved["external_rel"])
+    target, target_identity = open_anchored_dir_identity(resolved["external_root"], target)
+    now = time.time()
+    prepare_token = str(prepare_token or "").strip()
+    with _ESCAPE_AUTH_LOCK:
+        _escape_prune_tokens(now)
+        prepared = dict(_ESCAPE_UPLOAD_PREPARE_TOKENS.pop(prepare_token, None) or {})
+    workspace_root = str(workspace.resolve())
+    expected = {
+        "session_id": str(session_id or ""),
+        "workspace_root": workspace_root,
+        "surface_path": str(resolved["surface_path"]),
+        "authorized_path": str(resolved["request_path"]),
+        "target_path": str(target),
+        "target_dev": target_identity[0],
+        "target_ino": target_identity[1],
+        "read_token": str(read_token),
+    }
+    if not prepared or prepared.get("capability") != "upload-prepare":
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    if any(prepared.get(key) != value for key, value in expected.items()):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
     read_expires_at = float(resolved["record"].get("expires_at") or 0.0)
     expires_at = min(now + _ESCAPE_UPLOAD_AUTH_TTL_SECONDS, read_expires_at)
     if expires_at <= now:
@@ -1718,9 +1811,9 @@ def authorize_escape_upload(workspace: Path, session_id: str, read_token: str, r
         "workspace_root": str(workspace.resolve()),
         "surface_path": str(resolved["surface_path"]),
         "authorized_path": str(resolved["request_path"]),
-        "target_path": str(target.resolve()),
-        "target_dev": int(target_stat.st_dev),
-        "target_ino": int(target_stat.st_ino),
+        "target_path": str(target),
+        "target_dev": target_identity[0],
+        "target_ino": target_identity[1],
         "read_token": str(read_token),
         "expires_at": expires_at,
         "capability": "upload",
@@ -1775,16 +1868,14 @@ def resolve_authorized_escape_upload_request(
         raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
     try:
         target = safe_resolve_ws(resolved["external_root"], resolved["external_rel"])
-        target_stat = target.stat()
+        target, target_identity = open_anchored_dir_identity(resolved["external_root"], target)
     except (ValueError, OSError):
         raise EscapeUploadAuthorizationExpiredError("External upload authorization expired") from None
-    if not target.is_dir():
+    if str(target) != str(record.get("target_path") or ""):
         raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
-    if str(target.resolve()) != str(record.get("target_path") or ""):
+    if target_identity[0] != int(record.get("target_dev") or -1):
         raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
-    if int(target_stat.st_dev) != int(record.get("target_dev") or -1):
-        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
-    if int(target_stat.st_ino) != int(record.get("target_ino") or -1):
+    if target_identity[1] != int(record.get("target_ino") or -1):
         raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
     resolved["target"] = target
     resolved["upload_record"] = record

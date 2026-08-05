@@ -9621,6 +9621,7 @@ from api.workspace import (
     set_last_workspace,
     git_info_for_workspace,
     authorize_escape_target,
+    prepare_escape_upload,
     authorize_escape_upload,
     EscapeAuthorizationExpiredError,
     EscapeUploadAuthorizationExpiredError,
@@ -17069,21 +17070,36 @@ def _handle_escape_upload_authorize(handler, parsed, body: dict | None = None):
     sid = str(body.get("session_id") or qs.get("session_id", [""])[0] or "").strip()
     rel = str(body.get("path") or qs.get("path", [""])[0] or "").strip()
     token = str(body.get("token") or qs.get("token", [""])[0] or "").strip()
+    phase = str(body.get("phase") or qs.get("phase", ["activate"])[0] or "activate").strip()
+    prepare_token = str(
+        body.get("prepare_token") or qs.get("prepare_token", [""])[0] or ""
+    ).strip()
     if not sid:
         return bad(handler, "session_id is required")
     if not rel:
         return bad(handler, "path is required")
     if not token:
         return bad(handler, "read-only escape token is required")
+    if phase not in ("prepare", "activate"):
+        return bad(handler, "invalid upload authorization phase")
+    if phase == "activate" and not prepare_token:
+        return bad(handler, "upload prepare token is required")
     try:
-        session = get_session_for_file_ops(sid)
+        # Match the upload redemption path: only a WebUI-owned session that
+        # handle_workspace_upload() can load may receive an upload capability.
+        session = get_session(sid)
     except KeyError:
         return bad(handler, "Session not found", 404)
     try:
-        payload = authorize_escape_upload(Path(session.workspace), sid, token, rel)
+        if phase == "prepare":
+            payload = prepare_escape_upload(Path(session.workspace), sid, token, rel)
+        else:
+            payload = authorize_escape_upload(
+                Path(session.workspace), sid, token, rel, prepare_token
+            )
     except (EscapeAuthorizationExpiredError, EscapeUploadAuthorizationExpiredError) as exc:
         return bad(handler, _sanitize_error(exc), 403)
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, OSError) as exc:
         return bad(handler, _sanitize_error(exc), 403)
     return j(handler, payload)
 

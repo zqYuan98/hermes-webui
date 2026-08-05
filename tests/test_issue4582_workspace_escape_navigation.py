@@ -97,6 +97,30 @@ def _make_session(workspace: pathlib.Path) -> str:
     return payload["session"]["session_id"]
 
 
+def _prepare_upload_grant(sid: str, path: str, read_token: str) -> tuple[dict, int]:
+    return _post_json(
+        "/api/escape/upload-authorize",
+        {"session_id": sid, "path": path, "token": read_token, "phase": "prepare"},
+        headers=_browser_headers(),
+    )
+
+
+def _activate_upload_grant(
+    sid: str, path: str, read_token: str, prepare_token: str
+) -> tuple[dict, int]:
+    return _post_json(
+        "/api/escape/upload-authorize",
+        {
+            "session_id": sid,
+            "path": path,
+            "token": read_token,
+            "phase": "activate",
+            "prepare_token": prepare_token,
+        },
+        headers=_browser_headers(),
+    )
+
+
 def _read_workspace_js() -> str:
     return WORKSPACE_JS.read_text(encoding="utf-8")
 
@@ -326,10 +350,12 @@ class TestIssue4582EscapeNavigationLive:
         assert denied_status == 403, denied
         assert not (outside / "denied.txt").exists()
 
-        upload_grant, grant_status = _post_json(
-            "/api/escape/upload-authorize",
-            {"session_id": sid, "path": "escape/reports", "token": read_grant["token"]},
-            headers=_browser_headers(),
+        prepared, prepare_status = _prepare_upload_grant(
+            sid, "escape/reports", read_grant["token"]
+        )
+        assert prepare_status == 200, prepared
+        upload_grant, grant_status = _activate_upload_grant(
+            sid, "escape/reports", read_grant["token"], prepared["prepare_token"]
         )
         assert grant_status == 200, upload_grant
         assert upload_grant["capability"] == "upload"
@@ -375,6 +401,117 @@ class TestIssue4582EscapeNavigationLive:
         assert "sidecar_error" not in uploaded_office
         assert not (outside / "reports" / "review.docx.md").exists()
 
+    def test_external_upload_rejects_dangling_leaf_symlink_without_creating_nested_path(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        outside = tmp_path / "outside"
+        reports = outside / "reports"
+        workspace.mkdir()
+        reports.mkdir(parents=True)
+        (workspace / "escape").symlink_to(outside)
+        (reports / "alias.txt").symlink_to("nested/payload.txt")
+        sid = _make_session(workspace)
+
+        read_grant, status = _post_json(
+            "/api/escape/authorize",
+            {"session_id": sid, "path": "escape"},
+            headers=_browser_headers(),
+        )
+        assert status == 200, read_grant
+        prepared, status = _prepare_upload_grant(
+            sid, "escape/reports", read_grant["token"]
+        )
+        assert status == 200, prepared
+        upload_grant, status = _activate_upload_grant(
+            sid, "escape/reports", read_grant["token"], prepared["prepare_token"]
+        )
+        assert status == 200, upload_grant
+
+        uploaded, status = _post_multipart(
+            "/api/workspace/upload",
+            {
+                "session_id": sid,
+                "path": "escape/reports",
+                "upload_token": upload_grant["token"],
+            },
+            {"file": ("alias.txt", b"must-not-follow")},
+            headers=_browser_headers(),
+        )
+        assert status in (403, 409), uploaded
+        assert (reports / "alias.txt").is_symlink()
+        assert not (reports / "nested").exists()
+
+    def test_external_upload_rejects_existing_leaf_without_deduplicating_or_overwriting(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        outside = tmp_path / "outside"
+        reports = outside / "reports"
+        workspace.mkdir()
+        reports.mkdir(parents=True)
+        (workspace / "escape").symlink_to(outside)
+        (reports / "existing.txt").write_bytes(b"original")
+        sid = _make_session(workspace)
+
+        read_grant, status = _post_json(
+            "/api/escape/authorize",
+            {"session_id": sid, "path": "escape"},
+            headers=_browser_headers(),
+        )
+        assert status == 200, read_grant
+        prepared, status = _prepare_upload_grant(
+            sid, "escape/reports", read_grant["token"]
+        )
+        assert status == 200, prepared
+        upload_grant, status = _activate_upload_grant(
+            sid, "escape/reports", read_grant["token"], prepared["prepare_token"]
+        )
+        assert status == 200, upload_grant
+
+        uploaded, status = _post_multipart(
+            "/api/workspace/upload",
+            {
+                "session_id": sid,
+                "path": "escape/reports",
+                "upload_token": upload_grant["token"],
+            },
+            {"file": ("existing.txt", b"replacement")},
+            headers=_browser_headers(),
+        )
+        assert status == 409, uploaded
+        assert (reports / "existing.txt").read_bytes() == b"original"
+        assert not (reports / "existing-1.txt").exists()
+
+    def test_external_upload_activation_rejects_real_directory_replacement(self, tmp_path):
+        workspace = tmp_path / "workspace"
+        outside = tmp_path / "outside"
+        reports = outside / "reports"
+        substitute = outside / "substitute"
+        original = outside / "reports-original"
+        workspace.mkdir()
+        reports.mkdir(parents=True)
+        substitute.mkdir()
+        (workspace / "escape").symlink_to(outside)
+        sid = _make_session(workspace)
+
+        read_grant, status = _post_json(
+            "/api/escape/authorize",
+            {"session_id": sid, "path": "escape"},
+            headers=_browser_headers(),
+        )
+        assert status == 200, read_grant
+        prepared, status = _prepare_upload_grant(
+            sid, "escape/reports", read_grant["token"]
+        )
+        assert status == 200, prepared
+
+        reports.rename(original)
+        substitute.rename(reports)
+
+        activated, status = _activate_upload_grant(
+            sid, "escape/reports", read_grant["token"], prepared["prepare_token"]
+        )
+        assert status == 403, activated
+        assert not (reports / "payload.txt").exists()
+        assert not (original / "payload.txt").exists()
+
     def test_external_upload_capability_rejects_wrong_session_traversal_and_nested_escape(self, tmp_path):
         workspace = tmp_path / "workspace"
         second_workspace = tmp_path / "workspace-2"
@@ -396,10 +533,12 @@ class TestIssue4582EscapeNavigationLive:
             {"session_id": sid, "path": "escape"},
             headers=_browser_headers(),
         )
-        upload_grant, status = _post_json(
-            "/api/escape/upload-authorize",
-            {"session_id": sid, "path": "escape/reports", "token": read_grant["token"]},
-            headers=_browser_headers(),
+        prepared, prepare_status = _prepare_upload_grant(
+            sid, "escape/reports", read_grant["token"]
+        )
+        assert prepare_status == 200, prepared
+        upload_grant, status = _activate_upload_grant(
+            sid, "escape/reports", read_grant["token"], prepared["prepare_token"]
         )
         assert status == 200, upload_grant
 
@@ -698,6 +837,10 @@ const toasts = [];
 const showConfirmDialog = async (opts) => { confirms.push(opts); return true; };
 const api = async (path, opts) => {
   calls.push({path, method: opts.method, body: opts.body});
+  const body = JSON.parse(opts.body);
+  if(body.phase === 'prepare'){
+    return {prepare_token: 'prepare-token', path: 'escape/reports', expires_at: 4102444800, capability: 'upload-prepare'};
+  }
   return {token: 'upload-token', path: 'escape/reports', expires_at: 4102444800, capability: 'upload'};
 };
 const showToast = (...args) => toasts.push(args);
@@ -724,13 +867,60 @@ const fns = runner(S, showConfirmDialog, api, showToast, t, URLSearchParams);
         assert result["upload"]["uploadToken"] == "upload-token"
         assert result["upload"]["uploadPath"] == "escape/reports"
         assert result["confirms"][0]["message"] == "external_upload_confirm\n\nescape/reports"
-        assert result["calls"] == [
-            {
-                "path": "/api/escape/upload-authorize",
-                "method": "POST",
-                "body": '{"session_id":"sess-1","path":"escape/reports","token":"read-token"}',
-            }
-        ]
+        assert len(result["calls"]) == 2
+        prepared_body = json.loads(result["calls"][0]["body"])
+        activated_body = json.loads(result["calls"][1]["body"])
+        assert prepared_body == {
+            "session_id": "sess-1",
+            "path": "escape/reports",
+            "token": "read-token",
+            "phase": "prepare",
+        }
+        assert activated_body == {
+            "session_id": "sess-1",
+            "path": "escape/reports",
+            "token": "read-token",
+            "phase": "activate",
+            "prepare_token": "prepare-token",
+        }
+
+    def test_external_upload_cancel_stops_after_prepare_without_caching_authority(self):
+        helper_block = _workspace_escape_helper_block()
+        js = (
+            "const helperBlock = "
+            + json.dumps(helper_block)
+            + ";\n"
+            + r"""
+const S = {
+  session: { session_id: 'sess-1' }, currentDir: 'escape/reports',
+  _escapeGrants: {
+    escape: {sessionId:'sess-1', path:'escape', token:'read-token', expiresAt:Date.now()+60_000, isDir:true}
+  }
+};
+const calls = [];
+const showConfirmDialog = async () => false;
+const api = async (path, opts) => {
+  calls.push(JSON.parse(opts.body));
+  return {prepare_token:'prepare-token', path:'escape/reports', expires_at:4102444800, capability:'upload-prepare'};
+};
+const showToast = () => {};
+const t = (key) => key;
+const runner = new Function(
+  'S','showConfirmDialog','api','showToast','t','URLSearchParams',
+  helperBlock + '; return {authorizeWorkspaceEscapeUpload,_workspaceEscapeUploadGrantForPath};'
+);
+const fns = runner(S,showConfirmDialog,api,showToast,t,URLSearchParams);
+(async () => {
+  const granted = await fns.authorizeWorkspaceEscapeUpload('escape/reports');
+  console.log(JSON.stringify({granted,calls,cached:fns._workspaceEscapeUploadGrantForPath('escape/reports')}));
+})().catch(err => {console.error(err && err.stack || err); process.exit(1);});
+"""
+        )
+        result = _run_node(js)
+        assert result["granted"] is None
+        assert result["cached"] is None
+        assert len(result["calls"]) == 1
+        assert result["calls"][0]["phase"] == "prepare"
 
     def test_external_upload_token_is_not_reused_for_a_sibling_directory(self):
         helper_block = _workspace_escape_helper_block()
@@ -754,6 +944,10 @@ const calls = [];
 const showConfirmDialog = async (opts) => { confirms.push(opts); return true; };
 const api = async (path, opts) => {
   calls.push({path, body: opts.body});
+  const body = JSON.parse(opts.body);
+  if(body.phase === 'prepare'){
+    return {prepare_token: 'other-prepare', path: 'escape/other', expires_at: 4102444800, capability: 'upload-prepare'};
+  }
   return {token: 'other-token', path: 'escape/other', expires_at: 4102444800, capability: 'upload'};
 };
 const showToast = () => {};
@@ -773,6 +967,9 @@ const fns = runner(S, showConfirmDialog, api, showToast, t, URLSearchParams);
         result = _run_node(js)
         assert result["before"] is None
         assert len(result["confirms"]) == 1
+        assert len(result["calls"]) == 2
+        assert json.loads(result["calls"][0]["body"])["phase"] == "prepare"
+        assert json.loads(result["calls"][1]["body"])["phase"] == "activate"
         assert result["granted"]["uploadToken"] == "other-token"
         assert result["granted"]["uploadPath"] == "escape/other"
 

@@ -144,7 +144,8 @@
   var view = {
     module: 'home',
     data: null,
-    form: null,        // { kind, id } — kind 为 design/service/command/resource
+    form: null,        // { kind, id } — kind 为 design/service/command/resource/meeting
+    meetingDraft: null,
     meetingActionDrafts: null,
     query: '',
     tag: '',
@@ -759,26 +760,47 @@
   function openMeetingForm(id) {
     var meeting = findById(view.data.meetings.items, id);
     view.form = { kind: 'meeting', id: id || '' };
+    view.meetingDraft = Object.assign({}, meeting || {});
     view.meetingActionDrafts = meeting && Array.isArray(meeting.actionItems)
       ? meeting.actionItems.map(function (action) { return Object.assign(blankMeetingAction(), action); })
       : [blankMeetingAction()];
     render();
   }
 
+  function syncMeetingDraft() {
+    var form = document.querySelector('[data-hub-form="meeting"]');
+    if (!form) return;
+    var data = new FormData(form);
+    var get = function (name) { return String(data.get(name) || '').trim(); };
+    view.meetingDraft = Object.assign({}, view.meetingDraft || {}, {
+      title: get('title'), type: get('type') || 'sync', status: get('status') || 'planned',
+      startAt: get('startAt'), endAt: get('endAt'), nextReviewAt: get('nextReviewAt'),
+      participants: parseList(get('participants')), projectLinks: parseList(get('projectLinks')),
+      transcriptFile: get('transcriptFile'), minutesFile: get('minutesFile'), summary: get('summary'),
+      decisions: parseList(get('decisions')), risks: parseList(get('risks')),
+      openQuestions: parseList(get('openQuestions'))
+    });
+  }
+
   function syncMeetingActionDrafts() {
     var rows = document.querySelectorAll('[data-hub-meeting-action]');
-    view.meetingActionDrafts = Array.prototype.map.call(rows, function (row) {
+    view.meetingActionDrafts = Array.prototype.map.call(rows, function (row, index) {
       var value = function (name) {
         var input = row.querySelector('[name="' + name + '"]');
         return input ? String(input.value || '').trim() : '';
       };
-      return {
+      return Object.assign({}, (view.meetingActionDrafts || [])[index] || {}, {
         id: value('action_id'), title: value('action_title'), owner: value('action_owner'),
         due: value('action_due'), deliverable: value('action_deliverable'),
         acceptance: value('action_acceptance'), dependencies: value('action_dependencies'),
         status: value('action_status') || 'open'
-      };
+      });
     });
+  }
+
+  function syncMeetingFormDrafts() {
+    syncMeetingDraft();
+    syncMeetingActionDrafts();
   }
 
   function meetingActionEditor(action, index) {
@@ -798,7 +820,7 @@
   }
 
   function meetingForm() {
-    var meeting = findById(view.data.meetings.items, view.form.id) || {};
+    var meeting = view.meetingDraft || findById(view.data.meetings.items, view.form.id) || {};
     var actions = view.meetingActionDrafts || (meeting.actionItems || []).map(function (action) {
       return Object.assign(blankMeetingAction(), action);
     });
@@ -1768,6 +1790,32 @@
     });
   }
 
+  function saveMeetingsCandidate(candidate, afterMsg, closeFormOnSuccess) {
+    return HubStore.write('meetings', candidate).then(function () {
+      return HubStore.read('meetings');
+    }).then(function (persisted) {
+      view.data.meetings = persisted;
+      if (closeFormOnSuccess) {
+        view.form = null;
+        view.meetingDraft = null;
+        view.meetingActionDrafts = null;
+      }
+      if (afterMsg) toast(afterMsg, 'success');
+      render();
+      renderSidebar();
+    }, function (err) {
+      HubStore.invalidate();
+      return HubStore.read('meetings').then(function (remote) {
+        view.data.meetings = remote;
+        toast('保存失败：' + ((err && err.message) || '未知错误') + '；已重新读取磁盘数据', 'error');
+        render();
+        renderSidebar();
+      }, function () {
+        toast('保存失败：' + ((err && err.message) || '未知错误') + '；重新读取磁盘数据也失败', 'error');
+      });
+    });
+  }
+
   /* ── 与 Agent 联动 ────────────────────────────────────────────────── */
 
   /* Hub 的价值一半在这里：把一条记录直接变成给 agent 的指令，不用手打上下文。 */
@@ -1944,7 +1992,7 @@
       var actionDependencies = f.getAll('action_dependencies');
       var actionStatuses = f.getAll('action_status');
       var actionItems = actionTitles.map(function (title, index) {
-        return {
+        return Object.assign({}, (view.meetingActionDrafts || [])[index] || {}, {
           id: String(actionIds[index] || HubStore.newId()),
           title: String(title || '').trim(),
           owner: String(actionOwners[index] || '').trim(),
@@ -1954,7 +2002,7 @@
           dependencies: String(actionDependencies[index] || '').trim(),
           status: String(actionStatuses[index] || 'open'),
           updatedAt: nowIso()
-        };
+        });
       }).filter(function (action) {
         return action.title || action.owner || action.due || action.deliverable || action.acceptance || action.dependencies;
       });
@@ -1968,11 +2016,13 @@
         minutesFile: get('minutesFile'), nextReviewAt: isoFromInput(get('nextReviewAt')), updatedAt: nowIso()
       };
       if (!meetingPayload.title) return;
-      if (currentMeeting) Object.assign(currentMeeting, meetingPayload);
-      else d.meetings.items.unshift(Object.assign({ id: HubStore.newId(), createdAt: nowIso() }, meetingPayload));
-      view.form = null;
-      view.meetingActionDrafts = null;
-      save('meetings', currentMeeting ? '会议已更新' : '会议已新建');
+      var meetingCandidate = JSON.parse(JSON.stringify(d.meetings));
+      var candidateCurrent = editing ? findById(meetingCandidate.items, editing) : null;
+      if (candidateCurrent) Object.assign(candidateCurrent, meetingPayload);
+      else meetingCandidate.items.unshift(Object.assign({ id: HubStore.newId(), createdAt: nowIso() }, meetingPayload));
+      view.meetingDraft = Object.assign({}, currentMeeting || {}, meetingPayload);
+      view.meetingActionDrafts = actionItems;
+      saveMeetingsCandidate(meetingCandidate, currentMeeting ? '会议已更新' : '会议已新建', true);
       return;
     }
 
@@ -2086,7 +2136,7 @@
       case 'setup': doSetup(); return;
       case 'pick-ws': { var inp = $id('hubSetupPath'); if (inp) inp.value = value || ''; return; }
       case 'reload': reload(); return;
-      case 'cancel-form': view.form = null; view.meetingActionDrafts = null; render(); return;
+      case 'cancel-form': view.form = null; view.meetingDraft = null; view.meetingActionDrafts = null; render(); return;
       case 'clear-machine-filter': if (guardOpsForm()) return; view.opsMachine = ''; render(); return;
       case 'machine-services': if (guardOpsForm()) return; view.opsMachine = id || ''; view.opsView = 'services'; view.opsSelectedService = ''; render(); return;
       case 'open-service': openServiceDrawer(id); return;
@@ -2113,12 +2163,12 @@
       case 'new-meeting': openMeetingForm(''); return;
       case 'edit-meeting': openMeetingForm(id); return;
       case 'add-meeting-action':
-        syncMeetingActionDrafts();
+        syncMeetingFormDrafts();
         view.meetingActionDrafts.push(blankMeetingAction());
         render();
         return;
       case 'remove-meeting-action':
-        syncMeetingActionDrafts();
+        syncMeetingFormDrafts();
         view.meetingActionDrafts.splice(Number(btn.getAttribute('data-hub-index')), 1);
         render();
         return;
@@ -2162,8 +2212,9 @@
 
       case 'del-meeting':
         if (!confirm('删除这条会议记录？')) return;
-        d.meetings.items = d.meetings.items.filter(function (meeting) { return meeting.id !== id; });
-        save('meetings', '会议已删除');
+        var deleteCandidate = JSON.parse(JSON.stringify(d.meetings));
+        deleteCandidate.items = deleteCandidate.items.filter(function (meeting) { return meeting.id !== id; });
+        saveMeetingsCandidate(deleteCandidate, '会议已删除', false);
         return;
 
       case 'del-service':
