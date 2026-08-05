@@ -225,6 +225,9 @@ function _storeWorkspaceEscapeGrant(data){
     token: String(data.token),
     expiresAt: Number(data.expires_at || 0) * 1000,
     isDir: !!data.is_dir,
+    uploadToken: '',
+    uploadExpiresAt: 0,
+    uploadPath: '',
   };
   grants[root] = grant;
   return grant;
@@ -239,6 +242,75 @@ function _clearWorkspaceEscapeGrant(path){
 
 function _workspacePathIsReadOnly(path){
   return !!_workspaceEscapeGrantForPath(path || S.currentDir || '.');
+}
+
+function _workspaceEscapeUploadGrantForPath(path){
+  const grant = _workspaceEscapeGrantForPath(path);
+  if(!grant || !grant.uploadToken) return null;
+  const normalizedPath = _normalizeWorkspaceRelPath(path || '.');
+  if(grant.uploadPath !== normalizedPath) return null;
+  if(!grant.uploadExpiresAt || Date.now() >= grant.uploadExpiresAt){
+    grant.uploadToken = '';
+    grant.uploadExpiresAt = 0;
+    grant.uploadPath = '';
+    return null;
+  }
+  return grant;
+}
+
+async function authorizeWorkspaceEscapeUpload(path){
+  const normalizedPath = _normalizeWorkspaceRelPath(path || S.currentDir || '.');
+  const grant = _workspaceEscapeGrantForPath(normalizedPath);
+  if(!grant){
+    showToast(t('external_link_grant_expired'), 5000, 'error');
+    return null;
+  }
+  const current = _workspaceEscapeUploadGrantForPath(normalizedPath);
+  if(current) return current;
+  try{
+    const prepared = await api('/api/escape/upload-authorize', {
+      method: 'POST',
+      body: JSON.stringify({
+        session_id: S.session.session_id,
+        path: normalizedPath,
+        token: grant.token,
+        phase: 'prepare',
+      }),
+    });
+    if(!prepared || !prepared.prepare_token || prepared.capability !== 'upload-prepare'){
+      throw new Error('Missing upload preparation');
+    }
+    const ok = await showConfirmDialog({
+      title: t('external_upload_title'),
+      message: t('external_upload_confirm') + '\n\n' + normalizedPath,
+      confirmLabel: t('workspace_upload_file'),
+      danger: false,
+      focusCancel: true,
+    });
+    if(!ok) return null;
+    const data = await api('/api/escape/upload-authorize', {
+      method: 'POST',
+      body: JSON.stringify({
+        session_id: S.session.session_id,
+        path: normalizedPath,
+        token: grant.token,
+        phase: 'activate',
+        prepare_token: prepared.prepare_token,
+      }),
+    });
+    if(!data || !data.token || data.capability !== 'upload') throw new Error('Missing upload capability');
+    grant.uploadToken = String(data.token);
+    grant.uploadExpiresAt = Number(data.expires_at || 0) * 1000;
+    grant.uploadPath = _normalizeWorkspaceRelPath(data.path || normalizedPath);
+    showToast(t('external_upload_granted'), 2500, 'success');
+    return grant;
+  }catch(e){
+    grant.uploadToken = '';
+    grant.uploadExpiresAt = 0;
+    grant.uploadPath = '';
+    showToast(t('external_upload_expired'), 5000, 'error');
+    return null;
+  }
 }
 
 function _workspaceRouteForPath(path, kind, opts={}){
@@ -310,7 +382,7 @@ async function authorizeWorkspaceEscapeNavigation(item){
     });
     const grant = _storeWorkspaceEscapeGrant(data);
     if(!grant) throw new Error('Missing escape authorization token');
-    showToast(t('external_link_read_only'), 2000);
+    showToast(t('external_link_read_only_upload'), 2000);
     return grant;
   }catch(e){
     showToast(t('external_link_grant_expired') || (e && e.message ? e.message : String(e)), 5000, 'error');
@@ -717,6 +789,19 @@ function clearWorkspaceTreeSkeleton(){
   if(tree.querySelector('.skeleton-tree')) tree.innerHTML = '';
 }
 
+function syncWorkspaceMutationButtons(path){
+  const hasSession=!!S.session;
+  const readOnly=hasSession&&_workspacePathIsReadOnly(path||S.currentDir||'.');
+  const newFile=$('btnNewFile');
+  const newFolder=$('btnNewFolder');
+  const refresh=$('btnRefreshPanel');
+  const upload=$('btnUploadWorkspace');
+  if(newFile)newFile.disabled=!hasSession||readOnly;
+  if(newFolder)newFolder.disabled=!hasSession||readOnly;
+  if(refresh)refresh.disabled=!hasSession;
+  if(upload)upload.disabled=!hasSession;
+}
+
 async function loadDir(path, opts={}){
   const preservePreview=!!(opts&&opts.preservePreview);
   const refreshExpanded=!!(opts&&opts.refreshExpanded);
@@ -733,6 +818,7 @@ async function loadDir(path, opts={}){
       _restoreExpandedDirs();  // restore per-workspace expanded state after root and refresh resets
     }
     S.currentDir=path||'.';
+    if(typeof syncWorkspaceMutationButtons==='function')syncWorkspaceMutationButtons(S.currentDir);
     const data=await api(
       _workspaceRouteForPath(path, 'list') ||
       `/api/list?session_id=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path||'.')}`
@@ -747,6 +833,7 @@ async function loadDir(path, opts={}){
       showToast(t('workspace_recovered_notice',S.session.workspace),5000,'warning');
     }
     S.entries=data.entries||[];renderBreadcrumb();renderFileTree();
+    if(typeof syncWorkspaceMutationButtons==='function')syncWorkspaceMutationButtons(S.currentDir);
     // #2673 — refresh Artifacts tab when its source data (the file tree) updates.
     if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
     // Pre-fetch contents of restored expanded dirs so they render without a second click
@@ -985,7 +1072,7 @@ function updateEditBtn(){
 async function toggleEditMode(){
   const editing = $('previewEditArea').style.display!=='none';
   if(_workspacePathIsReadOnly(_previewCurrentPath)){
-    showToast(t('external_link_read_only'), 2000);
+    showToast(t('external_link_read_only_upload'), 2000);
     return;
   }
   if(!editing && _previewServerEditable===false){
@@ -1309,11 +1396,8 @@ async function copyPreviewRelativePath(){
 }
 
 // ── Workspace upload ──────────────────────────────────────────────────
-function triggerWorkspaceUpload() {
-  if(_workspacePathIsReadOnly(S.currentDir || '.')){
-    showToast(t('external_link_read_only'), 2000);
-    return;
-  }
+async function triggerWorkspaceUpload() {
+  if(_workspacePathIsReadOnly(S.currentDir || '.') && !await authorizeWorkspaceEscapeUpload(S.currentDir || '.')) return;
   const input = $('workspaceFileInput');
   if (!input) return;
   input.value = '';
@@ -1330,13 +1414,14 @@ function triggerWorkspaceUpload() {
 
 async function uploadToWorkspace(file, dir) {
   if (!S.session) return;
-  if(_workspacePathIsReadOnly(dir || '.')){
-    showToast(t('external_link_read_only'), 2000);
-    return;
-  }
+  const externalGrant = _workspacePathIsReadOnly(dir || '.')
+    ? await authorizeWorkspaceEscapeUpload(dir || '.')
+    : null;
+  if(_workspacePathIsReadOnly(dir || '.') && !externalGrant) return;
   const formData = new FormData();
   formData.append('session_id', S.session.session_id);
   formData.append('path', dir || '.');
+  if(externalGrant) formData.append('upload_token', externalGrant.uploadToken);
   formData.append('file', file, file.name);
   try {
     showToast(t('uploading') || 'Uploading\u2026', 2000);
@@ -1360,6 +1445,13 @@ async function uploadToWorkspace(file, dir) {
       showToast(t('uploaded') || ('Uploaded ' + (data.filename || file.name)), 2000);
     }
   } catch (e) {
+    if(externalGrant && e && e.status === 403){
+      externalGrant.uploadToken = '';
+      externalGrant.uploadExpiresAt = 0;
+      externalGrant.uploadPath = '';
+      showToast(t('external_upload_expired'), 5000, 'error');
+      return;
+    }
     showToast(t('upload_failed') || ('Upload failed: ' + e.message), 5000, 'error');
   }
 }
@@ -1431,12 +1523,12 @@ async function _collectOsDropUploads(dataTransfer) {
 
 async function uploadOsDropToWorkspace(dataTransfer, destDir) {
   if (!S.session || !dataTransfer) return;
-  if(_workspacePathIsReadOnly(destDir || '.')){
-    showToast(t('external_link_read_only'), 2000);
-    return;
-  }
+  const isExternal = _workspacePathIsReadOnly(destDir || '.');
+  if(isExternal && !await authorizeWorkspaceEscapeUpload(destDir || '.')) return;
   const uploads = await _collectOsDropUploads(dataTransfer);
-  for (const { file, relDir } of uploads) {
+  const accepted = isExternal ? uploads.filter(function(item){ return !item.relDir; }) : uploads;
+  if(isExternal && accepted.length !== uploads.length) showToast(t('external_upload_files_only'), 5000, 'warning');
+  for (const { file, relDir } of accepted) {
     await uploadToWorkspace(file, _targetDirForRelDir(destDir, relDir));
   }
   if (S.session) await loadDir(S.currentDir);
@@ -1479,10 +1571,6 @@ function _bindWorkspaceOsUploadDropTarget(el, destDir) {
     e.preventDefault();
     e.stopPropagation();
     el.classList.remove('drag-over-upload');
-    if(_workspacePathIsReadOnly(destDir || '.')){
-      showToast(t('external_link_read_only'), 2000);
-      return;
-    }
     await uploadOsDropToWorkspace(e.dataTransfer, destDir);
   });
 }
@@ -1517,10 +1605,6 @@ if (typeof document !== 'undefined') {
       if (e.target.closest('.file-item[data-ws-type="dir"],.file-item[data-ws-is-dir="true"],.breadcrumb-seg')) return;
       e.preventDefault();
       e.stopPropagation();
-      if(_workspacePathIsReadOnly(S.currentDir || '.')){
-        showToast(t('external_link_read_only'), 2000);
-        return;
-      }
       await uploadOsDropToWorkspace(e.dataTransfer, S.currentDir || '.');
     });
   };
