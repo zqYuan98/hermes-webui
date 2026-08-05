@@ -285,6 +285,7 @@ def test_hub_init_endpoint_creates_and_tightens_private_data(test_server, cleanu
     expected = {
         "hub-profile.json",
         "hub-design.json",
+        "hub-meetings.json",
         "hub-ops.json",
         "hub-ops-auto.json",
         "hub-resources.json",
@@ -294,6 +295,7 @@ def test_hub_init_endpoint_creates_and_tightens_private_data(test_server, cleanu
     assert all((hub / name).stat().st_mode & 0o777 == 0o600 for name in expected)
     auto = json.loads((hub / "hub-ops-auto.json").read_text(encoding="utf-8"))
     assert auto["machines"] == [] and auto["services"] == []
+    assert json.loads((hub / "hub-meetings.json").read_text(encoding="utf-8")) == {"items": []}
 
 
 def test_hub_init_endpoint_rejects_symlinked_fixed_file(test_server, cleanup_test_sessions, tmp_path):

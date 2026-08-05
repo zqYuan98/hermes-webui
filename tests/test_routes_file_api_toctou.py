@@ -165,6 +165,9 @@ def test_upload_archive_cleanup_uses_anchored_helpers():
     src = UPLOAD_PY.read_text(encoding="utf-8")
 
     assert "rmtree_anchored(workspace, dest_dir)" in src
-    assert "unlink_anchored(workspace, dest.resolve())" in src
+    # Workspace uploads use the session workspace; external upload-only requests
+    # use their separately validated write root. Cleanup must stay anchored to
+    # whichever authoritative root selected the destination.
+    assert "unlink_anchored(write_root, dest.resolve())" in src
     assert "shutil.rmtree(dest_dir" not in src
     assert "dest.unlink(" not in src

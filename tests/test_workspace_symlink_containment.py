@@ -1,13 +1,37 @@
 import pytest
 
 from api.workspace import (
+    EscapeUploadAuthorizationExpiredError,
+    authorize_escape_upload,
     authorize_escape_target,
     list_authorized_escape_dir,
     list_dir,
+    open_anchored_create_fd,
     read_file_content,
     resolve_authorized_escape_request,
+    resolve_authorized_escape_upload_request,
     safe_resolve_ws,
 )
+
+
+def test_anchored_create_rejects_replaced_root_identity(tmp_path):
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    original.mkdir()
+    replacement.mkdir()
+    original_stat = original.stat()
+    expected = (int(original_stat.st_dev), int(original_stat.st_ino))
+
+    original.rmdir()
+    replacement.rename(original)
+
+    with pytest.raises(FileNotFoundError):
+        open_anchored_create_fd(
+            original,
+            original / "blocked.txt",
+            expected_root_identity=expected,
+        )
+    assert not (original / "blocked.txt").exists()
 
 
 def test_safe_resolve_blocks_external_symlink_directory(tmp_path):
@@ -114,6 +138,37 @@ def test_authorized_escape_request_expires_when_surface_target_changes(tmp_path)
 
     with pytest.raises(ValueError, match="expired"):
         resolve_authorized_escape_request(workspace, "sess-1", grant["token"], "escape")
+
+
+def test_upload_capability_expires_and_revalidates_surface_target(tmp_path):
+    import api.workspace as workspace_api
+
+    workspace = tmp_path / "workspace"
+    outside_a = tmp_path / "outside-a"
+    outside_b = tmp_path / "outside-b"
+    workspace.mkdir()
+    outside_a.mkdir()
+    outside_b.mkdir()
+    escape = workspace / "escape"
+    escape.symlink_to(outside_a)
+
+    read_grant = authorize_escape_target(workspace, "sess-1", "escape")
+    upload_grant = authorize_escape_upload(workspace, "sess-1", read_grant["token"], "escape")
+
+    with workspace_api._ESCAPE_AUTH_LOCK:
+        workspace_api._ESCAPE_UPLOAD_AUTH_TOKENS[upload_grant["token"]]["expires_at"] = 0
+    with pytest.raises(EscapeUploadAuthorizationExpiredError, match="expired"):
+        resolve_authorized_escape_upload_request(
+            workspace, "sess-1", upload_grant["token"], "escape"
+        )
+
+    upload_grant = authorize_escape_upload(workspace, "sess-1", read_grant["token"], "escape")
+    escape.unlink()
+    escape.symlink_to(outside_b)
+    with pytest.raises(EscapeUploadAuthorizationExpiredError, match="expired"):
+        resolve_authorized_escape_upload_request(
+            workspace, "sess-1", upload_grant["token"], "escape"
+        )
 
 
 def test_authorized_escape_request_keeps_other_live_grants(tmp_path):

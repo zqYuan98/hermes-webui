@@ -25,8 +25,10 @@ from pathlib import Path, PurePosixPath
 logger = logging.getLogger(__name__)
 
 _ESCAPE_AUTH_TTL_SECONDS = 300
+_ESCAPE_UPLOAD_AUTH_TTL_SECONDS = 120
 _ESCAPE_AUTH_LOCK = threading.Lock()
 _ESCAPE_AUTH_TOKENS: dict[str, dict[str, str | int | float]] = {}
+_ESCAPE_UPLOAD_AUTH_TOKENS: dict[str, dict[str, str | int | float]] = {}
 
 from api.config import (
     WORKSPACES_FILE as _GLOBAL_WS_FILE,
@@ -1068,7 +1070,12 @@ def open_anchored_fd(workspace: Path, target: Path, *, want_dir: bool) -> int:
         raise
 
 
-def open_anchored_create_fd(root: Path, dest: Path) -> int:
+def open_anchored_create_fd(
+    root: Path,
+    dest: Path,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> int:
     """Create ``dest`` for exclusive writing race-safely, anchored under ``root``.
 
     Walks from ``root`` via openat + O_NOFOLLOW (creating missing intermediate
@@ -1091,11 +1098,19 @@ def open_anchored_create_fd(root: Path, dest: Path) -> int:
 
     if not _DIR_FD_OK:
         # Windows / no openat: create parent dirs then exclusively create the leaf.
+        if expected_root_identity is not None:
+            root_stat = root_resolved.stat()
+            if (int(root_stat.st_dev), int(root_stat.st_ino)) != expected_root_identity:
+                raise FileNotFoundError(f"Not found: {root}")
         dest.parent.mkdir(parents=True, exist_ok=True)
         return os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o644)
 
     fd = os.open(str(root_resolved), os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
     try:
+        if expected_root_identity is not None:
+            root_stat = os.fstat(fd)
+            if (int(root_stat.st_dev), int(root_stat.st_ino)) != expected_root_identity:
+                raise FileNotFoundError(f"Not found: {root}")
         for part in rel_parts[:-1]:
             try:
                 nfd = os.open(part, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=fd)
@@ -1580,11 +1595,22 @@ class EscapeAuthorizationExpiredError(ValueError):
     pass
 
 
+class EscapeUploadAuthorizationExpiredError(ValueError):
+    pass
+
+
 def _escape_prune_tokens(now: float | None = None) -> None:
     cutoff = time.time() if now is None else now
     expired = [token for token, record in _ESCAPE_AUTH_TOKENS.items() if float(record.get("expires_at") or 0.0) <= cutoff]
     for token in expired:
         _ESCAPE_AUTH_TOKENS.pop(token, None)
+    expired_uploads = [
+        token
+        for token, record in _ESCAPE_UPLOAD_AUTH_TOKENS.items()
+        if float(record.get("expires_at") or 0.0) <= cutoff
+    ]
+    for token in expired_uploads:
+        _ESCAPE_UPLOAD_AUTH_TOKENS.pop(token, None)
 
 
 def authorize_escape_target(workspace: Path, session_id: str, rel: str) -> dict:
@@ -1672,6 +1698,97 @@ def resolve_authorized_escape_request(workspace: Path, session_id: str, token: s
         "external_root": external_root,
         "target": target,
     }
+
+
+def authorize_escape_upload(workspace: Path, session_id: str, read_token: str, rel: str) -> dict:
+    """Mint an upload-only capability for one existing external directory."""
+    resolved = resolve_authorized_escape_request(workspace, session_id, read_token, rel)
+    target = safe_resolve_ws(resolved["external_root"], resolved["external_rel"])
+    if not target.is_dir():
+        raise ValueError("External upload target must be a directory")
+    target_stat = target.stat()
+    now = time.time()
+    read_expires_at = float(resolved["record"].get("expires_at") or 0.0)
+    expires_at = min(now + _ESCAPE_UPLOAD_AUTH_TTL_SECONDS, read_expires_at)
+    if expires_at <= now:
+        raise EscapeAuthorizationExpiredError("Escape authorization expired")
+    token = secrets.token_urlsafe(24)
+    record = {
+        "session_id": str(session_id or ""),
+        "workspace_root": str(workspace.resolve()),
+        "surface_path": str(resolved["surface_path"]),
+        "authorized_path": str(resolved["request_path"]),
+        "target_path": str(target.resolve()),
+        "target_dev": int(target_stat.st_dev),
+        "target_ino": int(target_stat.st_ino),
+        "read_token": str(read_token),
+        "expires_at": expires_at,
+        "capability": "upload",
+    }
+    with _ESCAPE_AUTH_LOCK:
+        _escape_prune_tokens(now)
+        _ESCAPE_UPLOAD_AUTH_TOKENS[token] = record
+    return {
+        "token": token,
+        "path": record["authorized_path"],
+        "expires_at": expires_at,
+        "expires_in": max(0, int(expires_at - now)),
+        "capability": "upload",
+        "read_only": False,
+    }
+
+
+def resolve_authorized_escape_upload_request(
+    workspace: Path,
+    session_id: str,
+    upload_token: str,
+    rel: str,
+) -> dict:
+    """Resolve an upload path under a live, session-bound external capability."""
+    workspace_root = str(workspace.resolve())
+    token = str(upload_token or "").strip()
+    if not token:
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization is required")
+    now = time.time()
+    with _ESCAPE_AUTH_LOCK:
+        _escape_prune_tokens(now)
+        record = dict(_ESCAPE_UPLOAD_AUTH_TOKENS.get(token) or {})
+    if not record or record.get("capability") != "upload":
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    if str(record.get("session_id") or "") != str(session_id or ""):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    if str(record.get("workspace_root") or "") != workspace_root:
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    request_path = _normalize_workspace_rel_path(rel)
+    if request_path != str(record.get("authorized_path") or ""):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    try:
+        resolved = resolve_authorized_escape_request(
+            workspace,
+            session_id,
+            str(record.get("read_token") or ""),
+            request_path,
+        )
+    except (EscapeAuthorizationExpiredError, ValueError):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired") from None
+    if str(resolved["surface_path"]) != str(record.get("surface_path") or ""):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    try:
+        target = safe_resolve_ws(resolved["external_root"], resolved["external_rel"])
+        target_stat = target.stat()
+    except (ValueError, OSError):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired") from None
+    if not target.is_dir():
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    if str(target.resolve()) != str(record.get("target_path") or ""):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    if int(target_stat.st_dev) != int(record.get("target_dev") or -1):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    if int(target_stat.st_ino) != int(record.get("target_ino") or -1):
+        raise EscapeUploadAuthorizationExpiredError("External upload authorization expired")
+    resolved["target"] = target
+    resolved["upload_record"] = record
+    return resolved
 
 
 def list_authorized_escape_dir(workspace: Path, session_id: str, token: str, rel: str) -> dict:

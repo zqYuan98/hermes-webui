@@ -12,8 +12,10 @@ from api.helpers import j
 from api.models import get_session
 from api.profiles import _profiles_match, get_active_profile_name as _get_active_profile_name
 from api.workspace import (
+    EscapeUploadAuthorizationExpiredError,
     safe_resolve_ws,
     resolve_trusted_workspace,
+    resolve_authorized_escape_upload_request,
     open_anchored_create_fd,
     make_anchored_dir,
     rmtree_anchored,
@@ -241,7 +243,13 @@ def handle_upload(handler):
         return j(handler, {'error': 'Upload failed'}, status=500)
 
 
-def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
+def extract_archive(
+    file_bytes: bytes,
+    filename: str,
+    workspace: Path,
+    *,
+    target_dir: Path | None = None,
+):
     """Extract a zip or tar archive into the workspace.
 
     Returns a dict with ``extracted`` (int), ``files`` (list[str]).
@@ -260,8 +268,12 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
     else:
         raise ValueError(f'Unsupported archive format: {filename}')
 
-    # Determine destination directory — use archive stem as folder name
-    dest_dir = safe_resolve_ws(workspace, stem)
+    # Determine destination directory — use archive stem as folder name. The
+    # write anchor remains ``workspace`` even when extraction is requested in a
+    # nested directory, so every member create is anchored at the authoritative
+    # workspace/external capability root rather than a re-resolved subdirectory.
+    extraction_parent = target_dir or workspace
+    dest_dir = safe_resolve_ws(extraction_parent, stem)
     # Avoid overwriting existing files by appending a suffix (bounded — astronomically
     # unlikely to collide, but never spin forever).
     if dest_dir.exists():
@@ -270,7 +282,7 @@ def extract_archive(file_bytes: bytes, filename: str, workspace: Path):
             if not dest_dir.exists():
                 break
             suffix = ''.join(random.choices(string.digits, k=3))
-            dest_dir = safe_resolve_ws(workspace, stem).with_name(stem + '_' + suffix)
+            dest_dir = safe_resolve_ws(extraction_parent, stem).with_name(stem + '_' + suffix)
         else:
             raise ValueError('Could not allocate a unique extraction directory')
     # #3398: create the extraction root race-safely under the true workspace root.
@@ -608,6 +620,7 @@ def handle_workspace_upload(handler):
         fields, files = parse_multipart(handler.rfile, content_type, content_length)
         session_id = fields.get('session_id', '')
         subpath = fields.get('path', '')
+        upload_token = fields.get('upload_token', '').strip()
 
         if not session_id:
             return j(handler, {'error': 'Missing session_id'}, status=400)
@@ -626,22 +639,66 @@ def handle_workspace_upload(handler):
         # Resolve workspace root from session
         workspace = resolve_trusted_workspace(session.workspace)
 
-        # Resolve target subdirectory within workspace
-        target_dir = safe_resolve_ws(workspace, subpath) if subpath else workspace
-        # safe_resolve_ws intentionally permits in-workspace symlinks pointing
-        # outside the root (read trust model). For an UPLOAD target that's not
-        # acceptable: a planted symlink subpath would let mkdir() + writes create
-        # files OUTSIDE the workspace. Require the resolved target to be inside
-        # the workspace before creating anything. (is_relative_to is True for the
-        # workspace==target equality case, so the normal subpath='' path passes.)
-        if not target_dir.resolve().is_relative_to(workspace.resolve()):
+        # A read-only escape grant is never sufficient for writes. External
+        # uploads must carry a separate, short-lived upload-only capability;
+        # resolving it revalidates the surfaced symlink and re-anchors the
+        # requested virtual path under that capability's external root.
+        external = None
+        if upload_token:
+            try:
+                external = resolve_authorized_escape_upload_request(
+                    workspace,
+                    session_id,
+                    upload_token,
+                    subpath or '.',
+                )
+            except (EscapeUploadAuthorizationExpiredError, ValueError, OSError):
+                return j(handler, {'error': 'External upload authorization expired or invalid'}, status=403)
+            write_root = external['external_root']
+            target_dir = external['target']
+            write_anchor = target_dir
+            expected_anchor_identity = (
+                int(external['upload_record']['target_dev']),
+                int(external['upload_record']['target_ino']),
+            )
+        else:
+            write_root = workspace
+            target_dir = safe_resolve_ws(workspace, subpath) if subpath else workspace
+            write_anchor = write_root
+            expected_anchor_identity = None
+        # Require the resolved target to stay under the selected authoritative
+        # write root (the session workspace or the upload capability's external
+        # root) before creating anything.
+        if not target_dir.resolve().is_relative_to(write_root.resolve()):
             return j(handler, {'error': 'Upload target escapes workspace'}, status=403)
-        # #3398: create the upload target dir race-safely under the workspace root
-        # (anchored mkdirat) so a raced symlink subpath can't mkdir outside.
-        try:
-            make_anchored_dir(workspace, target_dir)
-        except (ValueError, OSError):
-            return j(handler, {'error': 'Upload target escapes workspace'}, status=403)
+        if external is not None:
+            # Upload-only authority never creates directories. The user must
+            # explicitly browse to and authorize an already-existing target.
+            if not target_dir.is_dir():
+                return j(handler, {'error': 'External upload target must already exist'}, status=403)
+        else:
+            # Normal workspace uploads retain the existing convenience of
+            # creating missing subdirectories, race-safely under the workspace.
+            try:
+                make_anchored_dir(write_root, target_dir)
+            except (ValueError, OSError):
+                return j(handler, {'error': 'Upload target escapes workspace'}, status=403)
+
+        def response_path(path: str | Path) -> str:
+            if external is None:
+                return str(path)
+            try:
+                relative = Path(path).relative_to(write_root.resolve()).as_posix()
+            except ValueError:
+                return str(external['surface_path'])
+            surface = str(external['surface_path'])
+            return surface if relative in ('', '.') else f'{surface}/{relative}'
+
+        def response_files(paths: list[str]) -> list[str]:
+            if external is None:
+                return paths
+            surface = str(external['surface_path'])
+            return [surface if path in ('', '.') else f'{surface}/{path}' for path in paths]
 
         results = []
         for _field_name, (filename, file_bytes) in files.items():
@@ -654,7 +711,7 @@ def handle_workspace_upload(handler):
             # Path traversal guard (belt-and-suspenders: safe_resolve_ws above is
             # the authoritative guard and raises ValueError on traversal; this
             # check catches any edge case where the resolved path escapes).
-            if not dest.resolve().is_relative_to(workspace.resolve()):
+            if not dest.resolve().is_relative_to(write_root.resolve()):
                 return j(handler, {'error': f'Path traversal blocked: {safe_name}'}, status=403)
 
             # Deduplicate: append -1, -2, etc. if file already exists
@@ -663,7 +720,7 @@ def handle_workspace_upload(handler):
                 suffix = dest.suffix
                 for idx in range(1, 1000):
                     candidate = safe_resolve_ws(target_dir, f'{stem}-{idx}{suffix}')
-                    if not candidate.resolve().is_relative_to(workspace.resolve()):
+                    if not candidate.resolve().is_relative_to(write_root.resolve()):
                         return j(handler, {'error': 'Path traversal blocked'}, status=403)
                     if not candidate.exists():
                         dest = candidate
@@ -677,7 +734,11 @@ def handle_workspace_upload(handler):
             # containment checks above cannot redirect the write outside the
             # workspace. The dedup loop guarantees `dest` does not exist.
             try:
-                _wfd = open_anchored_create_fd(workspace, dest.resolve())
+                _wfd = open_anchored_create_fd(
+                    write_anchor,
+                    dest.resolve(),
+                    expected_root_identity=expected_anchor_identity,
+                )
             except FileExistsError:
                 return j(handler, {'error': f'Upload destination already exists: {safe_name}'}, status=409)
             except (ValueError, OSError):
@@ -690,23 +751,30 @@ def handle_workspace_upload(handler):
             # Suffix set MUST match extract_archive()'s supported formats, else
             # accepted-but-unlisted archives (.tar/.tbz2/.txz) silently land as
             # raw files instead of extracting.
-            is_archive = safe_name.lower().endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz'))
+            # External upload-only capabilities create exactly the selected file;
+            # they never expand archives into implicit files or directories.
+            is_archive = external is None and safe_name.lower().endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz'))
             if is_archive:
                 import zipfile, tarfile, traceback as _extract_tb
                 try:
-                    extraction = extract_archive(file_bytes, safe_name, target_dir)
+                    extraction = extract_archive(
+                        file_bytes,
+                        safe_name,
+                        write_root,
+                        target_dir=target_dir,
+                    )
                     # Remove the archive file after successful extraction
                     try:
-                        unlink_anchored(workspace, dest.resolve())
+                        unlink_anchored(write_root, dest.resolve())
                     except FileNotFoundError:
                         pass
                     results.append({
                         'filename': safe_name,
-                        'path': str(extraction.get('dest', target_dir)),
+                        'path': response_path(extraction.get('dest', target_dir)),
                         'size': len(file_bytes),
                         'is_image': False,
                         'extracted': True,
-                        'extracted_files': extraction.get('files', []),
+                        'extracted_files': response_files(extraction.get('files', [])),
                         'extracted_count': extraction.get('extracted', 0),
                     })
                     continue
@@ -714,13 +782,13 @@ def handle_workspace_upload(handler):
                     # Extraction failed — remove the archive file (no partial
                     # content left behind) and surface the error to the user.
                     try:
-                        unlink_anchored(workspace, dest.resolve())
+                        unlink_anchored(write_root, dest.resolve())
                     except FileNotFoundError:
                         pass
                     print(f'[webui] workspace upload extract error: {e}', flush=True)
                     results.append({
                         'filename': safe_name,
-                        'path': str(target_dir),
+                        'path': response_path(target_dir),
                         'size': len(file_bytes),
                         'mime': mime,
                         'is_image': False,
@@ -731,12 +799,12 @@ def handle_workspace_upload(handler):
                 except Exception:
                     print('[webui] workspace upload extract error: ' + _extract_tb.format_exc(), flush=True)
                     try:
-                        unlink_anchored(workspace, dest.resolve())
+                        unlink_anchored(write_root, dest.resolve())
                     except FileNotFoundError:
                         pass
                     results.append({
                         'filename': safe_name,
-                        'path': str(target_dir),
+                        'path': response_path(target_dir),
                         'size': len(file_bytes),
                         'mime': mime,
                         'is_image': False,
@@ -745,11 +813,13 @@ def handle_workspace_upload(handler):
                     })
                     continue
 
-            sidecar = _write_office_upload_sidecar(workspace, dest, file_bytes)
+            # Office sidecars are a normal-workspace convenience, not part of
+            # the external upload-only capability.
+            sidecar = None if external is not None else _write_office_upload_sidecar(write_root, dest, file_bytes)
             results.append({
                 'filename': dest.name,
-                'path': str(dest),
-                'size': dest.stat().st_size,
+                'path': response_path(dest),
+                'size': len(file_bytes),
                 'mime': mime,
                 'is_image': mime.startswith('image/'),
                 'extracted': False,

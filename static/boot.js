@@ -381,10 +381,6 @@ function syncWorkspacePanelUI(){
     _setButtonTooltip(collapseBtn, isCompact?_uiText('workspace_panel_close','Close workspace panel'):_uiText('workspace_panel_hide','Hide workspace panel'));
   }
   const hasSession=!!S.session;
-  ['btnUpDir','btnNewFile','btnNewFolder','btnRefreshPanel'].forEach(id=>{
-    const el=$(id);
-    if(el)el.disabled=!hasSession;
-  });
   const clearBtn=$('btnClearPreview');
   if(clearBtn){
     clearBtn.disabled=!isOpen;
@@ -393,6 +389,13 @@ function syncWorkspacePanelUI(){
     clearBtn.setAttribute('aria-label', label);
     if(!isCompact) clearBtn.style.display='';
   }
+  const upDir=$('btnUpDir');
+  if(upDir)upDir.disabled=!hasSession;
+  if(typeof syncWorkspaceMutationButtons==='function')syncWorkspaceMutationButtons(S.currentDir||'.');
+  else ['btnNewFile','btnNewFolder','btnRefreshPanel'].forEach(id=>{
+    const el=$(id);
+    if(el)el.disabled=!hasSession;
+  });
 }
 
 function toggleMobileSidebar(){

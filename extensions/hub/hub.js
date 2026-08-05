@@ -27,6 +27,7 @@
       '<circle cx="4" cy="16.5" r="2"/><path d="M12 9V5.5"/><path d="m14.6 13.6 3.7 2.1"/><path d="m9.4 13.6-3.7 2.1"/>',
     home: '<path d="m3 10 9-7 9 7v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/>',
     design: '<path d="M12 19a7 7 0 1 0 0-14 7 7 0 0 0 0 14z"/><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>',
+    meetings: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4"/><path d="M8 3v4"/><path d="M3 10h18"/><path d="M8 14h3"/><path d="M8 17h6"/>',
     ops: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 7.5h.01"/><path d="M7 17.5h.01"/>',
     resources: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
     inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
@@ -47,6 +48,7 @@
   var MODULES = [
     { id: 'home', label: '主页', icon: ICON.home, sub: '今日聚焦、快速捕获与全局概览' },
     { id: 'design', label: '产品设计', icon: ICON.design, sub: '需求与设计稿从想法走到交付' },
+    { id: 'meetings', label: '会议', icon: ICON.meetings, sub: '纪要、决策与行动项闭环' },
     { id: 'ops', label: '项目运维', icon: ICON.ops, sub: '服务清单、状态与常用命令速查' },
     { id: 'resources', label: '资源库', icon: ICON.resources, sub: '链接、文档与提示词的统一收藏' },
     { id: 'inbox', label: '收件箱', icon: ICON.inbox, sub: '先记下来，之后再归类' }
@@ -64,6 +66,29 @@
     { id: 'high', label: '高' },
     { id: 'normal', label: '中' },
     { id: 'low', label: '低' }
+  ];
+
+  var MEETING_TYPES = [
+    { id: 'sync', label: '同步会' },
+    { id: 'planning', label: '规划会' },
+    { id: 'review', label: '评审会' },
+    { id: 'decision', label: '决策会' },
+    { id: 'retrospective', label: '复盘会' },
+    { id: 'other', label: '其他' }
+  ];
+
+  var MEETING_STATUSES = [
+    { id: 'planned', label: '待召开' },
+    { id: 'in_progress', label: '进行中' },
+    { id: 'completed', label: '已完成' },
+    { id: 'cancelled', label: '已取消' }
+  ];
+
+  var ACTION_STATUSES = [
+    { id: 'open', label: '待处理' },
+    { id: 'in_progress', label: '进行中' },
+    { id: 'blocked', label: '受阻' },
+    { id: 'done', label: '已完成' }
   ];
 
   var ENVS = [
@@ -120,6 +145,7 @@
     module: 'home',
     data: null,
     form: null,        // { kind, id } — kind 为 design/service/command/resource
+    meetingActionDrafts: null,
     query: '',
     tag: '',
     opsOwner: 'personal',
@@ -192,6 +218,31 @@
   function parseTags(s) {
     return String(s || '').split(/[,，\s]+/).map(function (t) { return t.trim(); })
       .filter(function (t) { return t; }).slice(0, 12);
+  }
+
+  function parseList(s, limit) {
+    return String(s || '').split(/[\n,，]+/).map(function (item) { return item.trim(); })
+      .filter(function (item) { return item; }).slice(0, limit || 100);
+  }
+
+  function dateTimeInputValue(value) {
+    if (!value) return '';
+    var date = new Date(value);
+    if (isNaN(date.getTime())) return String(value).slice(0, 16);
+    var local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 16);
+  }
+
+  function isoFromInput(value) {
+    if (!value) return '';
+    var date = new Date(value);
+    return isNaN(date.getTime()) ? value : date.toISOString();
+  }
+
+  function localDateKey(date) {
+    date = date || new Date();
+    return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' +
+      String(date.getDate()).padStart(2, '0');
   }
 
   function optionsHtml(list, selected) {
@@ -345,6 +396,7 @@
     if (!view.data) { host.innerHTML = '<div class="hub-empty">正在读取 Hub 数据…</div>'; return; }
     switch (view.module) {
       case 'design': host.innerHTML = renderDesign(); break;
+      case 'meetings': host.innerHTML = renderMeetings(); break;
       case 'ops': host.innerHTML = renderOps(); break;
       case 'resources': host.innerHTML = renderResources(); break;
       case 'inbox': host.innerHTML = renderInbox(); break;
@@ -360,6 +412,7 @@
     var counts = {
       home: '',
       design: d ? d.design.items.length : '',
+      meetings: d ? d.meetings.items.length : '',
       ops: d ? (d.ops.services.length + d.ops.commands.length) : '',
       resources: d ? d.resources.items.length : '',
       inbox: d ? d.inbox.items.filter(function (i) { return !i.done; }).length : ''
@@ -463,10 +516,23 @@
     var openInbox = d.inbox.items.filter(function (i) { return !i.done; });
     var activeDesign = d.design.items.filter(function (i) { return i.stage !== 'done'; });
     var badServices = d.ops.services.filter(function (s) { return s.status && s.status !== 'ok'; });
+    var upcomingMeetings = d.meetings.items.filter(function (meeting) {
+      return meeting.status !== 'completed' && meeting.status !== 'cancelled';
+    });
+    var openActions = [];
+    d.meetings.items.forEach(function (meeting) {
+      (meeting.actionItems || []).forEach(function (action) {
+        if (action.status !== 'done') openActions.push(action);
+      });
+    });
+    var today = localDateKey();
+    var overdueActions = openActions.filter(function (action) { return action.due && action.due < today; });
     var name = p.name ? '，' + esc(p.name) : '';
 
     var stats = [
       { v: activeDesign.length, l: '进行中的设计条目' },
+      { v: upcomingMeetings.length, l: '近期会议' },
+      { v: openActions.length, l: '待办行动项' + (overdueActions.length ? '（' + overdueActions.length + ' 项逾期）' : '') },
       { v: d.ops.services.length, l: '在管服务' + (badServices.length ? '（' + badServices.length + ' 项异常）' : '') },
       { v: d.resources.items.length, l: '资源收藏' },
       { v: openInbox.length, l: '待归类' }
@@ -528,6 +594,20 @@
     var all = [];
     d.design.items.forEach(function (i) {
       all.push({ title: i.title, where: '产品设计 · ' + labelOf(STAGES, i.stage), at: i.updatedAt || i.createdAt });
+    });
+    d.meetings.items.forEach(function (meeting) {
+      all.push({
+        title: meeting.title,
+        where: '会议 · ' + labelOf(MEETING_STATUSES, meeting.status, '待召开'),
+        at: meeting.updatedAt || meeting.startAt || meeting.createdAt
+      });
+      (meeting.actionItems || []).forEach(function (action) {
+        all.push({
+          title: action.title || action.deliverable,
+          where: '会议行动项 · ' + (action.owner || '未指定负责人'),
+          at: action.updatedAt || action.due
+        });
+      });
     });
     d.ops.services.forEach(function (s) {
       all.push({ title: s.name, where: '项目运维 · ' + labelOf(STATUSES, s.status), at: s.updatedAt });
@@ -603,6 +683,145 @@
       '</div>' +
       '<div class="hub-field" style="margin-bottom:12px"><span class="hub-field-label">备注</span>' +
       '<textarea class="hub-textarea" name="notes">' + esc(it.notes || '') + '</textarea></div>' +
+      formActions() + '</form>';
+  }
+
+  /* ── 会议纪要 ─────────────────────────────────────────────────────── */
+
+  function renderMeetings() {
+    var meetings = view.data.meetings.items.slice().sort(function (a, b) {
+      return String(b.startAt || b.createdAt || '').localeCompare(String(a.startAt || a.createdAt || ''));
+    });
+    var html = '<div class="hub-section-head">' +
+      '<span class="hub-section-title">会议纪要</span>' +
+      '<div class="hub-section-actions"><button class="hub-btn primary" data-hub-action="new-meeting">' +
+      svg(ICON.plus, 13) + '新建会议</button></div></div>';
+    if (view.form && view.form.kind === 'meeting') html += meetingForm();
+    html += meetings.length
+      ? '<div class="hub-meeting-list">' + meetings.map(meetingCard).join('') + '</div>'
+      : '<div class="hub-empty">还没有会议记录。新建会议后，在同一处维护纪要、决策和行动项。</div>';
+    return html;
+  }
+
+  function meetingCard(meeting) {
+    var actions = meeting.actionItems || [];
+    var openCount = actions.filter(function (action) { return action.status !== 'done'; }).length;
+    var links = (meeting.projectLinks || []).map(function (link) {
+      var url = safeUrl(link);
+      return url ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(link) + '</a>' : esc(link);
+    });
+    return '<article class="hub-card hub-meeting" data-hub-meeting-id="' + esc(meeting.id) + '">' +
+      '<div class="hub-meeting-head"><div><div class="hub-item-title">' + esc(meeting.title) + '</div>' +
+      '<div class="hub-item-sub">' + esc(labelOf(MEETING_TYPES, meeting.type, '会议')) + ' · ' +
+      esc(labelOf(MEETING_STATUSES, meeting.status, '待召开')) +
+      (meeting.startAt ? ' · ' + esc(fmtDate(meeting.startAt)) : '') +
+      (meeting.participants && meeting.participants.length ? ' · ' + meeting.participants.length + ' 人' : '') +
+      (openCount ? ' · ' + openCount + ' 个待办' : '') + '</div></div>' +
+      '<div class="hub-item-actions">' + iconBtn('edit-meeting', meeting.id, ICON.edit, '编辑会议') +
+      iconBtn('del-meeting', meeting.id, ICON.trash, '删除会议', 'danger') + '</div></div>' +
+      (meeting.summary ? '<div class="hub-meeting-summary">' + esc(meeting.summary) + '</div>' : '') +
+      meetingListBlock('决策', meeting.decisions) +
+      meetingActionsBlock(actions) +
+      meetingListBlock('风险', meeting.risks) +
+      meetingListBlock('待确认问题', meeting.openQuestions) +
+      (links.length ? '<div class="hub-meeting-meta"><span>项目链接</span>' + links.join('<br>') + '</div>' : '') +
+      (meeting.transcriptFile ? '<div class="hub-meeting-meta"><span>逐字稿</span><code>' + esc(meeting.transcriptFile) + '</code></div>' : '') +
+      (meeting.minutesFile ? '<div class="hub-meeting-meta"><span>纪要文件</span><code>' + esc(meeting.minutesFile) + '</code></div>' : '') +
+      (meeting.nextReviewAt ? '<div class="hub-meeting-meta"><span>下次回顾</span>' + esc(fmtDate(meeting.nextReviewAt)) + '</div>' : '') +
+      '</article>';
+  }
+
+  function meetingListBlock(label, items) {
+    items = (items || []).filter(Boolean);
+    if (!items.length) return '';
+    return '<div class="hub-meeting-block"><div class="hub-meeting-block-title">' + esc(label) + '</div><ul>' +
+      items.map(function (item) { return '<li>' + esc(item) + '</li>'; }).join('') + '</ul></div>';
+  }
+
+  function meetingActionsBlock(actions) {
+    if (!actions.length) return '';
+    return '<div class="hub-meeting-block"><div class="hub-meeting-block-title">行动项</div><div class="hub-action-list">' +
+      actions.map(function (action) {
+        return '<div class="hub-action-item ' + esc(action.status || 'open') + '"><div><strong>' +
+          esc(action.title || action.deliverable || '未命名行动项') + '</strong><span>' +
+          esc(action.owner || '未指定负责人') + (action.due ? ' · ' + esc(action.due) : '') + ' · ' +
+          esc(labelOf(ACTION_STATUSES, action.status, '待处理')) + '</span></div>' +
+          (action.deliverable ? '<div><span>交付物</span>' + esc(action.deliverable) + '</div>' : '') +
+          (action.acceptance ? '<div><span>验收</span>' + esc(action.acceptance) + '</div>' : '') +
+          (action.dependencies ? '<div><span>依赖</span>' + esc(action.dependencies) + '</div>' : '') + '</div>';
+      }).join('') + '</div></div>';
+  }
+
+  function blankMeetingAction() {
+    return { id: '', title: '', owner: '', due: '', deliverable: '', acceptance: '', dependencies: '', status: 'open' };
+  }
+
+  function openMeetingForm(id) {
+    var meeting = findById(view.data.meetings.items, id);
+    view.form = { kind: 'meeting', id: id || '' };
+    view.meetingActionDrafts = meeting && Array.isArray(meeting.actionItems)
+      ? meeting.actionItems.map(function (action) { return Object.assign(blankMeetingAction(), action); })
+      : [blankMeetingAction()];
+    render();
+  }
+
+  function syncMeetingActionDrafts() {
+    var rows = document.querySelectorAll('[data-hub-meeting-action]');
+    view.meetingActionDrafts = Array.prototype.map.call(rows, function (row) {
+      var value = function (name) {
+        var input = row.querySelector('[name="' + name + '"]');
+        return input ? String(input.value || '').trim() : '';
+      };
+      return {
+        id: value('action_id'), title: value('action_title'), owner: value('action_owner'),
+        due: value('action_due'), deliverable: value('action_deliverable'),
+        acceptance: value('action_acceptance'), dependencies: value('action_dependencies'),
+        status: value('action_status') || 'open'
+      };
+    });
+  }
+
+  function meetingActionEditor(action, index) {
+    return '<div class="hub-action-editor" data-hub-meeting-action="' + index + '">' +
+      '<input type="hidden" name="action_id" value="' + esc(action.id || '') + '">' +
+      '<div class="hub-action-editor-head"><span>行动项 ' + (index + 1) + '</span>' +
+      '<button class="hub-icon-btn danger" type="button" data-hub-action="remove-meeting-action" data-hub-index="' + index + '" aria-label="删除行动项">' + svg(ICON.trash, 14) + '</button></div>' +
+      '<div class="hub-form-grid">' +
+      field('action_title', '事项', action.title, 'text') +
+      field('action_owner', '负责人', action.owner, 'text') +
+      field('action_due', '截止日期', action.due, 'date') +
+      selectField('action_status', '状态', ACTION_STATUSES, action.status || 'open') +
+      field('action_deliverable', '交付物', action.deliverable, 'text') +
+      field('action_acceptance', '验收标准', action.acceptance, 'text') +
+      field('action_dependencies', '依赖', action.dependencies, 'text') +
+      '</div></div>';
+  }
+
+  function meetingForm() {
+    var meeting = findById(view.data.meetings.items, view.form.id) || {};
+    var actions = view.meetingActionDrafts || (meeting.actionItems || []).map(function (action) {
+      return Object.assign(blankMeetingAction(), action);
+    });
+    return '<form class="hub-card hub-section hub-meeting-form" data-hub-form="meeting">' +
+      '<div class="hub-form-grid">' +
+      field('title', '会议名称', meeting.title, 'text', true) +
+      selectField('type', '会议类型', MEETING_TYPES, meeting.type || 'sync') +
+      selectField('status', '状态', MEETING_STATUSES, meeting.status || 'planned') +
+      field('startAt', '开始时间', dateTimeInputValue(meeting.startAt), 'datetime-local') +
+      field('endAt', '结束时间', dateTimeInputValue(meeting.endAt), 'datetime-local') +
+      field('nextReviewAt', '下次回顾时间', dateTimeInputValue(meeting.nextReviewAt), 'datetime-local') +
+      field('participants', '参与人（逗号或换行分隔）', (meeting.participants || []).join(', '), 'text') +
+      field('projectLinks', '项目链接（逗号或换行分隔）', (meeting.projectLinks || []).join(', '), 'text') +
+      field('transcriptFile', '逐字稿文件引用', meeting.transcriptFile, 'text') +
+      field('minutesFile', '纪要文件引用', meeting.minutesFile, 'text') + '</div>' +
+      '<label class="hub-field"><span class="hub-field-label">摘要</span><textarea class="hub-textarea" name="summary">' + esc(meeting.summary || '') + '</textarea></label>' +
+      '<div class="hub-form-grid hub-meeting-notes-grid">' +
+      textAreaField('decisions', '决策（每行一项）', (meeting.decisions || []).join('\n')) +
+      textAreaField('risks', '风险（每行一项）', (meeting.risks || []).join('\n')) +
+      textAreaField('openQuestions', '待确认问题（每行一项）', (meeting.openQuestions || []).join('\n')) + '</div>' +
+      '<div class="hub-action-editor-section"><div class="hub-section-head"><span class="hub-section-title">行动项</span>' +
+      '<div class="hub-section-actions"><button class="hub-btn" type="button" data-hub-action="add-meeting-action">' + svg(ICON.plus, 13) + '添加行动项</button></div></div>' +
+      (actions.length ? actions.map(meetingActionEditor).join('') : '<div class="hub-empty">暂无行动项，可按需添加。</div>') + '</div>' +
       formActions() + '</form>';
   }
 
@@ -1520,6 +1739,11 @@
       '<select class="hub-select" name="' + esc(name) + '">' + optionsHtml(list, selected) + '</select></label>';
   }
 
+  function textAreaField(name, label, value) {
+    return '<label class="hub-field"><span class="hub-field-label">' + esc(label) + '</span>' +
+      '<textarea class="hub-textarea" name="' + esc(name) + '">' + esc(value || '') + '</textarea></label>';
+  }
+
   function formActions() {
     return '<div class="hub-form-actions">' +
       '<button class="hub-btn" type="button" data-hub-action="cancel-form">取消</button>' +
@@ -1703,6 +1927,55 @@
       return;
     }
 
+    if (kind === 'meeting') {
+      var currentMeeting = editing ? findById(d.meetings.items, editing) : null;
+      var meetingStart = isoFromInput(get('startAt'));
+      var meetingEnd = isoFromInput(get('endAt'));
+      if (meetingStart && meetingEnd && new Date(meetingEnd).getTime() < new Date(meetingStart).getTime()) {
+        toast('会议结束时间不能早于开始时间', 'error');
+        return;
+      }
+      var actionIds = f.getAll('action_id');
+      var actionTitles = f.getAll('action_title');
+      var actionOwners = f.getAll('action_owner');
+      var actionDues = f.getAll('action_due');
+      var actionDeliverables = f.getAll('action_deliverable');
+      var actionAcceptance = f.getAll('action_acceptance');
+      var actionDependencies = f.getAll('action_dependencies');
+      var actionStatuses = f.getAll('action_status');
+      var actionItems = actionTitles.map(function (title, index) {
+        return {
+          id: String(actionIds[index] || HubStore.newId()),
+          title: String(title || '').trim(),
+          owner: String(actionOwners[index] || '').trim(),
+          due: String(actionDues[index] || '').trim(),
+          deliverable: String(actionDeliverables[index] || '').trim(),
+          acceptance: String(actionAcceptance[index] || '').trim(),
+          dependencies: String(actionDependencies[index] || '').trim(),
+          status: String(actionStatuses[index] || 'open'),
+          updatedAt: nowIso()
+        };
+      }).filter(function (action) {
+        return action.title || action.owner || action.due || action.deliverable || action.acceptance || action.dependencies;
+      });
+      var meetingPayload = {
+        title: get('title'), type: get('type') || 'sync', status: get('status') || 'planned',
+        startAt: meetingStart, endAt: meetingEnd,
+        participants: parseList(get('participants')), projectLinks: parseList(get('projectLinks')),
+        summary: get('summary'), decisions: parseList(get('decisions')),
+        actionItems: actionItems, risks: parseList(get('risks')),
+        openQuestions: parseList(get('openQuestions')), transcriptFile: get('transcriptFile'),
+        minutesFile: get('minutesFile'), nextReviewAt: isoFromInput(get('nextReviewAt')), updatedAt: nowIso()
+      };
+      if (!meetingPayload.title) return;
+      if (currentMeeting) Object.assign(currentMeeting, meetingPayload);
+      else d.meetings.items.unshift(Object.assign({ id: HubStore.newId(), createdAt: nowIso() }, meetingPayload));
+      view.form = null;
+      view.meetingActionDrafts = null;
+      save('meetings', currentMeeting ? '会议已更新' : '会议已新建');
+      return;
+    }
+
     if (kind === 'service' || kind === 'command') {
       var listKey = kind === 'service' ? 'services' : 'commands';
       var list = d.ops[listKey];
@@ -1813,7 +2086,7 @@
       case 'setup': doSetup(); return;
       case 'pick-ws': { var inp = $id('hubSetupPath'); if (inp) inp.value = value || ''; return; }
       case 'reload': reload(); return;
-      case 'cancel-form': view.form = null; render(); return;
+      case 'cancel-form': view.form = null; view.meetingActionDrafts = null; render(); return;
       case 'clear-machine-filter': if (guardOpsForm()) return; view.opsMachine = ''; render(); return;
       case 'machine-services': if (guardOpsForm()) return; view.opsMachine = id || ''; view.opsView = 'services'; view.opsSelectedService = ''; render(); return;
       case 'open-service': openServiceDrawer(id); return;
@@ -1837,6 +2110,18 @@
 
       case 'new-design': view.form = { kind: 'design', id: '' }; render(); return;
       case 'edit-design': view.form = { kind: 'design', id: id }; render(); return;
+      case 'new-meeting': openMeetingForm(''); return;
+      case 'edit-meeting': openMeetingForm(id); return;
+      case 'add-meeting-action':
+        syncMeetingActionDrafts();
+        view.meetingActionDrafts.push(blankMeetingAction());
+        render();
+        return;
+      case 'remove-meeting-action':
+        syncMeetingActionDrafts();
+        view.meetingActionDrafts.splice(Number(btn.getAttribute('data-hub-index')), 1);
+        render();
+        return;
       case 'new-service': view.opsSelectedService = ''; view.form = { kind: 'service', id: '' }; render(); return;
       case 'edit-service': view.opsSelectedService = ''; view.opsView = 'services'; view.form = { kind: 'service', id: id }; render(); return;
       case 'new-command': view.form = { kind: 'command', id: '' }; render(); return;
@@ -1873,6 +2158,12 @@
         if (!confirm('删除这条设计条目？')) return;
         d.design.items = d.design.items.filter(function (x) { return x.id !== id; });
         save('design', '已删除');
+        return;
+
+      case 'del-meeting':
+        if (!confirm('删除这条会议记录？')) return;
+        d.meetings.items = d.meetings.items.filter(function (meeting) { return meeting.id !== id; });
+        save('meetings', '会议已删除');
         return;
 
       case 'del-service':
