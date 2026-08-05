@@ -323,6 +323,46 @@ def test_meeting_store_rejects_duplicate_action_ids_on_save():
     assert "行动项存在重复 id" in result["error"]
 
 
+def _run_strict_meeting_read_on_corrupt_json() -> dict:
+    assert NODE, "node is required for hub-store behavioural tests"
+    script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync({json.dumps(str(HUB_STORE_JS))}, 'utf8');
+const storage = {{'hermes-hub.session':'sid-1','hermes-hub.root':'/tmp/hub'}};
+global.localStorage = {{
+  getItem(key) {{ return Object.prototype.hasOwnProperty.call(storage,key) ? storage[key] : null; }},
+  setItem(key,value) {{ storage[key]=String(value); }},
+  removeItem(key) {{ delete storage[key]; }}
+}};
+global.window = {{}};
+window.api = function(path) {{
+  if (path === '/api/hub/init') return Promise.resolve({{ok:true}});
+  if (path.startsWith('/api/list?')) return Promise.resolve({{items:[]}});
+  if (path.startsWith('/api/file?')) return Promise.resolve({{content:'{{broken json'}});
+  return Promise.reject(new Error('unexpected api path: '+path));
+}};
+vm.runInThisContext(src, {{filename:'hub-store.js'}});
+let normal = null;
+window.HubStore.init()
+  .then(() => window.HubStore.read('meetings'))
+  .then(data => {{ normal = data; window.HubStore.invalidate(); return window.HubStore.read('meetings', {{strict:true}}); }})
+  .then(() => process.stdout.write(JSON.stringify({{normal, strictRejected:false}})))
+  .catch(err => process.stdout.write(JSON.stringify({{normal, strictRejected:true, error:String(err && err.message || err)}})));
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_strict_meeting_reload_rejects_corrupt_json_while_normal_read_stays_safe():
+    result = _run_strict_meeting_read_on_corrupt_json()
+    assert result["normal"] == {"items": []}
+    assert result["strictRejected"] is True
+    assert "hub-meetings.json" in result["error"]
+
+
 def test_meeting_store_corruption_guard_and_merge_contract_are_present():
     store = HUB_STORE_JS.read_text(encoding="utf-8")
     assert "meetingsBase" in store
@@ -494,6 +534,140 @@ def test_failed_meeting_save_reloads_remote_without_losing_user_draft():
     assert result["state"]["persistedTitle"] == "Agent 远端版本"
     assert result["state"]["draft"]["title"] == "我的未保存版本"
     assert result["state"]["formOpen"] is True
+
+
+def _run_meeting_ui_failed_save_and_failed_reload() -> dict:
+    assert NODE, "node is required for Hub meeting UI behavioural tests"
+    script = f"""
+const fs = require('fs');
+const vm = require('vm');
+let src = fs.readFileSync({json.dumps(str(HUB_JS))}, 'utf8');
+const marker = '\\n}})();';
+const exportAt = src.lastIndexOf(marker);
+const testExport = `
+window.__hermesHubTest = {{
+  setMeetingState(meetings, id) {{
+    view.module = 'meetings';
+    view.data = {{profile:{{}}, design:{{items:[]}}, meetings,
+      ops:{{services:[],commands:[],events:[],maintenance:[],acknowledgements:[]}},
+      resources:{{items:[]}}, inbox:{{items:[]}}}};
+    view.form = {{kind:'meeting', id:id || ''}};
+    const meeting = findById(meetings.items || [], id);
+    view.meetingDraft = Object.assign({{}}, meeting || {{}});
+    view.meetingActionDrafts = [];
+  }},
+  saveMeetingCandidate(candidate) {{ return saveMeetingsCandidate(candidate, '', true); }},
+  getMeetingState() {{ return {{
+    persistedTitle:view.data.meetings.items[0] && view.data.meetings.items[0].title,
+    draftTitle:view.meetingDraft && view.meetingDraft.title,
+    formOpen:!!view.form
+  }}; }}
+}};`;
+src = src.slice(0, exportAt) + testExport + src.slice(exportAt);
+const toasts = [];
+global.navigator = {{}};
+global.document = {{readyState:'loading', addEventListener() {{}}, querySelector() {{return null;}}, querySelectorAll() {{return [];}}, getElementById() {{return null;}}}};
+global.window = {{showToast(message) {{toasts.push(message);}}}};
+global.HubStore = {{
+  write() {{ return Promise.reject(new Error('保存冲突')); }},
+  invalidate() {{}},
+  read(key, options) {{
+    if (options && options.strict) return Promise.reject(new Error('磁盘暂时不可读'));
+    return Promise.resolve({{items:[]}});
+  }}
+}};
+vm.runInThisContext(src, {{filename:'hub.js'}});
+const api = window.__hermesHubTest;
+api.setMeetingState({{items:[{{id:'m1',title:'最后可信版本',actionItems:[]}}]}}, 'm1');
+api.saveMeetingCandidate({{items:[{{id:'m1',title:'未保存候选',actionItems:[]}}]}})
+  .then(() => process.stdout.write(JSON.stringify({{state:api.getMeetingState(), toasts}})))
+  .catch(err => {{ console.error(err && err.stack || err); process.exit(1); }});
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_failed_meeting_save_keeps_last_trusted_list_when_reload_also_fails():
+    result = _run_meeting_ui_failed_save_and_failed_reload()
+    assert result["state"]["persistedTitle"] == "最后可信版本"
+    assert result["state"]["draftTitle"] == "最后可信版本"
+    assert result["state"]["formOpen"] is True
+    assert any("重新读取磁盘数据也失败" in message for message in result["toasts"])
+
+
+def _run_metadata_only_action_ui_round_trip() -> dict:
+    assert NODE, "node is required for Hub meeting UI behavioural tests"
+    script = f"""
+const fs = require('fs');
+const vm = require('vm');
+let src = fs.readFileSync({json.dumps(str(HUB_JS))}, 'utf8');
+const marker = '\\n}})();';
+const exportAt = src.lastIndexOf(marker);
+const testExport = `
+window.__hermesHubTest = {{
+  setMeetingState(meetings) {{
+    view.module = 'meetings';
+    view.data = {{profile:{{}}, design:{{items:[]}}, meetings,
+      ops:{{services:[],commands:[],events:[],maintenance:[],acknowledgements:[]}},
+      resources:{{items:[]}}, inbox:{{items:[]}}}};
+    view.form = {{kind:'meeting', id:'m1'}};
+    view.meetingDraft = Object.assign({{}}, meetings.items[0]);
+    view.meetingActionDrafts = meetings.items[0].actionItems.map(action => Object.assign(blankMeetingAction(), action));
+  }},
+  submit(form) {{ onSubmit({{target:form, preventDefault() {{}}}}); }}
+}};`;
+src = src.slice(0, exportAt) + testExport + src.slice(exportAt);
+const values = {{title:'周会', type:'sync', status:'planned'}};
+const arrays = {{
+  action_id:['a-meta','a-id-only',''], action_title:['','',''], action_owner:['','',''], action_due:['','',''],
+  action_deliverable:['','',''], action_acceptance:['','',''], action_dependencies:['','',''], action_status:['open','blocked','open']
+}};
+const form = {{
+  closest() {{ return this; }},
+  getAttribute(name) {{ return name === 'data-hub-form' ? 'meeting' : ''; }}
+}};
+global.FormData = class {{
+  constructor(node) {{ if (node !== form) throw new Error('unexpected form'); }}
+  get(key) {{ return values[key] || ''; }}
+  getAll(key) {{ return arrays[key] || []; }}
+}};
+global.navigator = {{}};
+global.document = {{readyState:'loading', addEventListener() {{}}, querySelector() {{return null;}}, querySelectorAll() {{return [];}}, getElementById() {{return null;}}}};
+let saved = null;
+global.window = {{showToast() {{}}}};
+global.HubStore = {{
+  newId() {{ return 'generated'; }},
+  write(key, candidate) {{ saved = JSON.parse(JSON.stringify(candidate)); return Promise.resolve(); }},
+  read() {{ return Promise.resolve(saved); }},
+  invalidate() {{}}
+}};
+vm.runInThisContext(src, {{filename:'hub.js'}});
+const api = window.__hermesHubTest;
+api.setMeetingState({{items:[{{id:'m1',title:'周会',type:'sync',status:'planned',actionItems:[
+  {{id:'a-meta',agentTraceId:'trace-only',labels:['agent']}},
+  {{id:'a-id-only',status:'blocked'}},
+  {{id:'',status:'open'}}
+]}}]}});
+api.submit(form);
+setTimeout(() => process.stdout.write(JSON.stringify(saved)), 0);
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_meeting_ui_preserves_metadata_only_action_when_editing_and_saving():
+    saved = _run_metadata_only_action_ui_round_trip()
+    actions = saved["items"][0]["actionItems"]
+    assert len(actions) == 2
+    assert actions[0]["id"] == "a-meta"
+    assert actions[0]["agentTraceId"] == "trace-only"
+    assert actions[0]["labels"] == ["agent"]
+    assert actions[1]["id"] == "a-id-only"
+    assert actions[1]["status"] == "blocked"
 
 
 def test_meeting_save_is_transactional_in_source_contract():

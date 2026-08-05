@@ -1805,7 +1805,7 @@
       renderSidebar();
     }, function (err) {
       HubStore.invalidate();
-      return HubStore.read('meetings').then(function (remote) {
+      return HubStore.read('meetings', { strict: true }).then(function (remote) {
         view.data.meetings = remote;
         toast('保存失败：' + ((err && err.message) || '未知错误') + '；已重新读取磁盘数据', 'error');
         render();
@@ -2003,8 +2003,16 @@
           status: String(actionStatuses[index] || 'open'),
           updatedAt: nowIso()
         });
-      }).filter(function (action) {
-        return action.title || action.owner || action.due || action.deliverable || action.acceptance || action.dependencies;
+      }).filter(function (action, index) {
+        if (action.title || action.owner || action.due || action.deliverable || action.acceptance || action.dependencies) return true;
+        var original = (view.meetingActionDrafts || [])[index] || {};
+        if (String(original.id || '').trim()) return true;
+        var known = {
+          id: true, title: true, owner: true, due: true, deliverable: true,
+          acceptance: true, dependencies: true, status: true,
+          createdAt: true, updatedAt: true
+        };
+        return Object.keys(original).some(function (key) { return !known[key]; });
       });
       var meetingPayload = {
         title: get('title'), type: get('type') || 'sync', status: get('status') || 'planned',

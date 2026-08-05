@@ -327,10 +327,11 @@
     return root;
   }
 
-  function parseMeetings(text) {
+  function parseMeetings(text, strict) {
     if (!text || !String(text).trim()) {
       meetingsWriteBlocked = true;
       meetingsMissing = false;
+      if (strict) throw new Error('hub-meetings.json 为空或无法解析');
       return DEFAULTS.meetings();
     }
     try {
@@ -341,8 +342,9 @@
       meetingsMissing = false;
       meetingsBase = JSON.parse(JSON.stringify(value));
       return value;
-    } catch (_) {
+    } catch (err) {
       meetingsWriteBlocked = true;
+      if (strict) throw new Error('hub-meetings.json 为空或无法解析', { cause: err });
       return DEFAULTS.meetings();
     }
   }
@@ -375,8 +377,11 @@
   }
 
   /* 运维自动快照与人工数据分文件读取，避免监控和界面整文件互相覆盖。 */
-  function read(key) {
-    if (!ctx.ready) return Promise.resolve(DEFAULTS[key]());
+  function read(key, options) {
+    options = options || {};
+    if (!ctx.ready) return options.strict
+      ? Promise.reject(new Error('Hub 工作区尚未就绪'))
+      : Promise.resolve(DEFAULTS[key]());
     if (cache[key]) return Promise.resolve(cache[key]);
     if (key === 'ops') {
       return Promise.all([
@@ -394,9 +399,10 @@
     }
     if (key === 'meetings') {
       return readText(FILES.meetings).then(function (text) {
-        cache.meetings = parseMeetings(text);
+        cache.meetings = parseMeetings(text, options.strict);
         return cache.meetings;
-      }, function () {
+      }, function (err) {
+        if (options.strict) throw err;
         meetingsWriteBlocked = false;
         meetingsMissing = true;
         meetingsBase = DEFAULTS.meetings();
