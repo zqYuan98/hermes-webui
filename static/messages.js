@@ -4586,7 +4586,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     el.addEventListener('animationend',e=>{
       const span=e.target;
       if(!span||!span.classList||!span.classList.contains('stream-fade-word')) return;
-      span.replaceWith(document.createTextNode(span.textContent||''));
+      // Keep the animated inline node stable for the lifetime of the live turn.
+      // Replacing each word with a fresh text node makes native scroll anchoring
+      // choose a new anchor while the transcript is still growing, producing a
+      // visible vertical bounce. Final settlement rebuilds plain persisted DOM.
+      span.classList.remove('is-new');
+      if(span.style) span.style.removeProperty('--stream-fade-ms');
     });
   }
   function _streamFadeRenderer(el){
@@ -5221,6 +5226,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const force=!!(options&&options.force);
     const skipAnchorProcessProse=!!(options&&options.skipAnchorProcessProse);
     if(!assistantBody||(!force&&!_renderPending)) return;
+    // #6449: guard — this stream's session is no longer the active pane.
+    // Callers already gate on _isActiveSession(), but add the guard here too
+    // so any future call-site cannot leak rendering into the wrong session.
+    if(!_isActiveSession()) return;
     if(_renderPending) _cancelAnimationFramePendingStreamRender();
     const displayText=segmentStart===0
       ? _parseStreamState().displayText
@@ -5546,6 +5555,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     if(_renderPending) return;
     if(_streamFinalized) return; // Bug A: don't schedule new rAF after stream finalized
+    // #6449: guard — this stream's session is no longer the active frontend pane.
+    // Drop the scheduled render instead of writing into a detached or wrong-session DOM.
+    // Callers (token/interim_assistant handlers) already gate on _isActiveSession(), but
+    // the rAF/setTimeout window between schedule and execution can outlive a session switch.
+    if(!_isActiveSession()) return;
     _renderPending=true;
     // Cap render rate to ~15fps. The browser's rAF fires at 60fps, but each DOM
     // update takes 50-150ms on large sessions. During GC pauses, rAF callbacks
@@ -5561,6 +5575,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _renderPending=false;
       // Guard: a pending setTimeout+rAF can outlive stream finalization.
       if(_streamFinalized) return;
+      // #6449: guard — the frontend session changed between rAF schedule and execution.
+      // Writing DOM into this stream's assistantBody would leak text into the wrong pane.
+      if(!_isActiveSession()) return;
       // Mobile scroll-jank guard: temporarily disable overflow-anchor before DOM
       // writes to suppress Chromium scroll re-anchoring during streaming growth.
       if(typeof window._fixMobileScrollJank==='function') window._fixMobileScrollJank();
