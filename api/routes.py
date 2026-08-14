@@ -23096,11 +23096,18 @@ def start_session_turn(
     *,
     source: str = "process_wakeup",
 ):
+    msg = str(message or "").strip()
+    if _is_silent_control_message(msg):
+        return {
+            "status": "suppressed",
+            "reason": "silent_control_message",
+            "_status": 200,
+        }
     try:
         with run_admission_transaction():
             return _start_session_turn_admitted(
                 session_id,
-                message,
+                msg,
                 source=source,
             )
     except RunAdmissionRejected as exc:

@@ -63,13 +63,19 @@ def test_http_chat_start_suppresses_silent_before_session_lookup(monkeypatch):
     assert looked_up == []
 
 
-def test_server_side_start_suppresses_silent_before_session_lookup(monkeypatch):
+def test_server_side_start_suppresses_silent_before_admission_or_session_lookup(monkeypatch):
+    entered_admission = []
     looked_up = []
+
+    def _unexpected_admission(*args, **kwargs):
+        entered_admission.append((args, kwargs))
+        raise AssertionError("[SILENT] must be suppressed before run admission")
 
     def _unexpected_lookup(*args, **kwargs):
         looked_up.append((args, kwargs))
         raise AssertionError("[SILENT] must be suppressed before session lookup")
 
+    monkeypatch.setattr(routes, "run_admission_transaction", _unexpected_admission)
     monkeypatch.setattr(routes, "get_session", _unexpected_lookup)
 
     result = routes.start_session_turn(
@@ -83,6 +89,7 @@ def test_server_side_start_suppresses_silent_before_session_lookup(monkeypatch):
         "reason": "silent_control_message",
         "_status": 200,
     }
+    assert entered_admission == []
     assert looked_up == []
 
 
