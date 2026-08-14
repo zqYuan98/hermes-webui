@@ -27551,7 +27551,6 @@ def _handle_skill_delete(handler, body):
         resolved_skill = _resolve_skill_in_dirs(requested_name, [skills_dir])
         if resolved_skill is None:
             return bad(handler, "Skill not found", 404)
-        skill_dir = resolved_skill.skill_dir
         skill_md = resolved_skill.skill_md
         canonical_name = _canonical_skill_name(
             skill_md, resolved_skill.canonical_fallback
