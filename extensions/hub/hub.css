@@ -438,6 +438,99 @@ main.main.showing-hub > #mainHub { display: flex; }
 
 .hub-col-empty { padding: 14px 4px; font-size: 11.5px; color: var(--muted); text-align: center; }
 
+/* ── 会议纪要 ─────────────────────────────────────────────────────── */
+
+.hub-meeting-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+
+.hub-meeting { min-width: 0; }
+
+.hub-meeting-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.hub-meeting-summary {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text2);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.hub-meeting-block { margin-top: 12px; }
+
+.hub-meeting-block-title,
+.hub-action-editor-head {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+.hub-meeting-block ul { margin: 6px 0 0; padding-left: 18px; color: var(--text2); font-size: 12px; line-height: 1.6; }
+
+.hub-meeting-meta {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--text2);
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.hub-meeting-meta > span { color: var(--muted); }
+.hub-meeting-meta a { color: var(--accent); }
+.hub-meeting-meta code { color: var(--text2); white-space: normal; word-break: break-all; }
+
+.hub-action-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+
+.hub-action-item {
+  display: grid;
+  grid-template-columns: minmax(150px, .8fr) repeat(2, minmax(120px, 1fr));
+  gap: 10px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border2);
+  background: var(--bg);
+  color: var(--text2);
+  font-size: 12px;
+}
+
+.hub-action-item.in_progress { border-left-color: var(--accent); }
+.hub-action-item.blocked { border-left-color: var(--warning); }
+.hub-action-item.done { border-left-color: var(--success); opacity: .72; }
+.hub-action-item strong { display: block; color: var(--text); font-size: 12.5px; }
+.hub-action-item span { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
+
+.hub-meeting-form { margin-bottom: 16px; }
+.hub-meeting-form > .hub-field { margin-bottom: 12px; }
+.hub-meeting-notes-grid { grid-template-columns: repeat(3, minmax(180px, 1fr)); }
+.hub-action-editor-section { margin: 16px 0; padding-top: 14px; border-top: 1px solid var(--border); }
+
+.hub-action-editor {
+  margin-bottom: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.hub-action-editor-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.hub-action-editor .hub-form-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); margin-bottom: 0; }
+
+@media (max-width: 720px) {
+  .hub-meeting-list { grid-template-columns: 1fr; }
+  .hub-meeting-head { align-items: flex-start; }
+  .hub-action-item { grid-template-columns: 1fr; }
+  .hub-meeting-notes-grid,
+  .hub-action-editor .hub-form-grid { grid-template-columns: 1fr; }
+  .hub-meeting-meta { grid-template-columns: 72px minmax(0, 1fr); }
+}
+
 /* ── 运维 ─────────────────────────────────────────────────────────── */
 
 .hub-ops-overview-label {

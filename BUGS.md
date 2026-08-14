@@ -24,6 +24,16 @@ This file tracks UI bugs and polish items. Fixed items are kept for reference.
 
 ## Fixed
 
+### ~~External directory views could not upload files~~ -- Fixed
+
+- **Was:** Escape-target grants were correctly read-only, but the workspace Upload button and OS drag/drop were blocked along with every mutation, so an explicitly opened external directory had no safe upload workflow.
+- **Fix:** Added an explicit browser-origin/CSRF-protected two-phase confirmation: the server first records the exact anchored directory identity before displaying the confirmation, then activates a separate short-lived, session-bound upload-only capability only if the same path still resolves to the same directory object. External uploads are re-anchored under that authorized root and may create only a brand-new ordinary leaf file in the exact authorized directory: traversal, nested or dangling symlink targets, existing-file overwrite/deduplication, implicit subdirectory creation, directory rename/symlink replacement, expired/wrong-session tokens, and read-only grants are rejected; edit/delete/rename/move/create/reveal remain read-only. Directory identity is captured and revalidated from anchored `O_NOFOLLOW` file descriptors; platforms without race-safe `dir_fd/openat` support fail closed for external capabilities while ordinary workspace uploads retain their compatibility fallback.
+
+### ~~Hermes Hub had no first-class meeting-minutes workflow~~ -- Fixed
+
+- **Was:** Hub could track design, operations, resources, and inbox entries, but meetings, decisions, risks, open questions, and accountable action items had no structured home.
+- **Fix:** Added the Chinese `会议` module backed by additive `hub-meetings.json` storage, with meeting CRUD, structured minutes and per-action owner/due/deliverable/acceptance/status controls, plus meeting/action homepage stats and timeline entries.
+
 ### ~~Hub auto-refresh polled the file API from a hidden tab~~ -- Fixed
 
 - **Was:** `reloadIfVisible` (extensions/hub/hub.js) gated its 60s poll only on the Hub panel being the active panel, not on `document.hidden`. A backgrounded tab left on Hub kept issuing `/api/file` reads forever — every other poll in the codebase gates on `document.hidden`.

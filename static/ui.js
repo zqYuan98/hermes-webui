@@ -20066,12 +20066,12 @@ function _renderTreeItems(container, entries, depth){
       nameEl.title = (typeof isReadOnlyEscape!=='undefined'
         ? isReadOnlyEscape
         : (typeof _workspaceEscapeGrantForPath==='function' ? !!_workspaceEscapeGrantForPath(item.path) : false))
-        ? t('external_link_read_only')
+        ? t('external_link_read_only_upload')
         : t('external_link_open_confirm');
     else if(typeof isReadOnlyEscape!=='undefined'
       ? isReadOnlyEscape
       : (typeof _workspaceEscapeGrantForPath==='function' ? !!_workspaceEscapeGrantForPath(item.path) : false))
-      nameEl.title = t('external_link_read_only');
+      nameEl.title = t('external_link_read_only_upload');
     else if(!isDirLike)
       nameEl.title = t('double_click_rename');
     const nameIsReadOnlyEscape=typeof isReadOnlyEscape!=='undefined'
@@ -20203,7 +20203,7 @@ function _renderTreeItems(container, entries, depth){
         if(isNestedEscape){
           await showConfirmDialog({
             title:item.name,
-            message:t('external_link_read_only'),
+            message:t('external_link_read_only_upload'),
             confirmLabel:t('dialog_confirm_btn'),
             danger:false,
             hideCancel:true,
@@ -20241,7 +20241,7 @@ function _renderTreeItems(container, entries, depth){
 async function deleteWorkspaceDir(relPath, name){
   if(!S.session)return;
   if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(relPath)){
-    showToast(t('external_link_read_only'), 2000);
+    showToast(t('external_link_read_only_upload'), 2000);
     return;
   }
   const ok=await showConfirmDialog({title:t('delete_dir_confirm',name),message:'',confirmLabel:'Delete',danger:true,focusCancel:true});
@@ -20400,7 +20400,7 @@ function _showFileContextMenu(e, item){
 async function _inlineRenameFileItem(item){
   if(!S.session)return;
   if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(item.path)){
-    showToast(t('external_link_read_only'), 2000);
+    showToast(t('external_link_read_only_upload'), 2000);
     return;
   }
   const isDirLike=item.type==='dir'||(item.type==='symlink'&&item.is_dir);
@@ -20437,7 +20437,7 @@ async function _inlineRenameFileItem(item){
 async function deleteWorkspaceFile(relPath, name){
   if(!S.session)return;
   if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(relPath)){
-    showToast(t('external_link_read_only'), 2000);
+    showToast(t('external_link_read_only_upload'), 2000);
     return;
   }
   const _delFile=await showConfirmDialog({title:t('delete_confirm',name),message:'',confirmLabel:'Delete',danger:true,focusCancel:true});
@@ -20464,7 +20464,7 @@ async function promptNewFile(targetDir = S.currentDir || '.'){
   }
   if(!S.session)return;
   if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(targetDir)){
-    showToast(t('external_link_read_only'), 2000);
+    showToast(t('external_link_read_only_upload'), 2000);
     return;
   }
   const targetLabel=_workspaceCreateTargetLabel(targetDir);
@@ -20497,7 +20497,7 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
   }
   if(!S.session)return;
   if(typeof _workspacePathIsReadOnly==='function'&&_workspacePathIsReadOnly(targetDir)){
-    showToast(t('external_link_read_only'), 2000);
+    showToast(t('external_link_read_only_upload'), 2000);
     return;
   }
   const targetLabel=_workspaceCreateTargetLabel(targetDir);

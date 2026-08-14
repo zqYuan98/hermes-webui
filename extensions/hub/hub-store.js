@@ -8,6 +8,7 @@
  *   HUB.md              给 agent 看的目录说明
  *   hub-profile.json    个人档案 / 今日聚焦
  *   hub-design.json     产品设计工作台
+ *   hub-meetings.json   会议纪要与行动项
  *   hub-ops.json        人工维护的服务、命令和自动服务备注
  *   hub-ops-auto.json   只读监控生成的服务器与服务快照
  *   hub-resources.json  个人资源库
@@ -26,6 +27,7 @@
   var FILES = {
     profile: 'hub-profile.json',
     design: 'hub-design.json',
+    meetings: 'hub-meetings.json',
     ops: 'hub-ops.json',
     resources: 'hub-resources.json',
     inbox: 'hub-inbox.json'
@@ -37,6 +39,7 @@
       return { name: '', role: '', focus: '', focusDate: '', updatedAt: '' };
     },
     design: function () { return { items: [] }; },
+    meetings: function () { return { items: [] }; },
     ops: function () {
       return {
         generatedAt: '',
@@ -63,6 +66,7 @@
     '| --- | --- | --- |',
     '| `hub-profile.json` | 个人档案与今日聚焦 | `{name, role, focus, focusDate}` |',
     '| `hub-design.json` | 产品设计工作台 | `{items:[{id,title,stage,priority,tags,link,notes}]}` |',
+    '| `hub-meetings.json` | 会议纪要与行动项 | `{items:[{id,title,type,status,startAt,endAt,participants,projectLinks,summary,decisions,actionItems:[{id,title,owner,due,deliverable,acceptance,dependencies,status}],risks,openQuestions,transcriptFile,minutesFile,nextReviewAt}]}` |',
     '| `hub-ops.json` | 运维人工数据 | `{services:[手工服务或{id,managed:true,notes}], commands:[{id,label,command,notes}], maintenance:[{id,entityType,entityId,start,end,reason}], acknowledgements:[{id,eventId,createdAt,note}]}` |',
     '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,kind,startup,listen,control,status,detail,updatedAt,managed}], events:[{id,entityType,entityId,statusChangedAt,incidentOpenedAt,lifecycleSource,status,detail}]}` |',
     '| `hub-resources.json` | 个人资源库 | `{items:[{id,title,url,category,tags,note}]}` |',
@@ -72,6 +76,9 @@
     '',
     '- `design.stage` 取值：`idea` | `spec` | `design` | `review` | `done`',
     '- `design.priority` 取值：`high` | `normal` | `low`',
+    '- `meetings.type` 取值：`sync` | `planning` | `review` | `decision` | `retrospective` | `other`',
+    '- `meetings.status` 取值：`planned` | `in_progress` | `completed` | `cancelled`',
+    '- `meetings.actionItems[].status` 取值：`open` | `in_progress` | `blocked` | `done`',
     '- `ops.services[].env` 取值：`prod` | `staging` | `dev`',
     '- `ops.services[].status` 取值：`ok` | `watch` | `down`',
     '- `ops.machines[].ownership` 取值：`personal` | `company`',
@@ -89,6 +96,9 @@
   var opsManualWriteBlocked = false;
   var opsManualMissing = false;
   var opsManualBase = { services: [], commands: [], maintenance: [], acknowledgements: [] };
+  var meetingsWriteBlocked = false;
+  var meetingsMissing = false;
+  var meetingsBase = { items: [] };
 
   function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (_) { return ''; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (_) { } }
@@ -265,6 +275,80 @@
     }
   }
 
+  function stringValue(value, fallback) {
+    if (value == null || typeof value === 'object') return fallback || '';
+    return String(value);
+  }
+
+  function stringList(value) {
+    var rows = Array.isArray(value) ? value : (typeof value === 'string' ? value.split(/[\n,，]+/) : []);
+    return rows.map(function (item) { return stringValue(item, '').trim(); }).filter(Boolean);
+  }
+
+  function normalizeMeetings(value) {
+    var root = normalize('meetings', value || {});
+    var meetingTypes = { sync: true, planning: true, review: true, decision: true, retrospective: true, other: true };
+    var meetingStatuses = { planned: true, in_progress: true, completed: true, cancelled: true };
+    var actionStatuses = { open: true, in_progress: true, blocked: true, done: true };
+    root.items = root.items.filter(function (meeting) {
+      return meeting && typeof meeting === 'object' && !Array.isArray(meeting);
+    }).map(function (meeting, meetingIndex) {
+      var next = Object.assign({}, meeting);
+      next.id = stringValue(meeting.id, 'meeting-legacy-' + meetingIndex);
+      next.title = stringValue(meeting.title);
+      next.type = meetingTypes[meeting.type] ? meeting.type : 'other';
+      next.status = meetingStatuses[meeting.status] ? meeting.status : 'planned';
+      [
+        'startAt', 'endAt', 'summary', 'transcriptFile', 'minutesFile',
+        'nextReviewAt', 'createdAt', 'updatedAt'
+      ].forEach(function (field) { next[field] = stringValue(meeting[field]); });
+      next.participants = stringList(meeting.participants);
+      next.projectLinks = stringList(meeting.projectLinks);
+      next.decisions = stringList(meeting.decisions);
+      next.risks = stringList(meeting.risks);
+      next.openQuestions = stringList(meeting.openQuestions);
+      next.actionItems = (Array.isArray(meeting.actionItems) ? meeting.actionItems : []).filter(function (action) {
+        return action && typeof action === 'object' && !Array.isArray(action);
+      }).map(function (action, actionIndex) {
+        var normalizedAction = Object.assign({}, action);
+        normalizedAction.id = stringValue(action.id, 'action-legacy-' + meetingIndex + '-' + actionIndex);
+        normalizedAction.title = stringValue(action.title);
+        normalizedAction.owner = stringValue(action.owner);
+        normalizedAction.due = stringValue(action.due);
+        normalizedAction.deliverable = stringValue(action.deliverable);
+        normalizedAction.acceptance = stringValue(action.acceptance);
+        normalizedAction.dependencies = stringValue(action.dependencies);
+        normalizedAction.status = actionStatuses[action.status] ? action.status : 'open';
+        normalizedAction.updatedAt = stringValue(action.updatedAt);
+        return normalizedAction;
+      });
+      return next;
+    });
+    return root;
+  }
+
+  function parseMeetings(text, strict) {
+    if (!text || !String(text).trim()) {
+      meetingsWriteBlocked = true;
+      meetingsMissing = false;
+      if (strict) throw new Error('hub-meetings.json 为空或无法解析');
+      return DEFAULTS.meetings();
+    }
+    try {
+      var value = JSON.parse(text);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('root is not object');
+      value = normalizeMeetings(value);
+      meetingsWriteBlocked = false;
+      meetingsMissing = false;
+      meetingsBase = JSON.parse(JSON.stringify(value));
+      return value;
+    } catch (err) {
+      meetingsWriteBlocked = true;
+      if (strict) throw new Error('hub-meetings.json 为空或无法解析', { cause: err });
+      return DEFAULTS.meetings();
+    }
+  }
+
   function mergeOps(manual, automatic) {
     manual = normalize('ops', manual || {});
     automatic = normalize('ops', automatic || {});
@@ -293,8 +377,11 @@
   }
 
   /* 运维自动快照与人工数据分文件读取，避免监控和界面整文件互相覆盖。 */
-  function read(key) {
-    if (!ctx.ready) return Promise.resolve(DEFAULTS[key]());
+  function read(key, options) {
+    options = options || {};
+    if (!ctx.ready) return options.strict
+      ? Promise.reject(new Error('Hub 工作区尚未就绪'))
+      : Promise.resolve(DEFAULTS[key]());
     if (cache[key]) return Promise.resolve(cache[key]);
     if (key === 'ops') {
       return Promise.all([
@@ -308,6 +395,19 @@
       ]).then(function (values) {
         cache.ops = mergeOps(values[0], values[1]);
         return cache.ops;
+      });
+    }
+    if (key === 'meetings') {
+      return readText(FILES.meetings).then(function (text) {
+        cache.meetings = parseMeetings(text, options.strict);
+        return cache.meetings;
+      }, function (err) {
+        if (options.strict) throw err;
+        meetingsWriteBlocked = false;
+        meetingsMissing = true;
+        meetingsBase = DEFAULTS.meetings();
+        cache.meetings = DEFAULTS.meetings();
+        return cache.meetings;
       });
     }
     return readText(FILES[key]).then(function (text) {
@@ -347,6 +447,38 @@
   }
 
   function sameJson(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+
+  function validateMeetingIds(value) {
+    var meetingIds = Object.create(null);
+    (value.items || []).forEach(function (meeting) {
+      if (!meeting.id) throw new Error('会议存在缺少 id 的条目，已拒绝保存');
+      if (meetingIds[meeting.id]) throw new Error('会议存在重复 id「' + meeting.id + '」，已拒绝保存');
+      meetingIds[meeting.id] = true;
+      var actionIds = Object.create(null);
+      (meeting.actionItems || []).forEach(function (action) {
+        if (!action.id) throw new Error('会议「' + meeting.id + '」存在缺少 id 的行动项，已拒绝保存');
+        if (actionIds[action.id]) throw new Error('会议「' + meeting.id + '」行动项存在重复 id「' + action.id + '」，已拒绝保存');
+        actionIds[action.id] = true;
+      });
+    });
+  }
+
+  function mergeObjectFields(base, local, remote, excluded, label) {
+    var result = {}, keys = Object.create(null);
+    [base, local, remote].forEach(function (source) {
+      Object.keys(source || {}).forEach(function (key) { if (!excluded[key]) keys[key] = true; });
+    });
+    Object.keys(keys).forEach(function (key) {
+      var localChanged = !sameJson(local && local[key], base && base[key]);
+      var remoteChanged = !sameJson(remote && remote[key], base && base[key]);
+      if (localChanged && remoteChanged && !sameJson(local && local[key], remote && remote[key])) {
+        throw new Error(label + '字段「' + key + '」已被其他页面或 Agent 修改，请刷新后重试');
+      }
+      var value = localChanged ? local[key] : remote[key];
+      if (typeof value !== 'undefined') result[key] = value;
+    });
+    return result;
+  }
 
   function mergeRows(baseRows, localRows, remoteRows, label) {
     var base = Object.create(null), local = Object.create(null), remote = Object.create(null), ids = Object.create(null);
@@ -397,6 +529,36 @@
 
   function write(key, value) {
     if (!ctx.ready) return Promise.reject(new Error('Hub 数据目录尚未配置'));
+    if (key === 'meetings') {
+      if (meetingsWriteBlocked) {
+        return Promise.reject(new Error('hub-meetings.json 无法解析，已禁止覆盖；请先修复或恢复该文件'));
+      }
+      var localMeetings = normalizeMeetings(JSON.parse(JSON.stringify(value || DEFAULTS.meetings())));
+      function mergeAndPersistMeetings(text) {
+        var remote;
+        try {
+          remote = text ? JSON.parse(text) : DEFAULTS.meetings();
+          if (!remote || typeof remote !== 'object' || Array.isArray(remote)) throw new Error('root');
+          remote = normalizeMeetings(remote);
+        } catch (_) {
+          meetingsWriteBlocked = true;
+          throw new Error('hub-meetings.json 无法解析，已禁止覆盖；请先修复或恢复该文件');
+        }
+        validateMeetingIds(localMeetings);
+        validateMeetingIds(remote);
+        var persisted = mergeObjectFields(meetingsBase, localMeetings, remote, { items: true }, '会议文件');
+        persisted.items = mergeRows(meetingsBase.items, localMeetings.items, remote.items, '会议');
+        return writeText(FILES.meetings, JSON.stringify(persisted, null, 2)).then(function () {
+          meetingsMissing = false;
+          meetingsBase = JSON.parse(JSON.stringify(persisted));
+          cache.meetings = persisted;
+        });
+      }
+      return readText(FILES.meetings).then(mergeAndPersistMeetings, function () {
+        if (meetingsMissing) return mergeAndPersistMeetings('');
+        throw new Error('保存前无法重新读取 hub-meetings.json，已拒绝覆盖；请稍后重试');
+      });
+    }
     if (key !== 'ops') {
       return writeText(FILES[key], JSON.stringify(value, null, 2)).then(function () { cache[key] = value; });
     }
