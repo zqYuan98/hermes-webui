@@ -20,6 +20,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture
+def explicit_process_auto_wake(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_PROCESS_AUTO_WAKE", "1")
+
+
 def _js_function_decl(src: str, name: str) -> str:
     marker = f"function {name}("
     start = src.find(marker)
@@ -659,6 +664,7 @@ def _install_fake_start_session_turn(monkeypatch, *, status=200):
     return _impl(monkeypatch, status=status)
 
 
+@pytest.mark.usefixtures("explicit_process_auto_wake")
 def test_server_side_wakeup_when_idle_no_tab(monkeypatch):
     """THE headline test: no SSE subscriber at all (closed tab / never opened).
     Pushing a completion must still start a server-side turn for the session.
@@ -702,6 +708,7 @@ def test_server_side_wakeup_when_idle_no_tab(monkeypatch):
         cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(sid, None)
 
 
+@pytest.mark.usefixtures("explicit_process_auto_wake")
 def test_server_side_wakeup_deferred_when_turn_active(monkeypatch):
     """A foreground turn is active (ACTIVE_RUNS has a row for the session) →
     the drain must NOT start a second turn. The PENDING_BG_TASK_COMPLETIONS
@@ -745,6 +752,7 @@ def test_server_side_wakeup_deferred_when_turn_active(monkeypatch):
         cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(sid, None)
 
 
+@pytest.mark.usefixtures("explicit_process_auto_wake")
 def test_wakeup_dedupe_once_per_process(monkeypatch):
     """The same process_id delivered twice (kill_process racing the reader
     thread) must wake the agent at most once.
@@ -780,6 +788,7 @@ def test_wakeup_dedupe_once_per_process(monkeypatch):
         cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(sid, None)
 
 
+@pytest.mark.usefixtures("explicit_process_auto_wake")
 def test_open_tab_sees_live_stream(monkeypatch):
     """Live-view still works: with a subscribed per-session SSE channel, the
     bg_task_complete frame is still delivered to the tab (so the open tab can

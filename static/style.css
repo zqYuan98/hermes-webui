@@ -2201,6 +2201,7 @@
   .skill-item.active{background:var(--accent-bg);color:var(--accent-text);}
   .skill-name{font-weight:500;flex-shrink:0;}
   .skill-desc{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;font-size:11px;opacity:.7;}
+  .skill-desc.localized{color:var(--accent-text);opacity:.9;}
   .skill-item.disabled{opacity:.5;}
   .skill-item.disabled .skill-name{opacity:.45;}
   .skill-toggle{flex-shrink:0;width:28px;height:14px;border-radius:7px;border:1px solid var(--border2);background:var(--border);cursor:pointer;position:relative;transition:all .15s;margin-top:3px;}
@@ -3652,6 +3653,12 @@ body.resizing .sidebar{transition:none!important;}
 .skill-tag{background:var(--accent-bg);border:1px solid var(--accent-bg);border-radius:12px;padding:2px 8px;font-size:11px;color:var(--accent-text);display:flex;align-items:center;gap:4px;}
 .remove-tag{cursor:pointer;opacity:.6;font-size:13px;line-height:1;}
 .remove-tag:hover{opacity:1;color:var(--accent);}
+/* WebUI-only human skill description */
+.skill-ui-description-card{margin-bottom:16px;padding:14px 16px;border:1px solid color-mix(in srgb,var(--accent) 35%,var(--border));border-radius:10px;background:var(--accent-bg);}
+.skill-ui-description-label{font-size:11px;font-weight:700;color:var(--accent-text);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;}
+.skill-ui-description-card p{margin:0;color:var(--text);font-size:14px;line-height:1.65;white-space:pre-wrap;}
+.skill-ui-description-hint{margin-top:8px;color:var(--muted);font-size:11px;line-height:1.45;}
+.skill-ui-description-field textarea{min-height:88px;resize:vertical;}
 /* Skill frontmatter (collapsible metadata) */
 .skill-frontmatter{margin-bottom:16px;border:1px solid var(--border);border-radius:8px;background:var(--surface);overflow:hidden;}
 .skill-frontmatter>summary{padding:8px 12px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);cursor:pointer;user-select:none;list-style:none;}

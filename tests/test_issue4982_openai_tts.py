@@ -104,8 +104,16 @@ def _reset_limiter():
 def _fresh_tts_limiter(monkeypatch):
     import api.auth as _auth
 
+    def _public_getaddrinfo(_host, port=None, *_args, **_kwargs):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", port or 443))
+        ]
+
     monkeypatch.setattr(_auth, "is_auth_enabled", lambda: False)
     monkeypatch.setattr(routes, "is_auth_enabled", lambda: False, raising=False)
+    # Keep request-path tests hermetic while still exercising production SSRF
+    # validation. Security-specific tests replace this with their own RRset.
+    monkeypatch.setattr(socket, "getaddrinfo", _public_getaddrinfo)
     monkeypatch.delenv("HERMES_WEBUI_TRUST_FORWARDED_FOR", raising=False)
     monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

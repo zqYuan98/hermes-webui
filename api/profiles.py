@@ -1596,6 +1596,74 @@ def init_profile_state() -> None:
     _reload_dotenv(home)
 
 
+def _switch_profile_process_wide(name: str) -> tuple[Path, dict, bool]:
+    """Commit one process-wide switch under the shared lifecycle transaction."""
+    global _active_profile
+
+    from api.config import (
+        STREAMS,
+        STREAMS_LOCK,
+        get_config_snapshot,
+        reload_config,
+    )
+    from api.skill_ui_descriptions import profile_transaction
+
+    root_home = _DEFAULT_HERMES_HOME.expanduser().resolve()
+    isolated = _is_isolated_profile_mode()
+    if isolated:
+        candidate_home = Path(_INITIAL_HERMES_HOME).expanduser().resolve()
+    elif name == 'default':
+        candidate_home = root_home
+    else:
+        # This is only structural validation/path canonicalization. The mutable
+        # root-alias and existence decisions are repeated under the lock below.
+        candidate_home = _resolve_named_profile_home(name).expanduser().resolve()
+
+    lock_homes = (root_home,) if candidate_home == root_home else (
+        root_home,
+        candidate_home,
+    )
+    with profile_transaction(lock_homes):
+        is_root = _is_root_profile(name)
+        if isolated:
+            home = candidate_home
+        elif is_root:
+            home = root_home
+        else:
+            home = candidate_home
+            if not home.is_dir():
+                raise ValueError(f"Profile '{name}' does not exist.")
+
+        # Profile transaction is always outermost. Holding STREAMS_LOCK through
+        # the global mutation prevents a new run from being admitted after the
+        # empty check but before HERMES_HOME/config publication completes.
+        with STREAMS_LOCK:
+            if STREAMS:
+                raise RuntimeError(
+                    'Cannot switch profiles while an agent is running. '
+                    'Cancel or wait for it to finish.'
+                )
+
+            ap_file = root_home / 'active_profile'
+            _atomic_write_text(
+                ap_file,
+                '' if is_root else f'{name}\n',
+                encoding='utf-8',
+                require_atomic_replace=True,
+            )
+
+            with _profile_lock:
+                _SKILLS_STATS_CACHE.clear()
+                _active_profile = name
+                _set_hermes_home(home)
+                _reload_dotenv(home)
+
+            reload_config()
+            cfg_snapshot = get_config_snapshot()
+
+    return home, cfg_snapshot, is_root
+
+
 def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     """Switch the active profile.
 
@@ -1626,60 +1694,22 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
                 f"Currently pinned to profile '{active}'."
             )
 
-    # Import here to avoid circular import at module load
-    from api.config import STREAMS, STREAMS_LOCK, reload_config
-
-    # Process-wide profile switches mutate HERMES_HOME, module-level path caches,
-    # os.environ-backed .env keys, and the global config cache. Keep those blocked
-    # while any agent stream is active. Per-client WebUI switches are cookie/TLS
-    # scoped (process_wide=False) and do not mutate those globals, so users can
-    # leave a running session in one profile and start work in another (#1700).
+    # Process-wide switches mutate shared process and disk state. Commit them
+    # under the canonical root/target lifecycle transaction. Per-client WebUI
+    # switches remain read-only and cookie/TLS scoped (#1700).
     if process_wide:
-        with STREAMS_LOCK:
-            if len(STREAMS) > 0:
-                raise RuntimeError(
-                    'Cannot switch profiles while an agent is running. '
-                    'Cancel or wait for it to finish.'
-                )
-
-    # Resolve profile directory
-    if _is_isolated_profile_mode():
-        home = Path(_INITIAL_HERMES_HOME).expanduser()
-    elif _is_root_profile(name):
-        home = _DEFAULT_HERMES_HOME
+        home, cfg, is_root = _switch_profile_process_wide(name)
     else:
-        home = _resolve_named_profile_home(name)
-        if not home.is_dir():
-            raise ValueError(f"Profile '{name}' does not exist.")
-
-    with _profile_lock:
-        _SKILLS_STATS_CACHE.clear()
-        if process_wide:
-            global _active_profile
-            _active_profile = name
-            _set_hermes_home(home)
-            _reload_dotenv(home)
-
-    if process_wide:
-        # Write sticky default for CLI consistency
-        try:
-            ap_file = _DEFAULT_HERMES_HOME / 'active_profile'
-            ap_file.write_text('' if _is_root_profile(name) else name, encoding='utf-8')
-        except Exception:
-            logger.debug("Failed to write active profile file")
-
-        # Reload config.yaml from the new profile
-        reload_config()
-
-    # Return profile-specific defaults so frontend can apply them.
-    # For process_wide=False (per-client switch), read the target profile's
-    # config.yaml directly from disk rather than from _cfg_cache (process-global),
-    # since reload_config() was intentionally skipped.
-    if process_wide:
-        from api.config import get_config
-        cfg = get_config()
-    else:
-        # Direct disk read — does not touch _cfg_cache
+        if _is_isolated_profile_mode():
+            home = Path(_INITIAL_HERMES_HOME).expanduser()
+        elif _is_root_profile(name):
+            home = _DEFAULT_HERMES_HOME
+        else:
+            home = _resolve_named_profile_home(name)
+            if not home.is_dir():
+                raise ValueError(f"Profile '{name}' does not exist.")
+        is_root = _is_root_profile(name)
+        # Direct disk read — does not touch the process-global config cache.
         try:
             import yaml as _yaml
             cfg_path = home / 'config.yaml'
@@ -1746,7 +1776,7 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     return {
         'profiles': list_profiles_api(),
         'active': name,
-        'is_default': _is_root_profile(name),
+        'is_default': is_root,
         'default_model': default_model,
         'default_model_provider': default_model_provider,
         'default_workspace': default_workspace,
@@ -2034,7 +2064,38 @@ def _build_profile_rows_fast() -> list | None:
     return rows
 
 
-def list_profiles_api() -> list:
+def _attach_profile_generations(rows: list[dict]) -> list[dict]:
+    """Add lifecycle tokens without holding the profile-list cache lock."""
+    from api.profile_generation import (
+        DEFAULT_PROFILE_GENERATION,
+        ensure_profile_generation,
+        profile_home_identity,
+    )
+    from api.skill_ui_descriptions import skill_transaction
+
+    enriched: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        if item.get('is_default'):
+            item['profile_generation'] = DEFAULT_PROFILE_GENERATION
+            enriched.append(item)
+            continue
+        home = Path(item.get('path') or '').expanduser()
+        profile_key = str(home.resolve(strict=False))
+        with skill_transaction(profile_key):
+            before = profile_home_identity(home)
+            generation = ensure_profile_generation(home)
+            after = profile_home_identity(home)
+            if after != before:
+                raise RuntimeError(
+                    "Profile generation changed while listing profiles; retry"
+                )
+        item['profile_generation'] = generation
+        enriched.append(item)
+    return enriched
+
+
+def _list_profiles_api_unenriched() -> list:
     """List all profiles with metadata, serialized for JSON response.
 
     In isolated profile mode (HERMES_HOME points to ~/.hermes/profiles/<name>),
@@ -2151,6 +2212,12 @@ def list_profiles_api() -> list:
 
     active = get_active_profile_name()
     return [{**p, 'is_active': p['name'] == active} for p in rows]
+
+
+def list_profiles_api(*, include_generation: bool = False) -> list:
+    """List Profiles, optionally enriching management rows with lifecycle tokens."""
+    rows = _list_profiles_api_unenriched()
+    return _attach_profile_generations(rows) if include_generation else rows
 
 
 def _profile_visible_from_meta(profile_path: Path) -> bool:
@@ -2517,12 +2584,12 @@ def _write_model_defaults_to_config(
     _atomic_write_text(config_path, _yaml.dump(cfg, default_flow_style=False, allow_unicode=True), encoding='utf-8')
 
 
-def create_profile_api(name: str, clone_from: str = None,
-                       clone_config: bool = False,
-                       base_url: str = None,
-                       api_key: str = None,
-                       default_model: str = None,
-                       model_provider: str = None) -> dict:
+def _create_profile_api_unlocked(name: str, clone_from: str = None,
+                                 clone_config: bool = False,
+                                 base_url: str = None,
+                                 api_key: str = None,
+                                 default_model: str = None,
+                                 model_provider: str = None) -> dict:
     """Create a new profile. Returns the new profile info dict.
 
     In isolated profile mode, profile creation is rejected (403).
@@ -2598,6 +2665,10 @@ def create_profile_api(name: str, clone_from: str = None,
         model_provider=model_provider,
     )
 
+    from api.profile_generation import reset_profile_generation
+
+    profile_generation = reset_profile_generation(profile_path)
+
     # Invalidate cached root-profile-name lookup; create_profile may have added
     # a new profile that flips is_default semantics on the agent side (#1612).
     _SKILLS_STATS_CACHE.clear()
@@ -2610,7 +2681,7 @@ def create_profile_api(name: str, clone_from: str = None,
     # In that case, return a complete profile dict directly.
     for p in list_profiles_api():
         if p['name'] == name:
-            return p
+            return {**p, 'profile_generation': profile_generation}
     return {
         'name': name,
         'path': str(profile_path),
@@ -2623,41 +2694,144 @@ def create_profile_api(name: str, clone_from: str = None,
         'skill_count': 0,
         'enabled_skills': 0,
         'total_skills': 0,
+        'profile_generation': profile_generation,
     }
 
 
-def delete_profile_api(name: str) -> dict:
-    """Delete a profile. Switches to default first if it's the active one.
+def create_profile_api(name: str, clone_from: str = None,
+                       clone_config: bool = False,
+                       base_url: str = None,
+                       api_key: str = None,
+                       default_model: str = None,
+                       model_provider: str = None) -> dict:
+    """Create a Profile under one sorted root/source/destination transaction."""
+    if _is_isolated_profile_mode():
+        raise PermissionError("Profile creation is not allowed in isolated profile mode.")
+    _validate_profile_name(name)
+    # Literal ``default`` is a stable alias. Any other clone source is only
+    # syntax-validated and mapped to a conservative candidate path here; the
+    # mutable root-display-name decision is made once by the unlocked helper
+    # after the shared root/source/destination transaction has been acquired.
+    if clone_from is not None and clone_from != 'default':
+        _validate_profile_name(clone_from)
 
-    In isolated profile mode, profile deletion is rejected (403).
+    root_home = _DEFAULT_HERMES_HOME.expanduser().resolve()
+    destination = _resolve_named_profile_home(name).expanduser().resolve()
+    profile_homes = [root_home]
+    if clone_from is not None and clone_from != 'default':
+        profile_homes.append(
+            _resolve_named_profile_home(clone_from).expanduser().resolve()
+        )
+    profile_homes.append(destination)
+
+    from api.skill_ui_descriptions import profile_transaction
+
+    with profile_transaction(profile_homes):
+        return _create_profile_api_unlocked(
+            name,
+            clone_from=clone_from,
+            clone_config=clone_config,
+            base_url=base_url,
+            api_key=api_key,
+            default_model=default_model,
+            model_provider=model_provider,
+        )
+
+
+def delete_profile_api(
+    name: str,
+    *,
+    expected_generation: str | None = None,
+    require_generation: bool = False,
+) -> dict:
+    """Delete one Profile incarnation under its lifecycle transaction lock.
+
+    HTTP management callers require the generation returned by ``/api/profiles``.
+    Legacy internal callers may omit it, but still receive the same path lock and
+    inode/generation capture before any active-profile or filesystem mutation.
     """
     if _is_isolated_profile_mode():
         raise PermissionError("Profile deletion is not allowed in isolated profile mode.")
-    if _is_root_profile(name):
+    # The literal alias is immutable and can be rejected before path resolution.
+    # Renamed-root display aliases are live state and must be checked only after
+    # the shared root/target transaction is held.
+    if name == 'default':
         raise ValueError("Cannot delete the default profile.")
     _validate_profile_name(name)
 
-    # If deleting the active profile, switch to default first
-    if _active_profile == name:
+    profile_dir = _resolve_named_profile_home(name)
+    profile_key = str(profile_dir.expanduser().resolve())
+    from api.profile_generation import (
+        ProfileGenerationMismatch,
+        ensure_profile_generation,
+        profile_home_identity,
+        read_profile_generation,
+    )
+    from api.skill_ui_descriptions import (
+        pop_profile_descriptions,
+        profile_transaction,
+        restore_profile_descriptions,
+    )
+
+    root_home = _DEFAULT_HERMES_HOME.expanduser().resolve()
+    with profile_transaction((root_home, profile_key)):
+        if _is_root_profile(name):
+            raise ValueError("Cannot delete the default profile.")
         try:
-            switch_profile('default')
-        except RuntimeError:
-            raise RuntimeError(
-                f"Cannot delete active profile '{name}' while an agent is running. "
-                "Cancel or wait for it to finish."
+            captured_identity = profile_home_identity(profile_dir)
+            current_generation = ensure_profile_generation(profile_dir)
+        except FileNotFoundError:
+            raise ValueError(f"Profile '{name}' does not exist.") from None
+
+        expected = str(expected_generation or "").strip()
+        if require_generation and not expected:
+            raise ProfileGenerationMismatch(
+                "Profile generation is required; reload and retry"
+            )
+        if expected and expected != current_generation:
+            raise ProfileGenerationMismatch(
+                "Profile generation changed; reload and retry"
+            )
+        if (
+            profile_home_identity(profile_dir) != captured_identity
+            or read_profile_generation(profile_dir) != current_generation
+        ):
+            raise ProfileGenerationMismatch(
+                "Profile generation changed; reload and retry"
             )
 
-    try:
-        from hermes_cli.profiles import delete_profile
-        delete_profile(name, yes=True)
-    except ImportError:
-        # Manual fallback: just remove the directory
-        import shutil
-        profile_dir = _resolve_named_profile_home(name)
-        if profile_dir.is_dir():
-            shutil.rmtree(str(profile_dir))
-        else:
-            raise ValueError(f"Profile '{name}' does not exist.")
+        # Only the verified incarnation may cause an active-profile switch.
+        if _active_profile == name:
+            try:
+                switch_profile('default')
+            except RuntimeError:
+                raise RuntimeError(
+                    f"Cannot delete active profile '{name}' while an agent is running. "
+                    "Cancel or wait for it to finish."
+                ) from None
+
+        previous_ui_descriptions = pop_profile_descriptions(profile_key)
+        try:
+            try:
+                from hermes_cli.profiles import delete_profile
+                delete_profile(name, yes=True)
+            except ImportError:
+                # Manual fallback: just remove the directory
+                import shutil
+                if profile_dir.is_dir():
+                    shutil.rmtree(str(profile_dir))
+                else:
+                    raise ValueError(f"Profile '{name}' does not exist.") from None
+        except Exception as delete_exc:
+            if profile_dir.exists() and previous_ui_descriptions:
+                try:
+                    restore_profile_descriptions(profile_key, previous_ui_descriptions)
+                except Exception as restore_exc:
+                    raise RuntimeError(
+                        "Profile deletion failed and its Skill UI descriptions "
+                        "could not be restored"
+                    ) from restore_exc
+            raise delete_exc
 
     # Drop cached root-profile-name lookup — list_profiles_api() shape changed.
     _SKILLS_STATS_CACHE.clear()

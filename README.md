@@ -302,7 +302,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 ### Panels
 - **Chat** -- session list, search, pin, archive, projects, new conversation
 - **Tasks** -- view, create, edit, run, pause/resume, delete cron jobs; run history; completion alerts
-- **Skills** -- list all skills by category, search, preview, create/edit/delete; linked files viewer
+- **Skills** -- list all skills by category, search, preview, create/edit/delete; linked files viewer; optional human-facing localized explanations stored as profile-scoped WebUI metadata (not in `SKILL.md` and not returned by the ordinary runtime skill APIs)
 - **Memory** -- view and edit built-in memory files inline; when an external provider such as Hy-Memory is active, view its health/configuration plus a read-only recent-memory list and semantic search results
 - **Profiles** -- create, switch, delete agent profiles; clone config
 - **Todos** -- live task list from the current session

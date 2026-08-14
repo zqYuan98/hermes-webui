@@ -86,10 +86,12 @@ def test_profile_dropdown_closing_invalidates_inflight_refresh():
 
 def test_profiles_panel_refresh_updates_dropdown_cache():
     body = _function_body(PANELS_JS, "async function loadProfilesPanel() {")
-    api_idx = body.index("const data = await api('/api/profiles');")
-    cache_idx = body.index("_profileDropdownWriteStoredCache(data);")
+    api_idx = body.index("const data = await api('/api/profiles?include_generation=1');")
+    sanitize_idx = body.index("const dropdownData = {")
+    cache_idx = body.index("_profileDropdownWriteStoredCache(dropdownData);")
     render_idx = body.index("panel.innerHTML = '';")
-    assert api_idx < cache_idx < render_idx
+    assert api_idx < sanitize_idx < cache_idx < render_idx
+    assert "profile_generation" in body[sanitize_idx:cache_idx]
 
 
 def test_profile_dropdown_prefetches_after_page_load():

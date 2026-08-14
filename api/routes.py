@@ -28,10 +28,11 @@ import threading
 import time
 import uuid
 import http.client
+from dataclasses import dataclass
 import socket as _socket
 from collections import defaultdict, deque
 from pathlib import Path
-from contextlib import closing
+from contextlib import closing, contextmanager
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -692,12 +693,246 @@ def _active_skills_dir() -> Path:
             return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser() / "skills"
 
 
+def _active_skill_ui_profile_key() -> str:
+    """Return a stable sidecar key for the active profile's human-only UI data."""
+    try:
+        from api.profiles import get_active_hermes_home
+
+        return str(Path(get_active_hermes_home()).expanduser().resolve())
+    except Exception:
+        return str(_active_skills_dir().parent.expanduser().resolve())
+
+
+@dataclass(frozen=True)
+class _SkillProfileLocator:
+    """One request-scoped Profile path resolution, before lifecycle locking."""
+
+    profile_home: Path
+    skills_dir: Path
+    profile_key: str
+    named_profile: bool
+
+
+@dataclass(frozen=True)
+class _SkillProfileContext:
+    """One immutable Profile incarnation captured under its transaction lock."""
+
+    profile_home: Path
+    skills_dir: Path
+    config_path: Path
+    profile_key: str
+    named_profile: bool
+    generation: str
+    home_identity: tuple[int, int] | None
+
+
+def _skill_profile_locator() -> _SkillProfileLocator:
+    """Resolve the active Profile path exactly once, without touching generation."""
+    from api.profile_generation import is_named_profile_home
+
+    requested_skills_dir = Path(_active_skills_dir()).expanduser()
+    profile_home = requested_skills_dir.parent
+    try:
+        canonical_home = profile_home.resolve(strict=False)
+    except OSError:
+        canonical_home = profile_home.absolute()
+    return _SkillProfileLocator(
+        profile_home=canonical_home,
+        skills_dir=canonical_home / "skills",
+        profile_key=str(canonical_home),
+        named_profile=is_named_profile_home(canonical_home),
+    )
+
+
+def _skill_profile_context(locator: _SkillProfileLocator) -> _SkillProfileContext:
+    """Capture one Profile incarnation after the caller takes its path lock."""
+    from api.profile_generation import (
+        generation_for_profile_home,
+        profile_home_identity,
+    )
+
+    resolved = locator
+    home_identity: tuple[int, int] | None = None
+    if resolved.named_profile:
+        home_identity = profile_home_identity(resolved.profile_home)
+    generation = generation_for_profile_home(
+        resolved.profile_home, named=resolved.named_profile
+    )
+    if resolved.named_profile and profile_home_identity(resolved.profile_home) != home_identity:
+        from api.profile_generation import ProfileGenerationMismatch
+
+        raise ProfileGenerationMismatch(
+            "Active profile generation changed; reload and retry"
+        )
+    return _SkillProfileContext(
+        profile_home=resolved.profile_home,
+        skills_dir=resolved.skills_dir,
+        config_path=resolved.profile_home / "config.yaml",
+        profile_key=resolved.profile_key,
+        named_profile=resolved.named_profile,
+        generation=generation,
+        home_identity=home_identity,
+    )
+
+
+@contextmanager
+def _locked_skill_profile_context(
+    locator: _SkillProfileLocator | None = None,
+):
+    """Resolve once, lock by canonical path, then capture one immutable incarnation."""
+    from api.skill_ui_descriptions import skill_transaction
+
+    resolved = locator or _skill_profile_locator()
+    with skill_transaction(resolved.profile_key):
+        yield _skill_profile_context(resolved)
+
+
+def _assert_skill_profile_context_current(context: _SkillProfileContext) -> None:
+    """Recheck the captured incarnation without resolving the active Profile again."""
+    if not context.named_profile:
+        return
+    from api.profile_generation import (
+        ProfileGenerationMismatch,
+        profile_home_identity,
+        read_profile_generation,
+    )
+
+    try:
+        current_identity = profile_home_identity(context.profile_home)
+        current_generation = read_profile_generation(context.profile_home)
+    except (FileNotFoundError, OSError) as exc:
+        raise ProfileGenerationMismatch(
+            "Active profile generation changed; reload and retry"
+        ) from exc
+    if (
+        current_identity != context.home_identity
+        or current_generation != context.generation
+    ):
+        raise ProfileGenerationMismatch(
+            "Active profile generation changed; reload and retry"
+        )
+
+
+def _require_skill_profile_generation(
+    context: _SkillProfileContext, body: dict
+) -> None:
+    """Reject a stale or tokenless named-Profile mutation after taking its lock."""
+    from api.profile_generation import ProfileGenerationMismatch
+
+    expected = str(body.get("profile_generation") or "").strip()
+    if not context.named_profile:
+        # Keep tokenless legacy calls compatible for the stable default Profile,
+        # but never accept an explicit token captured from another incarnation.
+        if expected and expected != context.generation:
+            raise ProfileGenerationMismatch(
+                "Active profile generation changed; reload and retry"
+            )
+        return
+    if not expected or expected != context.generation:
+        raise ProfileGenerationMismatch(
+            "Active profile generation changed; reload and retry"
+        )
+    _assert_skill_profile_context_current(context)
+
+
+_SKILL_COMPONENT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_WINDOWS_RESERVED_COMPONENTS = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def _normalize_local_skill_component(value, *, field_name: str) -> str:
+    """Validate one local Skill/category filesystem component cross-platform."""
+    raw = str(value or "").strip().lower().replace(" ", "-")
+    if not _SKILL_COMPONENT_RE.fullmatch(raw):
+        raise ValueError(f"Invalid {field_name}")
+    if raw.split(".", 1)[0] in _WINDOWS_RESERVED_COMPONENTS:
+        raise ValueError(f"Invalid {field_name}")
+    return raw
+
+
+def _skill_frontmatter_name(content: str, fallback: str) -> str:
+    from tools.skills_tool import _parse_frontmatter
+
+    frontmatter, _body = _parse_frontmatter(str(content or ""))
+    name = str(frontmatter.get("name") or fallback).strip()
+    return name
+
+
+def _canonical_skill_name(skill_md: Path, fallback: str) -> str:
+    return _skill_frontmatter_name(
+        skill_md.read_text(encoding="utf-8")[:4000],
+        fallback,
+    )
+
+
+def _webui_query_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _add_skill_ui_descriptions(
+    skills: list[dict],
+    *,
+    profile_key: str | None = None,
+    profile_generation: str | None = None,
+) -> list[dict]:
+    """Attach reconciled WebUI-only descriptions to an existing Skill list."""
+    from api.skill_ui_descriptions import (
+        read_profile_description_states,
+        read_profile_descriptions,
+    )
+
+    key = profile_key if profile_key is not None else _active_skill_ui_profile_key()
+    if profile_generation is None:
+        descriptions = read_profile_descriptions(key, strict=True)
+        return [
+            {
+                **{k: v for k, v in skill.items() if k != "_ui_runtime_path"},
+                "ui_description": descriptions.get(str(skill.get("name") or ""), ""),
+            }
+            for skill in skills
+        ]
+
+    runtime_paths = {
+        str(skill.get("name") or ""): Path(skill["_ui_runtime_path"])
+        for skill in skills
+        if skill.get("name") and skill.get("_ui_runtime_path")
+    }
+    states = read_profile_description_states(
+        key,
+        runtime_paths,
+        profile_generation=profile_generation,
+        strict=True,
+    )
+    result = []
+    for skill in skills:
+        name = str(skill.get("name") or "")
+        state = states.get(name, {"ui_description": "", "stale": False})
+        item = {k: v for k, v in skill.items() if k != "_ui_runtime_path"}
+        item["ui_description"] = str(state.get("ui_description") or "")
+        if state.get("stale"):
+            item["ui_description_stale"] = True
+        result.append(item)
+    return result
+
+
 def _skill_path_within(base_dir: Path, candidate: Path) -> bool:
     try:
         candidate.resolve().relative_to(base_dir.resolve())
         return True
     except (OSError, ValueError):
         return False
+
+
+def _active_named_profile_missing(skills_dir: Path) -> bool:
+    """Return whether a named Profile disappeared before a Skill mutation."""
+    profile_home = skills_dir.parent
+    return profile_home.parent.name == "profiles" and not profile_home.is_dir()
 
 
 def _skill_category_from_path(
@@ -771,17 +1006,18 @@ def _worktree_retained_payload_for_session_id(sid: str) -> dict:
         return {}
 
 
-def _active_profile_config_path() -> Path:
-    """Return config.yaml for the request's active WebUI profile.
+def _active_profile_config_path(profile_home: Path | None = None) -> Path:
+    """Return config.yaml for one already-resolved WebUI Profile home.
 
-    Skills endpoints are profile-scoped UI actions: both the visible disabled
-    toggle state and toggle writes must follow the cookie/thread-local active
-    Hermes home, not process-global HERMES_HOME or HERMES_CONFIG_PATH values
-    captured at server startup.
+    Management requests pass ``profile_home`` from their immutable Profile
+    context so config writes cannot drift to a second active-Profile lookup.
+    The override branch preserves focused tests that replace ``_get_config_path``.
     """
     test_override_module = getattr(_get_config_path, "__module__", "")
     if test_override_module != "api.config":
         return _get_config_path()
+    if profile_home is not None:
+        return Path(profile_home) / "config.yaml"
     try:
         from api.profiles import get_active_hermes_home
 
@@ -790,16 +1026,20 @@ def _active_profile_config_path() -> Path:
         return _get_config_path()
 
 
-def _get_disabled_skill_names_for_profile() -> set:
-    """Read disabled skill names from the active profile's config.yaml.
+def _get_disabled_skill_names_for_profile(
+    profile_home: Path | None = None,
+) -> set:
+    """Read disabled Skill names from one explicitly resolved Profile home.
 
-    Unlike ``tools.skills_tool._get_disabled_skill_names`` which reads from
-    the process-global ``HERMES_HOME``, this uses ``_get_config_path()`` which
-    resolves against the WebUI's active profile.  Checks
-    ``skills.platform_disabled.webui`` first, falling back to
-    ``skills.disabled``.
+    ``profile_home`` is supplied by Profile-scoped management requests so the
+    config lookup cannot drift away from the transaction lock/sidecar identity.
+    Legacy callers may omit it and retain the request-active lookup.
     """
-    config_path = _active_profile_config_path()
+    config_path = (
+        Path(profile_home) / "config.yaml"
+        if profile_home is not None
+        else _active_profile_config_path()
+    )
     if not config_path.exists():
         return set()
     try:
@@ -827,7 +1067,13 @@ def _normalize_disabled_set(values) -> set:
     return {str(v).strip() for v in values if str(v).strip()}
 
 
-def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict:
+def _skills_list_from_dir(
+    skills_dir: Path,
+    category: str | None = None,
+    *,
+    profile_home: Path | None = None,
+    include_runtime_paths: bool = False,
+) -> dict:
     """List skills using an explicit local skills directory.
 
     This mirrors ``tools.skills_tool.skills_list`` closely, but keeps the local
@@ -844,6 +1090,13 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
     )
 
     if not skills_dir.exists():
+        if _active_named_profile_missing(skills_dir):
+            return {
+                "success": True,
+                "skills": [],
+                "categories": [],
+                "message": "No skills found because the active profile no longer exists.",
+            }
         skills_dir.mkdir(parents=True, exist_ok=True)
         return {
             "success": True,
@@ -854,7 +1107,7 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
 
     all_skills = []
     seen_names: set[str] = set()
-    disabled = _get_disabled_skill_names_for_profile()
+    disabled = _get_disabled_skill_names_for_profile(profile_home)
     search_dirs = _active_skill_search_dirs(skills_dir)
 
     for scan_dir in search_dirs:
@@ -880,16 +1133,17 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
                 if len(description) > MAX_DESCRIPTION_LENGTH:
                     description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
                 seen_names.add(name)
-                all_skills.append(
-                    {
-                        "name": name,
-                        "description": description,
-                        "category": _skill_category_from_path(
-                            skill_md, search_dirs, local_skills_dir=skills_dir
-                        ),
-                        "disabled": name in disabled,
-                    }
-                )
+                item = {
+                    "name": name,
+                    "description": description,
+                    "category": _skill_category_from_path(
+                        skill_md, search_dirs, local_skills_dir=skills_dir
+                    ),
+                    "disabled": name in disabled,
+                }
+                if include_runtime_paths:
+                    item["_ui_runtime_path"] = str(skill_md)
+                all_skills.append(item)
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
             except Exception as e:
@@ -914,14 +1168,67 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
     return result
 
 
-def _find_skill_in_dirs(name: str, skills_dirs: list[Path]) -> tuple[Path | None, Path | None]:
-    """Resolve a WebUI skill name inside explicit skills directories."""
+class _ResolvedSkill:
+    """Typed Skill resolution so destructive callers know the object shape."""
+
+    __slots__ = (
+        "collection_root",
+        "skill_dir",
+        "skill_md",
+        "object_kind",
+        "delete_target",
+        "canonical_fallback",
+    )
+
+    def __init__(
+        self,
+        *,
+        collection_root: Path,
+        skill_dir: Path,
+        skill_md: Path,
+        object_kind: str,
+        delete_target: Path,
+        canonical_fallback: str,
+    ):
+        self.collection_root = collection_root
+        self.skill_dir = skill_dir
+        self.skill_md = skill_md
+        self.object_kind = object_kind
+        self.delete_target = delete_target
+        self.canonical_fallback = canonical_fallback
+
+
+def _directory_skill_resolution(skills_dir: Path, skill_dir: Path) -> _ResolvedSkill:
+    skill_md = skill_dir / "SKILL.md"
+    return _ResolvedSkill(
+        collection_root=skills_dir,
+        skill_dir=skill_dir,
+        skill_md=skill_md,
+        object_kind="directory",
+        delete_target=skill_dir,
+        canonical_fallback=skill_dir.name,
+    )
+
+
+def _single_file_skill_resolution(skills_dir: Path, skill_md: Path) -> _ResolvedSkill:
+    return _ResolvedSkill(
+        collection_root=skills_dir,
+        skill_dir=skill_md.parent,
+        skill_md=skill_md,
+        object_kind="single_file",
+        delete_target=skill_md,
+        canonical_fallback=skill_md.stem,
+    )
+
+
+def _resolve_skill_in_dirs(name: str, skills_dirs: list[Path]) -> _ResolvedSkill | None:
+    """Resolve a WebUI Skill and retain its directory-vs-single-file shape."""
     from agent.skill_utils import iter_skill_index_files
     from tools.skills_tool import _EXCLUDED_SKILL_DIRS, _parse_frontmatter
 
     raw_name = str(name or "").strip().strip("/")
     if not raw_name:
-        return None, None
+        return None
 
     candidate_names = [raw_name]
     if ":" in raw_name:
@@ -937,21 +1244,21 @@ def _find_skill_in_dirs(name: str, skills_dirs: list[Path]) -> tuple[Path | None
             if not _skill_path_within(skills_dir, direct_path):
                 continue
             if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
-                return direct_path, direct_path / "SKILL.md"
+                return _directory_skill_resolution(skills_dir, direct_path)
             legacy_md = direct_path.with_suffix(".md")
             if legacy_md.exists() and _skill_path_within(skills_dir, legacy_md):
-                return legacy_md.parent, legacy_md
+                return _single_file_skill_resolution(skills_dir, legacy_md)
 
         for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
             skill_dir = skill_md.parent
             if skill_dir.name == raw_name:
-                return skill_dir, skill_md
+                return _directory_skill_resolution(skills_dir, skill_dir)
             try:
                 frontmatter, _ = _parse_frontmatter(skill_md.read_text(encoding="utf-8")[:4000])
                 if frontmatter.get("name") == raw_name:
-                    return skill_dir, skill_md
+                    return _directory_skill_resolution(skills_dir, skill_dir)
             except Exception:
                 continue
 
@@ -959,8 +1266,16 @@ def _find_skill_in_dirs(name: str, skills_dirs: list[Path]) -> tuple[Path | None
             if legacy_md.name == "SKILL.md":
                 continue
             if legacy_md.stem == raw_name and _skill_path_within(skills_dir, legacy_md):
-                return legacy_md.parent, legacy_md
-    return None, None
+                return _single_file_skill_resolution(skills_dir, legacy_md)
+    return None
+
+
+def _find_skill_in_dirs(name: str, skills_dirs: list[Path]) -> tuple[Path | None, Path | None]:
+    """Compatibility wrapper returning the historical ``(dir, index)`` pair."""
+    resolved = _resolve_skill_in_dirs(name, skills_dirs)
+    if resolved is None:
+        return None, None
+    return resolved.skill_dir, resolved.skill_md
 
 
 def _find_skill_in_dir(name: str, skills_dir: Path) -> tuple[Path | None, Path | None]:
@@ -1051,8 +1366,8 @@ def _skill_view_from_active_dir(name: str) -> dict:
 
     skills_dir = _active_skills_dir()
     search_dirs = _active_skill_search_dirs(skills_dir)
-    skill_dir, skill_md = _find_skill_in_dirs(name, search_dirs)
-    if not skill_md:
+    resolved_skill = _resolve_skill_in_dirs(name, search_dirs)
+    if resolved_skill is None:
         # Preserve plugin-qualified skill viewing without falling back to the
         # startup/root profile's local skills tree for ordinary missing skills.
         if ":" in str(name or ""):
@@ -1070,7 +1385,12 @@ def _skill_view_from_active_dir(name: str) -> dict:
             except Exception:
                 pass
         return _skill_not_found_payload(name, skills_dir)
-    return _skill_view_from_file(skill_dir, skill_md)
+    skill_dir = (
+        resolved_skill.skill_dir
+        if resolved_skill.object_kind == "directory"
+        else None
+    )
+    return _skill_view_from_file(skill_dir, resolved_skill.skill_md)
 
 # ── SSE app-level heartbeat (#1623) ────────────────────────────────────────
 #
@@ -2881,6 +3201,14 @@ from api.config import (
     _parse_provider_qualified_model_id,
 )
 from api import config as api_config
+from api.run_admission import (
+    RunAdmissionRejected,
+    publish_admitted_stream,
+    register_admitted_run,
+    rollback_admitted_stream,
+    run_admission_transaction,
+    runtime_admission_snapshot,
+)
 from api.helpers import (
     require,
     bad,
@@ -11792,18 +12120,29 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
 
 def _handle_health(handler, parsed):
     deep = parse_qs(parsed.query or "").get("deep", [""])[0].lower() in {"1", "true", "yes", "on"}
+    admission_snapshot = runtime_admission_snapshot()
     stream_check = _streams_lock_health()
     run_check = _run_lifecycle_health()
     payload = {
-        "status": "ok" if stream_check.get("status") == "ok" else "degraded",
+        "status": (
+            "ok"
+            if stream_check.get("status") == "ok"
+            and admission_snapshot.get("drain_state_valid") is not False
+            else "degraded"
+        ),
         "sessions": len(SESSIONS),
-        "active_streams": int(stream_check.get("active_streams") or 0),
-        "active_runs": int(run_check.get("active_runs") or 0),
+        "active_streams": int(admission_snapshot.get("active_streams") or 0),
+        "active_runs": int(admission_snapshot.get("active_runs") or 0),
         "runs": run_check.get("runs", []),
         "last_run_finished_at": run_check.get("last_run_finished_at"),
         "server_started_at": SERVER_START_TIME,
         "uptime_seconds": round(time.time() - SERVER_START_TIME, 1),
         "accept_loop": _accept_loop_health(handler),
+        "draining": bool(admission_snapshot.get("draining")),
+        "drain_state_valid": bool(admission_snapshot.get("drain_state_valid")),
+        "drain_attempt_id": admission_snapshot.get("drain_attempt_id"),
+        "drain_candidate_id": admission_snapshot.get("drain_candidate_id"),
+        "in_process_shutdown": bool(admission_snapshot.get("in_process_shutdown")),
     }
     if "oldest_run_age_seconds" in run_check:
         payload["oldest_run_age_seconds"] = run_check["oldest_run_age_seconds"]
@@ -13799,8 +14138,42 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/skills":
         qs = parse_qs(parsed.query)
         category = qs.get("category", [None])[0]
+        include_ui = _webui_query_truthy(qs.get("include_ui", [None])[0])
+        if include_ui:
+            from api.profile_generation import ProfileGenerationError
+            try:
+                with _locked_skill_profile_context() as context:
+                    _assert_skill_profile_context_current(context)
+                    data = _skills_list_from_dir(
+                        context.skills_dir,
+                        category=category,
+                        profile_home=context.profile_home,
+                        include_runtime_paths=True,
+                    )
+                    skills = _add_skill_ui_descriptions(
+                        data.get("skills", []),
+                        profile_key=context.profile_key,
+                        profile_generation=context.generation,
+                    )
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+                ProfileGenerationError,
+            ) as exc:
+                logger.warning("Could not read Skill UI descriptions: %s", exc)
+                return bad(handler, "Could not read Skill UI descriptions", 500)
+            return j(
+                handler,
+                {
+                    "skills": skills,
+                    "profile_generation": context.generation,
+                },
+            )
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
-        return j(handler, {"skills": data.get("skills", [])})
+        skills = data.get("skills", [])
+        return j(handler, {"skills": skills})
 
     if parsed.path == "/api/skills/usage":
         from api.skill_usage import read_skill_usage
@@ -13867,9 +14240,61 @@ def handle_get(handler, parsed) -> bool:
                 handler,
                 {"content": target.read_text(encoding="utf-8"), "path": file_path},
             )
-        data = _skill_view_from_active_dir(name)
-        if not isinstance(data.get("linked_files"), dict):
-            data["linked_files"] = {}
+        include_ui = _webui_query_truthy(qs.get("include_ui", [None])[0])
+        if include_ui:
+            from api.profile_generation import ProfileGenerationError
+            from api.skill_ui_descriptions import get_ui_description_state
+
+            try:
+                with _locked_skill_profile_context() as context:
+                    _assert_skill_profile_context_current(context)
+                    resolved_skill = _resolve_skill_in_dirs(
+                        name,
+                        _active_skill_search_dirs(context.skills_dir),
+                    )
+                    if resolved_skill is None:
+                        data = _skill_not_found_payload(name, context.skills_dir)
+                    else:
+                        skill_dir = (
+                            resolved_skill.skill_dir
+                            if resolved_skill.object_kind == "directory"
+                            else None
+                        )
+                        data = _skill_view_from_file(
+                            skill_dir, resolved_skill.skill_md
+                        )
+                    if not isinstance(data.get("linked_files"), dict):
+                        data["linked_files"] = {}
+                    canonical_name = str(data.get("name") or name)
+                    if resolved_skill is None:
+                        ui_state = {"ui_description": "", "stale": False}
+                    else:
+                        ui_state = get_ui_description_state(
+                            context.profile_key,
+                            canonical_name,
+                            profile_generation=context.generation,
+                            runtime_path=resolved_skill.skill_md,
+                            strict=True,
+                        )
+                    data["ui_description"] = str(
+                        ui_state.get("ui_description") or ""
+                    )
+                    if ui_state.get("stale"):
+                        data["ui_description_stale"] = True
+                    data["profile_generation"] = context.generation
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+                ProfileGenerationError,
+            ) as exc:
+                logger.warning("Could not read Skill UI description: %s", exc)
+                return bad(handler, "Could not read Skill UI description", 500)
+        else:
+            data = _skill_view_from_active_dir(name)
+            if not isinstance(data.get("linked_files"), dict):
+                data["linked_files"] = {}
         return j(handler, data)
 
     # ── Memory API (GET) ──
@@ -13881,10 +14306,19 @@ def handle_get(handler, parsed) -> bool:
     # ── Profile API (GET) ──
     if parsed.path == "/api/profiles":
         from api import profiles as profiles_api
+
+        qs = parse_qs(parsed.query)
+        include_generation = _webui_query_truthy(
+            qs.get("include_generation", [None])[0]
+        )
         diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
             diag.stage("list_profiles_api") if diag else None
-            profiles_payload = profiles_api.list_profiles_api()
+            profiles_payload = (
+                profiles_api.list_profiles_api(include_generation=True)
+                if include_generation
+                else profiles_api.list_profiles_api()
+            )
             diag.stage("active_profile_lookup") if diag else None
             active = profiles_api.get_active_profile_name()
             diag.stage("isolated_mode_check") if diag else None
@@ -13896,6 +14330,11 @@ def handle_get(handler, parsed) -> bool:
                     "single_profile_mode": _is_isolated_profile_mode(),
                 },
             )
+        except (OSError, RuntimeError, ValueError) as exc:
+            if include_generation:
+                logger.warning("Could not read Profile generations: %s", exc)
+                return bad(handler, "Could not read Profile generations", 500)
+            raise
         finally:
             if diag:
                 diag.finish()
@@ -15843,6 +16282,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/skills/toggle":
         return _handle_skill_toggle(handler, body)
 
+    if parsed.path == "/api/skills/ui-description":
+        return _handle_skill_ui_description_save(handler, body)
+
     # ── Memory (POST) ──
     if parsed.path == "/api/memory/write":
         return _handle_memory_write(handler, body)
@@ -15942,17 +16384,27 @@ def handle_post(handler, parsed) -> bool:
         if not name:
             return bad(handler, "name is required")
         try:
+            from api.profile_generation import ProfileGenerationMismatch
             from api.profiles import delete_profile_api, _validate_profile_name
 
             _validate_profile_name(name)
-            result = delete_profile_api(name)
+            result = delete_profile_api(
+                name,
+                expected_generation=body.get("profile_generation"),
+                require_generation=True,
+            )
             return j(handler, result)
         except PermissionError as e:
             return bad(handler, _sanitize_error(e), 403)
+        except ProfileGenerationMismatch as e:
+            return bad(handler, str(e), 409)
         except (ValueError, FileNotFoundError) as e:
             return bad(handler, _sanitize_error(e))
         except RuntimeError as e:
             return bad(handler, str(e), 409)
+        except OSError as e:
+            logger.warning("Profile delete failed: %s", e)
+            return bad(handler, "Could not delete profile", 500)
 
     # ── Settings (POST) ──
     if parsed.path == "/api/settings":
@@ -21719,6 +22171,14 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
 
 
 def _handle_btw(handler, body):
+    try:
+        with run_admission_transaction():
+            return _handle_btw_admitted(handler, body)
+    except RunAdmissionRejected as exc:
+        return j(handler, exc.payload, status=503)
+
+
+def _handle_btw_admitted(handler, body):
     """POST /api/btw — ephemeral side question using session context.
 
     Creates a temporary hidden session, streams the answer via SSE, then
@@ -21766,9 +22226,15 @@ def _handle_btw(handler, body):
     register_session_writeback_owner(ephemeral.session_id, stream_id)
     ephemeral.save()
     stream = create_stream_channel()
-    register_stream_owner(stream_id, ephemeral.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
+    publish_admitted_stream(
+        stream_id,
+        stream,
+        session_id=ephemeral.session_id,
+        workspace=str(s.workspace),
+        model=s.model,
+        provider=model_provider,
+        ephemeral=True,
+    )
     from api.background import track_btw
     track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
     thr = threading.Thread(
@@ -21777,11 +22243,23 @@ def _handle_btw(handler, body):
         kwargs={"ephemeral": True, "model_provider": model_provider},
         daemon=True,
     )
-    thr.start()
+    try:
+        thr.start()
+    except Exception:
+        rollback_admitted_stream(stream_id)
+        raise
     return j(handler, {"stream_id": stream_id, "session_id": ephemeral.session_id, "parent_session_id": body["session_id"]})
 
 
 def _handle_background(handler, body):
+    try:
+        with run_admission_transaction():
+            return _handle_background_admitted(handler, body)
+    except RunAdmissionRejected as exc:
+        return j(handler, exc.payload, status=503)
+
+
+def _handle_background_admitted(handler, body):
     """POST /api/background — run prompt in parallel background agent.
 
     Creates a hidden session, starts streaming in a daemon thread.
@@ -21817,9 +22295,16 @@ def _handle_background(handler, body):
     register_session_writeback_owner(bg.session_id, stream_id)
     bg.save()
     stream = create_stream_channel()
-    register_stream_owner(stream_id, bg.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
+    publish_admitted_stream(
+        stream_id,
+        stream,
+        session_id=bg.session_id,
+        workspace=str(s.workspace),
+        model=s.model,
+        provider=model_provider,
+        ephemeral=False,
+        background=True,
+    )
     task_id = uuid.uuid4().hex[:8]
     from api.background import track_background, complete_background
     parent_sid = body["session_id"]
@@ -21873,7 +22358,11 @@ def _handle_background(handler, body):
                 pass
 
     thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
-    thr.start()
+    try:
+        thr.start()
+    except Exception:
+        rollback_admitted_stream(stream_id)
+        raise
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
 
@@ -22155,7 +22644,42 @@ def _start_chat_stream_for_session(
     moa_config=None,
     external_runtime_owned: bool | None = None,
 ):
-    """Persist pending state, register an SSE channel, and start an agent turn."""
+    try:
+        with run_admission_transaction():
+            return _start_chat_stream_for_session_admitted(
+                s,
+                msg=msg,
+                attachments=attachments,
+                workspace=workspace,
+                model=model,
+                model_provider=model_provider,
+                normalized_model=normalized_model,
+                diag=diag,
+                goal_related=goal_related,
+                source=source,
+                moa_config=moa_config,
+                external_runtime_owned=external_runtime_owned,
+            )
+    except RunAdmissionRejected as exc:
+        return {**exc.payload, "_status": 503}
+
+
+def _start_chat_stream_for_session_admitted(
+    s,
+    *,
+    msg: str,
+    attachments=None,
+    workspace: str,
+    model: str,
+    model_provider=None,
+    normalized_model: bool = False,
+    diag=None,
+    goal_related: bool = False,
+    source: str = "webui",
+    moa_config=None,
+    external_runtime_owned: bool | None = None,
+):
+    """Persist pending state, register an SSE channel, and start an admitted turn."""
     if external_runtime_owned is None:
         external_runtime_owned = webui_gateway_chat_enabled(get_config())
     backend_is_gateway = bool(external_runtime_owned)
@@ -22276,9 +22800,15 @@ def _start_chat_stream_for_session(
     set_last_workspace(workspace)
     diag.stage("stream_registration") if diag else None
     stream = create_stream_channel()
-    register_stream_owner(stream_id, s.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
+    publish_admitted_stream(
+        stream_id,
+        stream,
+        session_id=s.session_id,
+        workspace=str(workspace),
+        model=model,
+        provider=model_provider,
+        backend="gateway" if backend_is_gateway else "local",
+    )
     # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
     if goal_related:
         STREAM_GOAL_RELATED[stream_id] = True
@@ -22299,6 +22829,7 @@ def _start_chat_stream_for_session(
     try:
         thr.start()
     except Exception:
+        rollback_admitted_stream(stream_id)
         if backend_is_gateway:
             try:
                 from api.gateway_chat import _finish_gateway_run_starting
@@ -22389,7 +22920,42 @@ def _start_run(
     moa_config=None,
     gateway_chat_enabled: bool | None = None,
 ):
-    """Shared start-run helper for /api/chat/start and start_session_turn.
+    try:
+        with run_admission_transaction():
+            return _start_run_admitted(
+                s,
+                msg=msg,
+                attachments=attachments,
+                workspace=workspace,
+                model=model,
+                model_provider=model_provider,
+                normalized_model=normalized_model,
+                source=source,
+                route=route,
+                diag=diag,
+                moa_config=moa_config,
+                gateway_chat_enabled=gateway_chat_enabled,
+            )
+    except RunAdmissionRejected as exc:
+        return {**exc.payload, "_status": 503}
+
+
+def _start_run_admitted(
+    s,
+    *,
+    msg: str,
+    attachments,
+    workspace: str,
+    model,
+    model_provider,
+    normalized_model,
+    source: str,
+    route: str,
+    diag=None,
+    moa_config=None,
+    gateway_chat_enabled: bool | None = None,
+):
+    """Shared admitted start-run helper for browser and server-side turns.
 
     Centralizes the runtime-adapter selection block (Q-2979-A2 / Copilot
     discussion_r3305864087/r3305864173) so both entrypoints honor
@@ -22530,7 +23096,24 @@ def start_session_turn(
     *,
     source: str = "process_wakeup",
 ):
-    """Start a server-side agent turn for ``session_id`` with ``message``.
+    try:
+        with run_admission_transaction():
+            return _start_session_turn_admitted(
+                session_id,
+                message,
+                source=source,
+            )
+    except RunAdmissionRejected as exc:
+        return {**exc.payload, "_status": 503}
+
+
+def _start_session_turn_admitted(
+    session_id: str,
+    message: str,
+    *,
+    source: str = "process_wakeup",
+):
+    """Start an admitted server-side agent turn for ``session_id``.
 
     Option Z primary wakeup entrypoint. This is the minimal, HTTP-handler-free
     core that ``/api/chat/start`` already reaches via ``_handle_chat_start`` →
@@ -23386,6 +23969,24 @@ def _normalize_chat_attachments(raw_attachments):
 
 
 def _handle_chat_sync(handler, body):
+    sync_run_id = f"sync-{uuid.uuid4().hex}"
+    session_id = str(body.get("session_id") or "").strip()
+    try:
+        register_admitted_run(
+            sync_run_id,
+            session_id=session_id,
+            phase="sync-running",
+            backend="local-sync",
+        )
+    except RunAdmissionRejected as exc:
+        return j(handler, exc.payload, status=503)
+    try:
+        return _handle_chat_sync_admitted(handler, body)
+    finally:
+        api_config.unregister_active_run(sync_run_id)
+
+
+def _handle_chat_sync_admitted(handler, body):
     """Fallback synchronous chat endpoint (POST /api/chat). Not used by frontend."""
     stale_response = _agent_runtime_barrier_response(runner_local_owned=False)
     if stale_response is not None:
@@ -26629,30 +27230,255 @@ def _handle_skill_save(handler, body):
         require(body, "name", "content")
     except ValueError as e:
         return bad(handler, str(e))
-    skill_name = body["name"].strip().lower().replace(" ", "-")
-    if not skill_name or "/" in skill_name or ".." in skill_name:
-        return bad(handler, "Invalid skill name")
-    category = body.get("category", "").strip()
-    if category and ("/" in category or ".." in category):
-        return bad(handler, "Invalid category")
-    skills_dir = _active_skills_dir()
-
-    if category:
-        skill_dir = skills_dir / category / skill_name
-    else:
-        skill_dir = skills_dir / skill_name
-    # Validate resolved path stays within the active profile skills dir.
+    raw_skill_name = str(body["name"] or "")
     try:
-        skill_dir.resolve().relative_to(skills_dir.resolve())
-    except ValueError:
-        return bad(handler, "Invalid skill path")
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    skill_file = skill_dir / "SKILL.md"
-    if skill_file.is_symlink():
-        return bad(handler, "Cannot save to a symlinked skill file")
-    skill_file.write_text(body["content"], encoding="utf-8")
+        skill_name = _normalize_local_skill_component(
+            raw_skill_name, field_name="skill name"
+        )
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    if raw_skill_name != skill_name:
+        return bad(handler, "Skill name must use its canonical form")
+    raw_category = body.get("category", "").strip()
+    try:
+        category = (
+            _normalize_local_skill_component(raw_category, field_name="category")
+            if raw_category
+            else ""
+        )
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    has_ui_description = "ui_description" in body
+    ui_description = body.get("ui_description", "")
+    if has_ui_description and not isinstance(ui_description, str):
+        return bad(handler, "ui_description must be a string")
+    if has_ui_description:
+        from api.skill_ui_descriptions import MAX_UI_DESCRIPTION_CHARS
+
+        if len(ui_description.strip()) > MAX_UI_DESCRIPTION_CHARS:
+            return bad(
+                handler,
+                f"UI description must be {MAX_UI_DESCRIPTION_CHARS} characters or fewer",
+            )
+    try:
+        raw_content_skill_name = _skill_frontmatter_name(body["content"], skill_name)
+        content_skill_name = _normalize_local_skill_component(
+            raw_content_skill_name,
+            field_name="skill name",
+        )
+    except (TypeError, ValueError) as exc:
+        return bad(handler, str(exc))
+    if raw_content_skill_name != content_skill_name:
+        return bad(handler, "Skill frontmatter name must use its canonical form")
+    if content_skill_name != skill_name:
+        return bad(handler, "Skill frontmatter name must match the skill name")
+
+    from api.paths import _atomic_write_text
+    from api.profile_generation import (
+        ProfileGenerationError,
+        ProfileGenerationMismatch,
+    )
+    from api.skill_ui_descriptions import (
+        bind_ui_description_to_runtime,
+        prepare_ui_description_for_runtime_change,
+        set_ui_description,
+        skill_transaction,
+    )
+
+    locator = _skill_profile_locator()
+    skills_dir = locator.skills_dir
+    profile_key = locator.profile_key
+    with skill_transaction(profile_key):
+        if _active_named_profile_missing(skills_dir):
+            return bad(handler, "Active profile no longer exists", 409)
+        try:
+            context = _skill_profile_context(locator)
+            _require_skill_profile_generation(context, body)
+        except FileNotFoundError:
+            return bad(handler, "Active profile no longer exists", 409)
+        except ProfileGenerationMismatch as exc:
+            return bad(handler, str(exc), 409)
+        except (OSError, ProfileGenerationError) as exc:
+            logger.warning("Could not verify active Profile generation: %s", exc)
+            return bad(handler, "Could not verify active profile", 500)
+
+        existing_skill = _resolve_skill_in_dirs(skill_name, [skills_dir])
+        if existing_skill is not None:
+            try:
+                existing_name = _normalize_local_skill_component(
+                    _canonical_skill_name(
+                        existing_skill.skill_md,
+                        existing_skill.canonical_fallback,
+                    ),
+                    field_name="skill name",
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                return bad(handler, str(exc))
+            if existing_name != skill_name:
+                return bad(handler, "Skill path belongs to a different skill", 409)
+            skill_dir = existing_skill.skill_dir
+            skill_file = existing_skill.skill_md
+        else:
+            skill_dir = (
+                skills_dir / category / skill_name
+                if category
+                else skills_dir / skill_name
+            )
+            skill_file = skill_dir / "SKILL.md"
+
+        if not _skill_path_within(skills_dir, skill_dir):
+            return bad(handler, "Invalid skill path")
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        if skill_file.is_symlink():
+            return bad(handler, "Cannot save to a symlinked skill file")
+
+        existed_before = skill_file.exists()
+        previous_content = (
+            skill_file.read_text(encoding="utf-8") if existed_before else None
+        )
+        previous_ui_description = prepare_ui_description_for_runtime_change(
+            profile_key,
+            skill_name,
+            profile_generation=context.generation,
+            runtime_path=skill_file if existed_before else None,
+        )
+        _atomic_write_text(
+            skill_file,
+            body["content"],
+            encoding="utf-8",
+            require_atomic_replace=True,
+        )
+        description_to_publish = (
+            ui_description if has_ui_description else previous_ui_description
+        )
+        should_publish_description = has_ui_description or bool(
+            previous_ui_description
+        )
+        if should_publish_description:
+            try:
+                with bind_ui_description_to_runtime(
+                    context.generation, skill_file
+                ):
+                    rebound_ui_description = set_ui_description(
+                        profile_key, skill_name, description_to_publish
+                    )
+                saved_ui_description = (
+                    rebound_ui_description if has_ui_description else None
+                )
+            except Exception as exc:
+                rolled_back = True
+                try:
+                    if existed_before:
+                        _atomic_write_text(
+                            skill_file,
+                            previous_content or "",
+                            encoding="utf-8",
+                            require_atomic_replace=True,
+                        )
+                        if previous_ui_description:
+                            with bind_ui_description_to_runtime(
+                                context.generation, skill_file
+                            ):
+                                set_ui_description(
+                                    profile_key,
+                                    skill_name,
+                                    previous_ui_description,
+                                )
+                    else:
+                        skill_file.unlink(missing_ok=True)
+                        try:
+                            skill_dir.rmdir()
+                        except OSError:
+                            pass
+                except Exception:
+                    rolled_back = False
+                    logger.exception(
+                        "Could not roll back SKILL.md after UI description save failed"
+                    )
+                logger.warning("Failed to persist skill UI description: %s", exc)
+                if rolled_back:
+                    return bad(
+                        handler,
+                        "Could not save skill UI description; SKILL.md was rolled back",
+                        500,
+                    )
+                return bad(
+                    handler,
+                    "Could not save skill UI description and SKILL.md rollback failed",
+                    500,
+                )
+        else:
+            saved_ui_description = None
+
     _SKILLS_STATS_CACHE.clear()
-    return j(handler, {"ok": True, "name": skill_name, "path": str(skill_file)})
+    response = {"ok": True, "name": skill_name, "path": str(skill_file)}
+    if has_ui_description:
+        response["ui_description"] = saved_ui_description
+    return j(handler, response)
+
+
+def _handle_skill_ui_description_save(handler, body):
+    try:
+        require(body, "name")
+    except ValueError as e:
+        return bad(handler, str(e))
+    if "ui_description" not in body:
+        return bad(handler, "Missing required field(s): ui_description")
+
+    requested_name = str(body["name"] or "").strip()
+    if not requested_name or any(ch in requested_name for ch in ("/", "\\", "\0")):
+        return bad(handler, "Invalid skill name")
+    ui_description = body["ui_description"]
+    if not isinstance(ui_description, str):
+        return bad(handler, "ui_description must be a string")
+
+    from api.profile_generation import (
+        ProfileGenerationError,
+        ProfileGenerationMismatch,
+    )
+    from api.skill_ui_descriptions import (
+        bind_ui_description_to_runtime,
+        set_ui_description,
+        skill_transaction,
+    )
+
+    locator = _skill_profile_locator()
+    skills_dir = locator.skills_dir
+    profile_key = locator.profile_key
+    try:
+        with skill_transaction(profile_key):
+            if _active_named_profile_missing(skills_dir):
+                return bad(handler, "Active profile no longer exists", 409)
+            context = _skill_profile_context(locator)
+            _require_skill_profile_generation(context, body)
+            resolved_skill = _resolve_skill_in_dirs(
+                requested_name, _active_skill_search_dirs(skills_dir)
+            )
+            if resolved_skill is None:
+                return bad(handler, f"Skill '{requested_name}' not found", 404)
+            canonical_name = _canonical_skill_name(
+                resolved_skill.skill_md,
+                resolved_skill.canonical_fallback,
+            )
+            with bind_ui_description_to_runtime(
+                context.generation, resolved_skill.skill_md
+            ):
+                saved = set_ui_description(
+                    profile_key, canonical_name, ui_description
+                )
+    except FileNotFoundError:
+        return bad(handler, "Active profile no longer exists", 409)
+    except ProfileGenerationMismatch as exc:
+        return bad(handler, str(exc), 409)
+    except ValueError as exc:
+        return bad(handler, str(exc))
+    except (OSError, ProfileGenerationError) as exc:
+        logger.warning("Failed to persist skill UI description: %s", exc)
+        return bad(handler, "Could not save skill UI description", 500)
+    return j(
+        handler,
+        {"ok": True, "name": canonical_name, "ui_description": saved},
+    )
 
 
 def _handle_skill_delete(handler, body):
@@ -26662,17 +27488,87 @@ def _handle_skill_delete(handler, body):
         return bad(handler, str(e))
     import shutil
 
-    skill_name = str(body["name"]).strip().lower().replace(" ", "-")
-    if not skill_name or "/" in skill_name or ".." in skill_name:
+    requested_name = str(body["name"] or "").strip()
+    if not requested_name or any(ch in requested_name for ch in ("/", "\\", "\0")):
         return bad(handler, "Invalid skill name")
-    skills_dir = _active_skills_dir()
-    matches = [p for p in skills_dir.rglob("SKILL.md") if p.parent.name == skill_name]
-    if not matches:
-        return bad(handler, "Skill not found", 404)
-    skill_dir = matches[0].parent
-    shutil.rmtree(str(skill_dir))
+    from api.profile_generation import (
+        ProfileGenerationError,
+        ProfileGenerationMismatch,
+    )
+    from api.skill_ui_descriptions import (
+        pop_ui_description,
+        restore_ui_description,
+        skill_transaction,
+    )
+
+    locator = _skill_profile_locator()
+    skills_dir = locator.skills_dir
+    profile_key = locator.profile_key
+    with skill_transaction(profile_key):
+        if _active_named_profile_missing(skills_dir):
+            return bad(handler, "Active profile no longer exists", 409)
+        try:
+            context = _skill_profile_context(locator)
+            _require_skill_profile_generation(context, body)
+        except FileNotFoundError:
+            return bad(handler, "Active profile no longer exists", 409)
+        except ProfileGenerationMismatch as exc:
+            return bad(handler, str(exc), 409)
+        except (OSError, ProfileGenerationError) as exc:
+            logger.warning("Could not verify active Profile generation: %s", exc)
+            return bad(handler, "Could not verify active profile", 500)
+        resolved_skill = _resolve_skill_in_dirs(requested_name, [skills_dir])
+        if resolved_skill is None:
+            return bad(handler, "Skill not found", 404)
+        skill_dir = resolved_skill.skill_dir
+        skill_md = resolved_skill.skill_md
+        canonical_name = _canonical_skill_name(
+            skill_md, resolved_skill.canonical_fallback
+        )
+        try:
+            previous_ui_description = pop_ui_description(
+                profile_key, canonical_name
+            )
+        except Exception as exc:
+            logger.warning("Could not prune skill UI description before delete: %s", exc)
+            return bad(
+                handler,
+                "Could not remove skill UI description; skill was not deleted",
+                500,
+            )
+
+        try:
+            delete_target = resolved_skill.delete_target
+            collection_root = resolved_skill.collection_root
+            if not _skill_path_within(collection_root, delete_target):
+                raise ValueError("Skill delete target escaped the skills root")
+            if resolved_skill.object_kind == "single_file":
+                # Delete only the exact legacy file; its parent can be the
+                # collection root or a directory containing unrelated siblings.
+                delete_target.unlink()
+            elif resolved_skill.object_kind == "directory":
+                if delete_target.resolve(strict=False) == collection_root.resolve(
+                    strict=False
+                ):
+                    raise ValueError("Refusing to delete the skills root")
+                shutil.rmtree(str(delete_target))
+            else:
+                raise ValueError("Unknown Skill object type")
+        except Exception as exc:
+            if previous_ui_description:
+                try:
+                    restore_ui_description(
+                        profile_key, canonical_name, previous_ui_description
+                    )
+                except Exception:
+                    logger.exception(
+                        "Skill delete failed and its UI description could not be restored"
+                    )
+            logger.warning("Could not delete skill %s: %s", canonical_name, exc)
+            return bad(handler, "Could not delete skill", 500)
+
     _SKILLS_STATS_CACHE.clear()
-    return j(handler, {"ok": True, "name": body["name"]})
+    return j(handler, {"ok": True, "name": canonical_name})
 
 
 def _normalize_names_list(names) -> list[str]:
@@ -26712,42 +27608,64 @@ def _handle_skill_toggle(handler, body):
     name = body["name"].strip()
     enabled = bool(body["enabled"])
 
-    # Validate the skill exists in the filesystem
-    skills_dir = _active_skills_dir()
-    search_dirs = _active_skill_search_dirs(skills_dir)
-    skill_dir, skill_md = _find_skill_in_dirs(name, search_dirs)
-    if not skill_md:
-        return bad(handler, f"Skill '{name}' not found", 404)
+    from api.profile_generation import (
+        ProfileGenerationError,
+        ProfileGenerationMismatch,
+    )
 
-    config_path = _active_profile_config_path()
-    with _cfg_lock:
-        cfg = _load_yaml_config_file(config_path)
+    locator = _skill_profile_locator()
+    try:
+        with _locked_skill_profile_context(locator) as context:
+            _require_skill_profile_generation(context, body)
 
-        # Ensure skills section exists as a dict
-        if "skills" not in cfg or not isinstance(cfg["skills"], dict):
-            cfg["skills"] = {}
-        skills_cfg = cfg["skills"]
+            search_dirs = _active_skill_search_dirs(context.skills_dir)
+            skill_dir, skill_md = _find_skill_in_dirs(name, search_dirs)
+            if not skill_md:
+                return bad(handler, f"Skill '{name}' not found", 404)
 
-        # Always update the global disabled list
-        skills_cfg["disabled"] = _toggle_name_in_list(
-            skills_cfg.get("disabled"), name, enabled
-        )
+            config_path = _active_profile_config_path(context.profile_home)
+            with _cfg_lock:
+                cfg = _load_yaml_config_file(config_path)
 
-        # Write-through to platform_disabled.webui if it exists so that the
-        # toggle takes effect for WebUI sessions (the agent checks the
-        # platform-specific list first when HERMES_SESSION_PLATFORM=webui).
-        platform_disabled = skills_cfg.get("platform_disabled")
-        if isinstance(platform_disabled, dict) and "webui" in platform_disabled:
-            platform_disabled["webui"] = _toggle_name_in_list(
-                platform_disabled["webui"], name, enabled
-            )
+                # Ensure skills section exists as a dict
+                if "skills" not in cfg or not isinstance(cfg["skills"], dict):
+                    cfg["skills"] = {}
+                skills_cfg = cfg["skills"]
 
-        cfg["skills"] = skills_cfg
-        _save_yaml_config_file(config_path, cfg)
+                # Always update the global disabled list
+                skills_cfg["disabled"] = _toggle_name_in_list(
+                    skills_cfg.get("disabled"), name, enabled
+                )
+
+                # Write-through to platform_disabled.webui if it exists so that
+                # the toggle takes effect for WebUI sessions.
+                platform_disabled = skills_cfg.get("platform_disabled")
+                if isinstance(platform_disabled, dict) and "webui" in platform_disabled:
+                    platform_disabled["webui"] = _toggle_name_in_list(
+                        platform_disabled["webui"], name, enabled
+                    )
+
+                cfg["skills"] = skills_cfg
+                _save_yaml_config_file(config_path, cfg)
+    except FileNotFoundError:
+        return bad(handler, "Active profile no longer exists", 409)
+    except ProfileGenerationMismatch as exc:
+        return bad(handler, str(exc), 409)
+    except (OSError, ProfileGenerationError) as exc:
+        logger.warning("Could not toggle Skill for active Profile: %s", exc)
+        return bad(handler, "Could not verify active profile", 500)
 
     reload_config()  # outside with block — reload_config() acquires the lock itself
     _SKILLS_STATS_CACHE.clear()
-    return j(handler, {"ok": True, "name": name, "enabled": enabled})
+    return j(
+        handler,
+        {
+            "ok": True,
+            "name": name,
+            "enabled": enabled,
+            "profile_generation": context.generation,
+        },
+    )
 
 
 def _handle_memory_write(handler, body):

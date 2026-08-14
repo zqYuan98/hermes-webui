@@ -5,7 +5,7 @@
       "name": "Hermes Hub",
       "enabled": true,
       "stylesheets": ["hub/hub.css"],
-      "scripts": ["hub/hub-store.js", "hub/hub.js"]
+      "scripts": ["hub/hub-store.js", "hub/agent-cost.js", "hub/hub.js"]
     }
   ]
 }

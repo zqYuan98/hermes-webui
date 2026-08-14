@@ -52,6 +52,7 @@ def test_skills_list_reads_disabled_state_from_active_profile(monkeypatch, tmp_p
 def test_skill_toggle_writes_active_profile_config_not_default(monkeypatch, tmp_path):
     """#3066: WebUI toggle writes the active profile config, not default HERMES_HOME."""
     from api import profiles, routes
+    from api.profile_generation import ensure_profile_generation
 
     default_home = tmp_path / "default"
     active_home = tmp_path / "profiles" / "trader"
@@ -64,13 +65,30 @@ def test_skill_toggle_writes_active_profile_config_not_default(monkeypatch, tmp_
     monkeypatch.setattr(routes, "reload_config", lambda: None)
     monkeypatch.setattr(routes, "j", lambda _handler, payload: payload)
     monkeypatch.setattr(routes, "bad", lambda _handler, message, status=400: {"error": message, "status": status})
+    generation = ensure_profile_generation(active_home)
 
-    enabled_response = routes._handle_skill_toggle(None, {"name": "gamma", "enabled": True})
-    assert enabled_response == {"ok": True, "name": "gamma", "enabled": True}
+    enabled_response = routes._handle_skill_toggle(
+        None,
+        {"name": "gamma", "enabled": True, "profile_generation": generation},
+    )
+    assert enabled_response == {
+        "ok": True,
+        "name": "gamma",
+        "enabled": True,
+        "profile_generation": generation,
+    }
     assert _load_config(active_home)["skills"]["disabled"] == []
     assert _load_config(default_home)["skills"]["disabled"] == []
 
-    disabled_response = routes._handle_skill_toggle(None, {"name": "gamma", "enabled": False})
-    assert disabled_response == {"ok": True, "name": "gamma", "enabled": False}
+    disabled_response = routes._handle_skill_toggle(
+        None,
+        {"name": "gamma", "enabled": False, "profile_generation": generation},
+    )
+    assert disabled_response == {
+        "ok": True,
+        "name": "gamma",
+        "enabled": False,
+        "profile_generation": generation,
+    }
     assert _load_config(active_home)["skills"]["disabled"] == ["gamma"]
     assert _load_config(default_home)["skills"]["disabled"] == []

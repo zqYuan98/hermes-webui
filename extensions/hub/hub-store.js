@@ -13,6 +13,7 @@
  *   hub-ops-auto.json   只读监控生成的服务器与服务快照
  *   hub-resources.json  个人资源库
  *   hub-inbox.json      快速捕获收件箱
+ *   hub-agent-costs.json  公司 Agent 月度消耗与固定订阅费用
  *
  * 文件读写绑定在一个 session 上（WebUI 的 file API 以 session 的 workspace 为根）。
  * Hub 首次配置时会注册工作区并创建一个专属会话，之后 session id 记在 localStorage。
@@ -30,7 +31,8 @@
     meetings: 'hub-meetings.json',
     ops: 'hub-ops.json',
     resources: 'hub-resources.json',
-    inbox: 'hub-inbox.json'
+    inbox: 'hub-inbox.json',
+    agentCosts: 'hub-agent-costs.json'
   };
   var OPS_AUTO_FILE = 'hub-ops-auto.json';
 
@@ -53,7 +55,10 @@
       };
     },
     resources: function () { return { items: [] }; },
-    inbox: function () { return { items: [] }; }
+    inbox: function () { return { items: [] }; },
+    agentCosts: function () {
+      return { version: 1, updatedAt: '', subscriptions: [], expenses: [], budgets: [] };
+    }
   };
 
   var HUB_README = [
@@ -71,6 +76,7 @@
     '| `hub-ops-auto.json` | 只读监控自动快照 | `{generatedAt, source, machines:[{id,name,ownership,role,host,region,os,resources,status,checks}], services:[{id,machineId,name,kind,startup,listen,control,status,detail,updatedAt,managed}], events:[{id,entityType,entityId,statusChangedAt,incidentOpenedAt,lifecycleSource,status,detail}]}` |',
     '| `hub-resources.json` | 个人资源库 | `{items:[{id,title,url,category,tags,note}]}` |',
     '| `hub-inbox.json` | 快速捕获收件箱 | `{items:[{id,text,done,createdAt}]}` |',
+    '| `hub-agent-costs.json` | 公司 Agent 月度成本 | `{version,updatedAt,subscriptions:[固定订阅],expenses:[月度消耗],budgets:[月度预算]}` |',
     '',
     '约定：',
     '',
@@ -84,6 +90,11 @@
     '- `ops.machines[].ownership` 取值：`personal` | `company`',
     '- `hub-ops-auto.json` 仅由只读监控原子更新，界面永不写入',
     '- `hub-ops.json` 仅存手工服务、命令、自动服务 notes、维护窗口与人工确认；界面读取时按 id 合并',
+    '- `agentCosts.subscriptions[].amountStatus` 取值：`confirmed` | `pending`；`status` 取值：`active` | `configured` | `paused`',
+    '- `costCategory` 取值：`agent_subscription` | `model_usage` | `cloud_server` | `proxy_subscription` | `other`',
+    '- `allocation` 取值：`company_self` | `customer_project` | `internal_department` | `personal_reimbursement` | `unassigned`',
+    '- 云服务器和代理即使按月订阅，也分别计入云服务器、代理与网络，不混入 Agent 席位订阅',
+    '- 待补录金额为空且不计入合计；固定项明确免费用 `confirmed` + 0，月度费用明确免费用 `no_cost`，不得把未知金额写成 0',
     '- 时间字段是 ISO 8601 字符串',
     '- 每个条目的 `id` 必须唯一；新增时生成即可',
     '',
@@ -99,6 +110,9 @@
   var meetingsWriteBlocked = false;
   var meetingsMissing = false;
   var meetingsBase = { items: [] };
+  var agentCostsWriteBlocked = false;
+  var agentCostsMissing = false;
+  var agentCostsBase = { version: 1, updatedAt: '', subscriptions: [], expenses: [], budgets: [] };
 
   function lsGet(k) { try { return localStorage.getItem(k) || ''; } catch (_) { return ''; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (_) { } }
@@ -349,6 +363,50 @@
     }
   }
 
+  function validateAgentCostShape(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('root');
+    ['subscriptions', 'expenses', 'budgets'].forEach(function (field) {
+      if (!Array.isArray(value[field])) throw new Error(field + ' is not array');
+      var ids = Object.create(null);
+      value[field].forEach(function (row) {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error(field + ' row is not object');
+        if (!row.id) throw new Error(field + ' row missing id');
+        if (ids[row.id]) throw new Error(field + ' duplicate id');
+        ids[row.id] = true;
+      });
+    });
+  }
+
+  function normalizeAgentCosts(value) {
+    var root = normalize('agentCosts', value || {});
+    ['subscriptions', 'expenses', 'budgets'].forEach(function (field) {
+      root[field] = root[field].map(function (row) { return Object.assign({}, row); });
+    });
+    return root;
+  }
+
+  function parseAgentCosts(text, strict) {
+    if (!text || !String(text).trim()) {
+      agentCostsWriteBlocked = true;
+      agentCostsMissing = false;
+      if (strict) throw new Error('hub-agent-costs.json 为空或无法解析');
+      return DEFAULTS.agentCosts();
+    }
+    try {
+      var value = JSON.parse(text);
+      validateAgentCostShape(value);
+      value = normalizeAgentCosts(value);
+      agentCostsWriteBlocked = false;
+      agentCostsMissing = false;
+      agentCostsBase = JSON.parse(JSON.stringify(value));
+      return value;
+    } catch (err) {
+      agentCostsWriteBlocked = true;
+      if (strict) throw new Error('hub-agent-costs.json 为空或无法解析', { cause: err });
+      return DEFAULTS.agentCosts();
+    }
+  }
+
   function mergeOps(manual, automatic) {
     manual = normalize('ops', manual || {});
     automatic = normalize('ops', automatic || {});
@@ -382,7 +440,7 @@
     if (!ctx.ready) return options.strict
       ? Promise.reject(new Error('Hub 工作区尚未就绪'))
       : Promise.resolve(DEFAULTS[key]());
-    if (cache[key]) return Promise.resolve(cache[key]);
+    if (cache[key] && !(key === 'agentCosts' && options.strict)) return Promise.resolve(cache[key]);
     if (key === 'ops') {
       return Promise.all([
         readText(FILES.ops).then(parseManualOps, function () {
@@ -408,6 +466,25 @@
         meetingsBase = DEFAULTS.meetings();
         cache.meetings = DEFAULTS.meetings();
         return cache.meetings;
+      });
+    }
+    if (key === 'agentCosts') {
+      return readText(FILES.agentCosts).then(function (text) {
+        cache.agentCosts = parseAgentCosts(text, options.strict);
+        return cache.agentCosts;
+      }, function (err) {
+        if (err && err.status === 404) {
+          if (options.strict) throw err;
+          agentCostsWriteBlocked = false;
+          agentCostsMissing = true;
+          agentCostsBase = DEFAULTS.agentCosts();
+          cache.agentCosts = DEFAULTS.agentCosts();
+          return cache.agentCosts;
+        }
+        agentCostsWriteBlocked = true;
+        agentCostsMissing = false;
+        delete cache.agentCosts;
+        throw err;
       });
     }
     return readText(FILES[key]).then(function (text) {
@@ -508,6 +585,29 @@
     };
   }
 
+  function validateAgentCostIds(value) {
+    ['subscriptions', 'expenses', 'budgets'].forEach(function (field) {
+      var ids = Object.create(null);
+      (value[field] || []).forEach(function (row) {
+        if (!row.id) throw new Error('Agent 成本「' + field + '」存在缺少 id 的条目，已拒绝保存');
+        if (ids[row.id]) throw new Error('Agent 成本「' + field + '」存在重复 id「' + row.id + '」，已拒绝保存');
+        ids[row.id] = true;
+      });
+    });
+  }
+
+  function mergeAgentCosts(base, local, remote) {
+    var persisted = mergeObjectFields(base, local, remote, {
+      subscriptions: true, expenses: true, budgets: true, updatedAt: true
+    }, 'Agent 成本文件');
+    persisted.version = Math.max(Number(base.version) || 1, Number(local.version) || 1, Number(remote.version) || 1);
+    persisted.updatedAt = local.updatedAt || remote.updatedAt || '';
+    persisted.subscriptions = mergeRows(base.subscriptions, local.subscriptions, remote.subscriptions, 'Agent 固定项');
+    persisted.expenses = mergeRows(base.expenses, local.expenses, remote.expenses, 'Agent 月度费用');
+    persisted.budgets = mergeRows(base.budgets, local.budgets, remote.budgets, 'Agent 月度预算');
+    return persisted;
+  }
+
   function applyManualToMerged(value, manual) {
     var notes = Object.create(null), manualServices = [];
     (manual.services || []).forEach(function (service) {
@@ -557,6 +657,36 @@
       return readText(FILES.meetings).then(mergeAndPersistMeetings, function () {
         if (meetingsMissing) return mergeAndPersistMeetings('');
         throw new Error('保存前无法重新读取 hub-meetings.json，已拒绝覆盖；请稍后重试');
+      });
+    }
+    if (key === 'agentCosts') {
+      if (agentCostsWriteBlocked) {
+        return Promise.reject(new Error('hub-agent-costs.json 无法解析，已禁止覆盖；请先修复或恢复该文件'));
+      }
+      var localAgentCosts = normalizeAgentCosts(JSON.parse(JSON.stringify(value || DEFAULTS.agentCosts())));
+      function mergeAndPersistAgentCosts(text) {
+        var remote;
+        try {
+          remote = text ? JSON.parse(text) : DEFAULTS.agentCosts();
+          validateAgentCostShape(remote);
+          remote = normalizeAgentCosts(remote);
+        } catch (_) {
+          agentCostsWriteBlocked = true;
+          throw new Error('hub-agent-costs.json 无法解析，已禁止覆盖；请先修复或恢复该文件');
+        }
+        validateAgentCostIds(localAgentCosts);
+        validateAgentCostIds(remote);
+        var persisted = mergeAgentCosts(agentCostsBase, localAgentCosts, remote);
+        return writeText(FILES.agentCosts, JSON.stringify(persisted, null, 2)).then(function () {
+          agentCostsMissing = false;
+          agentCostsBase = JSON.parse(JSON.stringify(persisted));
+          cache.agentCosts = persisted;
+        });
+      }
+      return readText(FILES.agentCosts).then(mergeAndPersistAgentCosts, function (err) {
+        if (agentCostsMissing && err && err.status === 404) return mergeAndPersistAgentCosts('');
+        agentCostsWriteBlocked = true;
+        throw new Error('保存前无法重新读取 hub-agent-costs.json，已拒绝覆盖；请稍后重试');
       });
     }
     if (key !== 'ops') {

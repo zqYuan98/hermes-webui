@@ -20,6 +20,7 @@ let _kanbanSuppressCardClickUntil = 0;
 let _kanbanEventSource = null;
 let _kanbanEventSourceFailures = 0;
 let _skillsData = null; // cached skills list
+let _skillsProfileGeneration = null; // Profile incarnation captured by management reads
 let _cronList = null; // cached cron jobs (array)
 let _currentCronDetail = null; // full cron job object
 let _currentCronDetailKey = '';
@@ -4861,7 +4862,8 @@ async function loadSkills() {
   if (_skillsData) { renderSkills(_skillsData); return; }
   const box = $('skillsList');
   try {
-    const data = await api('/api/skills');
+    const data = await api('/api/skills?include_ui=1');
+    _skillsProfileGeneration = data.profile_generation || null;
     _skillsData = data.skills || [];
     // Prune collapsed state to only keep categories present in fresh data,
     // avoiding stale keys when categories are renamed or removed server-side.
@@ -4892,6 +4894,7 @@ function renderSkills(skills) {
   const query = ($('skillsSearch').value || '').toLowerCase();
   const filtered = query ? skills.filter(s =>
     (s.name||'').toLowerCase().includes(query) ||
+    (s.ui_description||'').toLowerCase().includes(query) ||
     (s.description||'').toLowerCase().includes(query) ||
     (s.category||'').toLowerCase().includes(query)
   ) : skills;
@@ -4923,16 +4926,20 @@ function renderSkills(skills) {
       const toggle = document.createElement('span');
       toggle.className = 'skill-toggle' + (isDisabled ? '' : ' enabled');
       toggle.title = isDisabled ? t('skill_disabled') : t('skill_enabled');
+      const renderGeneration = _skillsProfileGeneration;
       toggle.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        toggleSkill(skill.name, !isDisabled);
+        toggleSkill(skill.name, !isDisabled, renderGeneration);
       });
       const nameEl = document.createElement('span');
       nameEl.className = 'skill-name';
       nameEl.textContent = skill.name;
       const descEl = document.createElement('span');
-      descEl.className = 'skill-desc';
-      descEl.textContent = skill.description || '';
+      descEl.className = 'skill-desc' + (skill.ui_description ? ' localized' : '');
+      descEl.textContent = skill.ui_description || skill.description || '';
+      if (skill.ui_description && skill.description) {
+        descEl.title = `${skill.ui_description}\n${t('skill_runtime_description')}: ${skill.description}`;
+      }
       el.append(toggle, nameEl, descEl);
       el.onclick = () => openSkill(skill.name, el);
       sec.appendChild(el);
@@ -4945,13 +4952,22 @@ function filterSkills() {
   if (_skillsData) renderSkills(_skillsData);
 }
 
+function _skillMutationPayload(fields, profileGeneration) {
+  if (profileGeneration === undefined) {
+    return { ...fields, profile_generation: _skillsProfileGeneration };
+  }
+  return { ...fields, profile_generation: profileGeneration };
+}
 
-async function toggleSkill(name, currentlyEnabled) {
+
+async function toggleSkill(name, currentlyEnabled, profileGeneration = _skillsProfileGeneration) {
   const newEnabled = !currentlyEnabled;
   try {
     const result = await api('/api/skills/toggle', {
       method: 'POST',
-      body: JSON.stringify({ name, enabled: newEnabled })
+      body: JSON.stringify(
+        _skillMutationPayload({ name, enabled: newEnabled }, profileGeneration)
+      )
     });
     if (result && result.ok) {
       if (_skillsData) {
@@ -4970,10 +4986,11 @@ async function toggleSkill(name, currentlyEnabled) {
 
 // Currently selected skill detail — kept across panel switches so re-entering
 // the Skills view shows the last-viewed skill.
-let _currentSkillDetail = null; // { name, category, content }
+let _currentSkillDetail = null; // { name, category, content, ui_description }
 let _skillMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
 let _skillPreFormDetail = null; // snapshot of previously-viewed skill when entering a form
 let _editingSkillName = null;
+let _skillFormProfileGeneration = null;
 
 function _stripYamlFrontmatter(content) {
   if (!content) return { frontmatter: null, body: '' };
@@ -4995,7 +5012,7 @@ function _enhanceSkillMarkdown(root) {
   });
 }
 
-function _renderSkillDetail(name, content, linkedFiles) {
+function _renderSkillDetail(name, content, linkedFiles, uiDescription = '') {
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
   const empty = $('skillDetailEmpty');
@@ -5004,6 +5021,9 @@ function _renderSkillDetail(name, content, linkedFiles) {
   if (title) title.textContent = name;
   const { frontmatter, body: markdownBody } = _stripYamlFrontmatter(content);
   let html = '';
+  if (uiDescription) {
+    html += `<section class="skill-ui-description-card"><div class="skill-ui-description-label">${esc(t('skill_ui_description'))}</div><p>${esc(uiDescription)}</p><div class="skill-ui-description-hint">${esc(t('skill_ui_description_hint'))}</div></section>`;
+  }
   if (frontmatter) {
     html += `<details class="skill-frontmatter"><summary>${esc(t('skill_metadata'))}</summary><pre><code>${esc(frontmatter)}</code></pre></details>`;
   }
@@ -5067,15 +5087,22 @@ async function openSkill(name, el) {
   _skillPreFormDetail = null;
   _editingSkillName = null;
   try {
-    const data = await api(`/api/skills/content?name=${encodeURIComponent(name)}`);
+    const data = await api(`/api/skills/content?name=${encodeURIComponent(name)}&include_ui=1`);
     if (data && (data.success === false || data.error)) {
       const message = data.error || t('skill_load_failed');
       _renderSkillError(name, message);
       setStatus(t('skill_load_failed') + message);
       return;
     }
-    _currentSkillDetail = { name, content: data.content || '', linked_files: data.linked_files || {} };
-    _renderSkillDetail(name, data.content || '', data.linked_files || {});
+    _skillsProfileGeneration = data.profile_generation || _skillsProfileGeneration;
+    _currentSkillDetail = {
+      name,
+      content: data.content || '',
+      linked_files: data.linked_files || {},
+      ui_description: data.ui_description || '',
+      profile_generation: data.profile_generation || _skillsProfileGeneration,
+    };
+    _renderSkillDetail(name, data.content || '', data.linked_files || {}, data.ui_description || '');
     _closeMobileSidebarAfterPanelSelection();
   } catch(e) { setStatus(t('skill_load_failed') + e.message); }
 }
@@ -5109,7 +5136,7 @@ async function openSkillFile(skillName, filePath) {
       a.addEventListener('click', e => {
         e.preventDefault();
         if (_currentSkillDetail && _currentSkillDetail.name === a.dataset.skillName) {
-          _renderSkillDetail(_currentSkillDetail.name, _currentSkillDetail.content, _currentSkillDetail.linked_files);
+          _renderSkillDetail(_currentSkillDetail.name, _currentSkillDetail.content, _currentSkillDetail.linked_files, _currentSkillDetail.ui_description || '');
         } else {
           openSkill(a.dataset.skillName, null);
         }
@@ -5128,25 +5155,27 @@ function editCurrentSkill() {
     const match = _skillsData.find(x => x.name === s.name);
     if (match) category = match.category || '';
   }
-  _skillPreFormDetail = { name: s.name, content: s.content, linked_files: s.linked_files };
+  _skillPreFormDetail = { ...s };
   _editingSkillName = s.name;
+  _skillFormProfileGeneration = s.profile_generation || _skillsProfileGeneration;
   _skillMode = 'edit';
-  _renderSkillForm({ name: s.name, category, content: s.content || '', isEdit: true });
+  _renderSkillForm({ name: s.name, category, content: s.content || '', uiDescription: s.ui_description || '', isEdit: true });
 }
 
 function openSkillCreate() {
   if (typeof switchPanel === 'function' && _currentPanel !== 'skills') switchPanel('skills');
   _skillPreFormDetail = _currentSkillDetail ? { ..._currentSkillDetail } : null;
   _editingSkillName = null;
+  _skillFormProfileGeneration = _skillsProfileGeneration;
   _skillMode = 'create';
-  _renderSkillForm({ name: '', category: '', content: '', isEdit: false });
+  _renderSkillForm({ name: '', category: '', content: '', uiDescription: '', isEdit: false });
   // Mobile: the new-skill form lives in the main view, which is covered by the
   // full-screen sidebar drawer. Close the drawer so the form is visible (mirror
   // openSkillDetail's behaviour); no-op on desktop.
   _closeMobileSidebarAfterPanelSelection();
 }
 
-function _renderSkillForm({ name, category, content, isEdit }) {
+function _renderSkillForm({ name, category, content, uiDescription = '', isEdit }) {
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
   const empty = $('skillDetailEmpty');
@@ -5165,6 +5194,11 @@ function _renderSkillForm({ name, category, content, isEdit }) {
         <div class="detail-form-row">
           <label for="skillFormCategory">${esc(t('skill_category') || 'Category')}</label>
           <input type="text" id="skillFormCategory" value="${esc(category || '')}" placeholder="${esc(t('skill_category_placeholder') || 'Optional, e.g. devops')}" autocomplete="off">
+        </div>
+        <div class="detail-form-row skill-ui-description-field">
+          <label for="skillUiDescription">${esc(t('skill_ui_description'))}</label>
+          <textarea id="skillUiDescription" rows="4" maxlength="2000" placeholder="${esc(t('skill_ui_description_placeholder'))}">${esc(uiDescription || '')}</textarea>
+          <div class="detail-form-hint">${esc(t('skill_ui_description_hint'))}</div>
         </div>
         <div class="detail-form-row">
           <label for="skillFormContent">${esc(t('skill_content') || 'SKILL.md content')}</label>
@@ -5186,7 +5220,7 @@ function cancelSkillForm() {
     const snap = _skillPreFormDetail;
     _skillPreFormDetail = null;
     _currentSkillDetail = snap;
-    _renderSkillDetail(snap.name, snap.content || '', snap.linked_files || {});
+    _renderSkillDetail(snap.name, snap.content || '', snap.linked_files || {}, snap.ui_description || '');
     return;
   }
   // Revert to empty state
@@ -5206,16 +5240,24 @@ async function saveSkillForm() {
   const nameInput = $('skillFormName');
   const catInput = $('skillFormCategory');
   const contentInput = $('skillFormContent');
+  const uiDescriptionInput = $('skillUiDescription');
   const errEl = $('skillFormError');
   if (!nameInput || !contentInput || !errEl) return;
   const name = (nameInput.value || '').trim().toLowerCase().replace(/\s+/g, '-');
   const category = (catInput ? (catInput.value || '').trim() : '');
   const content = contentInput.value;
+  const uiDescription = uiDescriptionInput ? uiDescriptionInput.value.trim() : '';
   errEl.style.display = 'none';
   if (!name) { errEl.textContent = t('skill_name_required'); errEl.style.display = ''; return; }
   if (!content.trim()) { errEl.textContent = t('content_required'); errEl.style.display = ''; return; }
   try {
-    await api('/api/skills/save', {method:'POST', body: JSON.stringify({name, category: category||undefined, content})});
+    await api('/api/skills/save', {
+      method:'POST',
+      body: JSON.stringify(_skillMutationPayload(
+        {name, category: category||undefined, content, ui_description: uiDescription},
+        _skillFormProfileGeneration
+      ))
+    });
     showToast(_editingSkillName ? t('skill_updated') : t('skill_created'));
     _skillsData = null;
     _cronSkillsCache = null;
@@ -5242,6 +5284,7 @@ function toggleSkillForm(){ openSkillCreate(); }
 async function deleteCurrentSkill() {
   if (!_currentSkillDetail) return;
   const name = _currentSkillDetail.name;
+  const profileGeneration = _currentSkillDetail.profile_generation || _skillsProfileGeneration;
   const message = t('skill_delete_confirm')
     ? t('skill_delete_confirm').replace('{0}', name)
     : `Delete skill "${name}"?`;
@@ -5254,7 +5297,10 @@ async function deleteCurrentSkill() {
   });
   if (!ok) return;
   try {
-    await api('/api/skills/delete', { method:'POST', body: JSON.stringify({ name }) });
+    await api('/api/skills/delete', {
+      method:'POST',
+      body: JSON.stringify(_skillMutationPayload({ name }, profileGeneration))
+    });
     _currentSkillDetail = null;
     _skillPreFormDetail = null;
     _skillsData = null;
@@ -6816,6 +6862,7 @@ async function switchToWorkspace(path,name){
 
 // ── Profile panel + dropdown ──
 let _profilesCache = null;
+let _profileManagementCache = null; // never persisted; includes Profile generations
 let _profileDropdownFetchPromise = null;
 let _profileDropdownCacheLoadedFromStorage = false;
 const PROFILE_DROPDOWN_CACHE_KEY = 'hermes-webui-profile-dropdown-cache-v1';
@@ -6974,9 +7021,14 @@ async function loadProfilesPanel() {
   const panel = $('profilesPanel');
   if (!panel) return;
   try {
-    const data = await api('/api/profiles');
-    _profilesCache = data;
-    _profileDropdownWriteStoredCache(data);
+    const data = await api('/api/profiles?include_generation=1');
+    _profileManagementCache = data;
+    const dropdownData = {
+      ...data,
+      profiles: (data.profiles || []).map(({ profile_generation, ...profile }) => profile),
+    };
+    _profilesCache = dropdownData;
+    _profileDropdownWriteStoredCache(dropdownData);
     panel.innerHTML = '';
 
     // Hide "New profile" button in single profile mode
@@ -7140,15 +7192,22 @@ function _setProfileHeaderButtons(mode, p, activeName){
 }
 
 function openProfileDetail(name, el){
-  if (!_profilesCache || !_profilesCache.profiles) return;
-  const p = _profilesCache.profiles.find(x => x.name === name);
+  const managementData = _profileManagementCache || _profilesCache;
+  if (!managementData || !managementData.profiles) return;
+  const p = managementData.profiles.find(x => x.name === name);
   if (!p) return;
   document.querySelectorAll('.profile-card').forEach(e => e.classList.remove('active'));
   const target = el || document.querySelector(`.profile-card[data-name="${CSS.escape(name)}"]`);
   if (target) target.classList.add('active');
   _profilePreFormDetail = null;
-  _renderProfileDetail(p, _profilesCache.active);
+  _renderProfileDetail(p, managementData.active);
   _closeMobileSidebarAfterPanelSelection();
+}
+
+function _profileGenerationForDelete(profile) {
+  const generation = profile && profile.profile_generation;
+  if (!generation) throw new Error('Profile generation is unavailable; reload Profiles and retry');
+  return generation;
 }
 
 function _clearProfileDetail(){
@@ -7171,11 +7230,15 @@ async function activateCurrentProfile(){
 async function deleteCurrentProfile(){
   if (!_currentProfileDetail) return;
   const name = _currentProfileDetail.name;
+  let profile_generation;
+  try { profile_generation = _profileGenerationForDelete(_currentProfileDetail); }
+  catch (e) { showToast(t('delete_failed') + e.message); return; }
   const _ok = await showConfirmDialog({title:t('profile_delete_confirm_title',name),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
   if(!_ok) return;
   try {
-    await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name, profile_generation }) });
     _invalidateKanbanProfileCache();
+    _profileManagementCache = null;
     _clearProfileDetail();
     await loadProfilesPanel();
     showToast(t('profile_deleted', name));
@@ -7437,6 +7500,9 @@ async function switchToProfile(name) {
     if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
     else localStorage.removeItem('hermes-webui-model');
     _skillsData = null;
+    _skillsProfileGeneration = null;
+    _currentSkillDetail = null;
+    _skillFormProfileGeneration = null;
     _workspaceList = null;
     if (data.default_model) window._defaultModel = data.default_model;
     if (data.default_model_provider) window._activeProvider = data.default_model_provider;
@@ -7763,11 +7829,18 @@ function toggleProfileForm(){ openProfileCreate();
 }
 
 async function deleteProfile(name) {
+  const profile = _profileManagementCache && Array.isArray(_profileManagementCache.profiles)
+    ? _profileManagementCache.profiles.find(p => p.name === name)
+    : null;
+  let profile_generation;
+  try { profile_generation = _profileGenerationForDelete(profile); }
+  catch (e) { showToast(t('delete_failed') + e.message); return; }
   const _delProf=await showConfirmDialog({title:t('profile_delete_confirm_title',name),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
   if(!_delProf) return;
   try {
-    await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name }) });
+    await api('/api/profile/delete', { method: 'POST', body: JSON.stringify({ name, profile_generation }) });
     _invalidateKanbanProfileCache();
+    _profileManagementCache = null;
     await loadProfilesPanel();
     showToast(t('profile_deleted', name));
   } catch (e) { showToast(t('delete_failed') + e.message); }

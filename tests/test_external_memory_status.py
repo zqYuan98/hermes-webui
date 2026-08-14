@@ -16,7 +16,7 @@ def _memory_payload(tmp_path, monkeypatch, *, config_text, env_text="", healthy=
 
     monkeypatch.setattr(api.profiles, "get_active_hermes_home", lambda: home)
     monkeypatch.setattr(routes, "_memory_project_context_workspace", lambda _parsed: tmp_path)
-    monkeypatch.setattr(routes, "_external_notes_sources_enabled", lambda: False)
+    monkeypatch.setattr(routes, "_external_notes_sources_enabled", lambda _cfg=None: False)
     monkeypatch.setattr(routes, "_probe_hy_memory_health", lambda _url: healthy)
     monkeypatch.setattr(routes, "j", lambda _handler, payload, **_kwargs: payload)
     return routes._handle_memory_read(object(), SimpleNamespace(query=""))

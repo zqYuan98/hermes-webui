@@ -105,7 +105,13 @@ def _require_writable_target(write_path: Path) -> os.stat_result | None:
         os.close(probe_fd)
 
 
-def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    require_atomic_replace: bool = False,
+) -> None:
     """Atomically replace *path* with *text*.
 
     Writes to a temp file in the same directory, flushes + ``os.fsync``, then
@@ -152,6 +158,8 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     The caller is responsible for ensuring ``path.parent`` exists.
     """
     path = Path(path)
+    if require_atomic_replace and path.is_symlink():
+        raise ValueError(f"Atomic replacement target cannot be a symlink: {path}")
     symlink_target = path.resolve(strict=False) if path.is_symlink() else None
     write_path = symlink_target or path
     try:
@@ -201,12 +209,18 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
         if existing_stat is not None and (
             existing_stat.st_nlink > 1 or _has_extended_attributes(write_path)
         ):
+            if require_atomic_replace:
+                raise PermissionError(
+                    f"Atomic replacement is not safe for linked or extended-attribute target: {write_path}"
+                )
             _write_in_place()
             return
 
     try:
         fd, tmp = _create_atomic_temp_file(write_path, existing=existing_stat is not None)
     except PermissionError:
+        if require_atomic_replace:
+            raise
         _write_in_place()
         return
     owns_fd = True
@@ -226,6 +240,10 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
                     and exc.errno not in unsupported_ownership_errnos
                 ):
                     raise
+                if require_atomic_replace:
+                    raise PermissionError(
+                        f"Atomic replacement could not preserve ownership for: {write_path}"
+                    ) from exc
                 os.close(fd)
                 owns_fd = False
                 os.unlink(tmp)

@@ -705,14 +705,9 @@ def main() -> None:
     _shutdown_requested = threading.Event()
 
     def _request_shutdown(signum, _frame):
-        if _shutdown_requested.is_set():
-            return
-        _shutdown_requested.set()
-        threading.Thread(
-            target=httpd.shutdown,
-            name="webui-sigterm-shutdown",
-            daemon=True,
-        ).start()
+        from api.run_admission import request_http_shutdown
+
+        request_http_shutdown(httpd, _shutdown_requested)
 
     try:
         signal.signal(signal.SIGTERM, _request_shutdown)
