@@ -480,8 +480,9 @@ set_ui_description(sys.argv[2], sys.argv[3], sys.argv[4])
 
 def test_combined_skill_save_is_serialized_across_processes(tmp_path):
     repo = pathlib.Path(__file__).resolve().parent.parent
+    agent_repo = _conftest.HERMES_AGENT
     worker_python = pathlib.Path(_conftest.VENV_PYTHON)
-    if not worker_python.exists():
+    if agent_repo is None or not worker_python.exists():
         pytest.skip("Hermes Agent Python is unavailable for route-level process test")
     state_dir = tmp_path / "state"
     skills_dir = tmp_path / "profile" / "skills"
@@ -545,9 +546,12 @@ done_marker.write_text(json.dumps(payload), encoding="utf-8")
         encoding="utf-8",
     )
     env = os.environ.copy()
+    env["HERMES_WEBUI_AGENT_DIR"] = str(agent_repo)
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(repo), "/home/zqyuan98/.hermes/hermes-agent", env.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
+        part
+        for part in (str(repo), str(agent_repo), env.get("PYTHONPATH", ""))
+        if part
+    )
 
     done_a = tmp_path / "done-a"
     proc_a = subprocess.Popen(
@@ -606,8 +610,9 @@ done_marker.write_text(json.dumps(payload), encoding="utf-8")
 
 def test_ui_detail_read_is_serialized_with_combined_save_across_processes(tmp_path):
     repo = pathlib.Path(__file__).resolve().parent.parent
+    agent_repo = _conftest.HERMES_AGENT
     worker_python = pathlib.Path(_conftest.VENV_PYTHON)
-    if not worker_python.exists():
+    if agent_repo is None or not worker_python.exists():
         pytest.skip("Hermes Agent Python is unavailable for route-level process test")
 
     state_dir = tmp_path / "state"
@@ -702,9 +707,12 @@ done_marker.write_text(json.dumps(payload), encoding="utf-8")
         encoding="utf-8",
     )
     env = os.environ.copy()
+    env["HERMES_WEBUI_AGENT_DIR"] = str(agent_repo)
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(repo), "/home/zqyuan98/.hermes/hermes-agent", env.get("PYTHONPATH", "")]
-    ).rstrip(os.pathsep)
+        part
+        for part in (str(repo), str(agent_repo), env.get("PYTHONPATH", ""))
+        if part
+    )
 
     writer = subprocess.Popen(
         [

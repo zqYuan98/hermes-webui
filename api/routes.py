@@ -41,6 +41,7 @@ from api.agent_runtime import (
     ensure_agent_runtime_current,
     require_ai_agent_class,
 )
+from api.profile_generation import ProfileGenerationMismatch
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -3202,8 +3203,13 @@ from api.config import (
 )
 from api import config as api_config
 from api.run_admission import (
+    AuxiliaryRunLease,
     RunAdmissionRejected,
+    admitted_auxiliary_run,
+    auxiliary_profile_commit_guard,
+    capture_auxiliary_profile_snapshot,
     publish_admitted_stream,
+    register_admitted_auxiliary_run,
     register_admitted_run,
     rollback_admitted_stream,
     run_admission_transaction,
@@ -14574,6 +14580,273 @@ def _validate_session_toolsets_shape(toolsets):
         raise ValueError("each toolset must be a non-empty string")
     return toolsets
 
+def _update_summary_main_runtime() -> dict:
+    """Resolve the active Profile's main model route without creating a client."""
+    from api.config import (
+        get_effective_default_model,
+        resolve_custom_provider_connection,
+        resolve_model_provider,
+    )
+
+    main_model, main_provider, main_base_url = resolve_model_provider(
+        get_effective_default_model()
+    )
+    main_api_key = None
+    main_api_mode = None
+    main_command = None
+    try:
+        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider_with_anthropic_env_lock(
+            resolve_runtime_provider,
+            requested=main_provider,
+        )
+        main_api_key = runtime.get("api_key")
+        main_api_mode = runtime.get("api_mode")
+        main_command = runtime.get("command")
+        if not main_provider:
+            main_provider = runtime.get("provider")
+        if not main_base_url:
+            main_base_url = runtime.get("base_url")
+    except Exception as exc:
+        logger.debug("update summary runtime provider resolution failed: %s", exc)
+    if isinstance(main_provider, str) and main_provider.startswith("custom:"):
+        custom_key, custom_base = resolve_custom_provider_connection(main_provider)
+        if not main_api_key and custom_key:
+            main_api_key = custom_key
+        if not main_base_url and custom_base:
+            main_base_url = custom_base
+
+    return {
+        "provider": main_provider,
+        "model": main_model,
+        "base_url": main_base_url,
+        "api_key": main_api_key,
+        "api_mode": main_api_mode,
+        "command": main_command,
+    }
+
+
+def _prepare_update_summary_model(profile: str | None = None) -> bool:
+    """Probe whether update summarization has a real model route.
+
+    Probe mode follows the Agent's full auxiliary routing policy but returns
+    non-functional stubs instead of constructing SDK clients. No active run is
+    published until this function confirms that a model request can be made.
+    """
+    from api import profiles as profiles_api
+
+    active_profile = str(profile or profiles_api.get_active_profile_name() or "default")
+    with profiles_api.profile_env_for_background_worker(
+        active_profile,
+        "update summary availability probe",
+        logger_override=logger,
+    ):
+        ensure_agent_runtime_current()
+        main_runtime = _update_summary_main_runtime()
+        try:
+            from agent.auxiliary_client import aux_probe_mode, get_text_auxiliary_client
+
+            with aux_probe_mode():
+                aux_client, aux_model = get_text_auxiliary_client(
+                    "compression",
+                    main_runtime=main_runtime,
+                )
+            if aux_client is not None and aux_model:
+                return True
+        except (AgentRuntimeChangedError, ProfileGenerationMismatch):
+            raise
+        except Exception as exc:
+            logger.debug("update summary auxiliary availability probe failed: %s", exc)
+
+        # Preserve the historical AIAgent fallback for main transports that do
+        # not expose an auxiliary client adapter. A successfully resolved main
+        # runtime with credentials/command is enough to attempt that path.
+        return bool(
+            main_runtime.get("provider")
+            and main_runtime.get("model")
+            and (
+                main_runtime.get("api_key")
+                or main_runtime.get("command")
+            )
+        )
+
+
+def _llm_update_summary(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    commit=None,
+    profile_snapshot=None,
+):
+    profile_snapshot = profile_snapshot or capture_auxiliary_profile_snapshot()
+    try:
+        model_available = _prepare_update_summary_model(profile_snapshot.profile)
+    except (
+        AgentRuntimeChangedError,
+        ProfileGenerationMismatch,
+        RunAdmissionRejected,
+    ):
+        raise
+    except Exception:
+        model_available = False
+
+    if not model_available:
+        with auxiliary_profile_commit_guard(profile_snapshot):
+            return commit("") if callable(commit) else ""
+
+    run_id = f"updates-summary-{uuid.uuid4().hex}"
+    with admitted_auxiliary_run(
+        run_id,
+        session_id="updates-summary",
+        profile_snapshot=profile_snapshot,
+        phase="auxiliary-running",
+        backend="update-summary",
+    ) as lease:
+        try:
+            result = _llm_update_summary_admitted(
+                system_prompt,
+                user_prompt,
+                profile=lease.profile,
+            )
+        except (
+            AgentRuntimeChangedError,
+            ProfileGenerationMismatch,
+            RunAdmissionRejected,
+        ):
+            raise
+        except Exception:
+            result = ""
+        with lease.commit_guard():
+            return commit(result) if callable(commit) else result
+
+
+def _llm_update_summary_admitted(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    profile: str | None = None,
+) -> str:
+    from api import profiles as profiles_api
+
+    active_profile = str(profile or profiles_api.get_active_profile_name() or "default")
+
+    with profiles_api.profile_env_for_background_worker(
+        active_profile,
+        "update summary",
+        logger_override=logger,
+    ):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        main_runtime = _update_summary_main_runtime()
+
+        ensure_agent_runtime_current()
+        try:
+            from agent.auxiliary_client import get_text_auxiliary_client
+
+            # Update summaries are a short text-compression/summarization task.
+            # Reuse the documented auxiliary.compression slot instead of
+            # inventing a WebUI-only auxiliary task name that users cannot
+            # discover in the Hermes Agent setup/config UI.
+            aux_client, aux_model = get_text_auxiliary_client(
+                "compression",
+                main_runtime=main_runtime,
+            )
+            if aux_client is not None and aux_model:
+                response = aux_client.chat.completions.create(
+                    model=aux_model,
+                    messages=messages,
+                )
+                return str(response.choices[0].message.content or "").strip()
+        except (
+            AgentRuntimeChangedError,
+            ProfileGenerationMismatch,
+            RunAdmissionRejected,
+        ):
+            raise
+        except Exception as exc:
+            logger.debug(
+                "update summary auxiliary model failed; falling back to main model: %s",
+                exc,
+            )
+
+        AIAgent = require_ai_agent_class()
+
+        agent = AIAgent(
+            model=main_runtime.get("model"),
+            provider=main_runtime.get("provider"),
+            base_url=main_runtime.get("base_url"),
+            api_key=main_runtime.get("api_key"),
+            api_mode=main_runtime.get("api_mode"),
+            command=main_runtime.get("command"),
+            platform="webui",
+            quiet_mode=True,
+            enabled_toolsets=[],
+            session_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
+        )
+        result = agent.run_conversation(
+            user_message=user_prompt,
+            system_message=system_prompt,
+            conversation_history=[],
+            task_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
+        )
+        return str(result.get("final_response") or "").strip()
+
+def _handle_update_summary(handler, body):
+    from api.profile_generation import ProfileGenerationMismatch
+    from api.updates import summarize_update_payload
+
+    updates = body.get("updates") if isinstance(body, dict) else {}
+    target = body.get("target") if isinstance(body, dict) else None
+    try:
+        profile_snapshot = capture_auxiliary_profile_snapshot()
+
+        def _commit_local_result(operation):
+            with auxiliary_profile_commit_guard(profile_snapshot):
+                return operation()
+
+        def _run_model(system_prompt, user_prompt, *, commit=None):
+            return _llm_update_summary(
+                system_prompt,
+                user_prompt,
+                commit=commit,
+                profile_snapshot=profile_snapshot,
+            )
+
+        return summarize_update_payload(
+            updates,
+            llm_runner=_run_model,
+            result_commit=lambda result: j(handler, result),
+            local_result_commit=_commit_local_result,
+            target=target,
+        )
+    except RunAdmissionRejected as exc:
+        return j(handler, exc.payload, status=503)
+    except AgentRuntimeChangedError as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "agent_runtime_stale",
+                "retryable": True,
+            },
+            status=409,
+        )
+    except ProfileGenerationMismatch as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "profile_generation_stale",
+                "retryable": True,
+            },
+            status=409,
+        )
+
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
@@ -17038,105 +17311,7 @@ def handle_post(handler, parsed) -> bool:
         return j(handler, apply_clear_lock(target))
 
     if parsed.path == "/api/updates/summary":
-        from api.updates import summarize_update_payload
-
-        updates = body.get("updates") if isinstance(body, dict) else {}
-        target = body.get("target") if isinstance(body, dict) else None
-
-        def _llm_update_summary(system_prompt: str, user_prompt: str) -> str:
-            from api import profiles as profiles_api
-
-            active_profile = profiles_api.get_active_profile_name() or "default"
-
-            with profiles_api.profile_env_for_background_worker(
-                active_profile,
-                "update summary",
-                logger_override=logger,
-            ):
-                from api.config import (
-                    get_effective_default_model,
-                    resolve_model_provider,
-                    resolve_custom_provider_connection,
-                )
-
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
-
-                _main_model, _main_provider, _main_base_url = resolve_model_provider(get_effective_default_model())
-                _main_api_key = None
-                try:
-                    from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
-                    from hermes_cli.runtime_provider import resolve_runtime_provider
-
-                    _rt = resolve_runtime_provider_with_anthropic_env_lock(
-                        resolve_runtime_provider,
-                        requested=_main_provider,
-                    )
-                    _main_api_key = _rt.get("api_key")
-                    if not _main_provider:
-                        _main_provider = _rt.get("provider")
-                    if not _main_base_url:
-                        _main_base_url = _rt.get("base_url")
-                except Exception as _e:
-                    logger.debug("update summary runtime provider resolution failed: %s", _e)
-                if isinstance(_main_provider, str) and _main_provider.startswith("custom:"):
-                    _cp_key, _cp_base = resolve_custom_provider_connection(_main_provider)
-                    if not _main_api_key and _cp_key:
-                        _main_api_key = _cp_key
-                    if not _main_base_url and _cp_base:
-                        _main_base_url = _cp_base
-
-                main_runtime = {
-                    "provider": _main_provider,
-                    "model": _main_model,
-                    "base_url": _main_base_url,
-                    "api_key": _main_api_key,
-                }
-
-                ensure_agent_runtime_current()
-                try:
-                    from agent.auxiliary_client import get_text_auxiliary_client
-
-                    # Update summaries are a short text-compression/summarization task.
-                    # Reuse the documented auxiliary.compression slot instead of
-                    # inventing a WebUI-only auxiliary task name that users cannot
-                    # discover in the Hermes Agent setup/config UI.
-                    aux_client, aux_model = get_text_auxiliary_client(
-                        "compression",
-                        main_runtime=main_runtime,
-                    )
-                    if aux_client is not None and aux_model:
-                        response = aux_client.chat.completions.create(
-                            model=aux_model,
-                            messages=messages,
-                        )
-                        return str(response.choices[0].message.content or "").strip()
-                except Exception as _e:
-                    logger.debug("update summary auxiliary model failed; falling back to main model: %s", _e)
-
-                AIAgent = require_ai_agent_class()
-
-                agent = AIAgent(
-                    model=_main_model,
-                    provider=_main_provider,
-                    base_url=_main_base_url,
-                    api_key=_main_api_key,
-                    platform="webui",
-                    quiet_mode=True,
-                    enabled_toolsets=[],
-                    session_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
-                )
-                result = agent.run_conversation(
-                    user_message=user_prompt,
-                    system_message=system_prompt,
-                    conversation_history=[],
-                    task_id=f"updates-summary-{uuid.uuid4().hex[:8]}",
-                )
-                return str(result.get("final_response") or "").strip()
-
-        return j(handler, summarize_update_payload(updates, llm_callback=_llm_update_summary, target=target))
+        return _handle_update_summary(handler, body)
 
     # ── CLI session import (POST) ──
     if parsed.path == "/api/session/import_cli":
@@ -24633,10 +24808,43 @@ def _handle_git_discard(handler, body):
         return _git_bad(handler, e)
 
 
-def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) -> str:
+def _llm_git_commit_message(
+    system_prompt: str,
+    user_prompt: str,
+    session=None,
+    *,
+    commit=None,
+):
+    session_id = str(getattr(session, "session_id", "") or "git-commit-message")
+    profile = str(getattr(session, "profile", "") or "").strip() or None
+    run_id = f"git-commit-message-{uuid.uuid4().hex}"
+    with admitted_auxiliary_run(
+        run_id,
+        session_id=session_id,
+        profile=profile,
+        phase="auxiliary-running",
+        backend="git-commit-message",
+    ) as lease:
+        result = _llm_git_commit_message_admitted(
+            system_prompt,
+            user_prompt,
+            session=session,
+            profile=lease.profile,
+        )
+        with lease.commit_guard():
+            return commit(result) if callable(commit) else result
+
+
+def _llm_git_commit_message_admitted(
+    system_prompt: str,
+    user_prompt: str,
+    session=None,
+    *,
+    profile: str | None = None,
+) -> str:
     from api import profiles as profiles_api
 
-    active_profile = profiles_api.get_active_profile_name() or "default"
+    active_profile = str(profile or profiles_api.get_active_profile_name() or "default")
     with profiles_api.profile_env_for_background_worker(
         active_profile,
         "git commit message",
@@ -24704,6 +24912,12 @@ def _llm_git_commit_message(system_prompt: str, user_prompt: str, session=None) 
                     messages=messages,
                 )
                 return str(response.choices[0].message.content or "").strip()
+        except (
+            AgentRuntimeChangedError,
+            ProfileGenerationMismatch,
+            RunAdmissionRejected,
+        ):
+            raise
         except Exception as _e:
             logger.debug("git commit message auxiliary model failed; falling back to main model: %s", _e)
 
@@ -24741,12 +24955,26 @@ def _handle_git_commit_message(handler, body):
         workspace = Path(session.workspace)
 
         prompt = staged_commit_message_prompt(workspace)
-        message = clean_generated_commit_message(
-            _llm_git_commit_message(prompt["system_prompt"], prompt["user_prompt"], session=session)
+
+        def _commit(raw_message):
+            message = clean_generated_commit_message(raw_message)
+            if not message:
+                raise GitWorkspaceError("No commit message was generated")
+            return j(
+                handler,
+                {
+                    "ok": True,
+                    "message": message,
+                    "truncated": bool(prompt.get("truncated")),
+                },
+            )
+
+        return _llm_git_commit_message(
+            prompt["system_prompt"],
+            prompt["user_prompt"],
+            session=session,
+            commit=_commit,
         )
-        if not message:
-            raise GitWorkspaceError("No commit message was generated")
-        return j(handler, {"ok": True, "message": message, "truncated": bool(prompt.get("truncated"))})
     except KeyError:
         return bad(handler, "Session not found", 404)
     except ValueError as e:
@@ -24757,6 +24985,14 @@ def _handle_git_commit_message(handler, body):
         return j(handler, {
             "error": str(e),
             "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
+    except RunAdmissionRejected as e:
+        return j(handler, e.payload, status=503)
+    except ProfileGenerationMismatch as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "profile_generation_stale",
             "retryable": True,
         }, status=409)
     except Exception as e:
@@ -24778,12 +25014,26 @@ def _handle_git_commit_message_selected(handler, body):
         workspace = Path(session.workspace)
 
         prompt = selected_commit_message_prompt(workspace, paths)
-        message = clean_generated_commit_message(
-            _llm_git_commit_message(prompt["system_prompt"], prompt["user_prompt"], session=session)
+
+        def _commit(raw_message):
+            message = clean_generated_commit_message(raw_message)
+            if not message:
+                raise GitWorkspaceError("No commit message was generated")
+            return j(
+                handler,
+                {
+                    "ok": True,
+                    "message": message,
+                    "truncated": bool(prompt.get("truncated")),
+                },
+            )
+
+        return _llm_git_commit_message(
+            prompt["system_prompt"],
+            prompt["user_prompt"],
+            session=session,
+            commit=_commit,
         )
-        if not message:
-            raise GitWorkspaceError("No commit message was generated")
-        return j(handler, {"ok": True, "message": message, "truncated": bool(prompt.get("truncated"))})
     except KeyError:
         return bad(handler, "Session not found", 404)
     except ValueError as e:
@@ -24794,6 +25044,14 @@ def _handle_git_commit_message_selected(handler, body):
         return j(handler, {
             "error": str(e),
             "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
+    except RunAdmissionRejected as e:
+        return j(handler, e.payload, status=503)
+    except ProfileGenerationMismatch as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "profile_generation_stale",
             "retryable": True,
         }, status=409)
     except Exception as e:
@@ -26086,7 +26344,12 @@ def _manual_compression_status_payload(job):
     return payload
 
 
-def _run_manual_compression_job(sid, body):
+def _run_manual_compression_job(
+    sid,
+    body,
+    run_id=None,
+    lease: AuxiliaryRunLease | None = None,
+):
     memory_handler = _ManualCompressionMemoryHandler()
     try:
         try:
@@ -26096,38 +26359,70 @@ def _run_manual_compression_job(sid, body):
         if session is not None:
             from api import profiles as profiles_api
 
-            with profiles_api.profile_env_for_background_worker(session, "manual compression", logger_override=logger):
-                _handle_session_compress(memory_handler, body)
-        else:
+            with profiles_api.profile_env_for_background_worker(
+                lease.profile if lease is not None else session,
+                "manual compression",
+                logger_override=logger,
+            ):
+                if lease is None:
+                    _handle_session_compress(memory_handler, body)
+                else:
+                    _handle_session_compress(
+                        memory_handler,
+                        body,
+                        lease=lease,
+                    )
+        elif lease is None:
             _handle_session_compress(memory_handler, body)
+        else:
+            _handle_session_compress(memory_handler, body, lease=lease)
         status = int(memory_handler.status or 500)
         payload = memory_handler.payload()
-        with _MANUAL_COMPRESSION_JOBS_LOCK:
-            job = _MANUAL_COMPRESSION_JOBS.get(sid)
-            if not job:
-                return
-            now = time.time()
-            if status >= 400 or not isinstance(payload, dict) or payload.get("error"):
-                job.update(
-                    {
-                        "status": "error",
-                        "error": str((payload or {}).get("error") or "Compression failed"),
-                        "error_status": status,
-                        "error_type": (payload or {}).get("type"),
-                        "retryable": (payload or {}).get("retryable"),
-                        "updated_at": now,
-                    }
-                )
-            else:
-                job.update(
-                    {
-                        "status": "done",
-                        "result": payload,
-                        "updated_at": now,
-                    }
-                )
-    except AgentRuntimeChangedError as exc:
-        logger.warning("Manual compression worker found stale Agent runtime for session %s", sid)
+
+        def _publish_terminal_job():
+            with _MANUAL_COMPRESSION_JOBS_LOCK:
+                job = _MANUAL_COMPRESSION_JOBS.get(sid)
+                if not job:
+                    return
+                now = time.time()
+                if status >= 400 or not isinstance(payload, dict) or payload.get("error"):
+                    job.update(
+                        {
+                            "status": "error",
+                            "error": str((payload or {}).get("error") or "Compression failed"),
+                            "error_status": status,
+                            "error_type": (payload or {}).get("type"),
+                            "retryable": (payload or {}).get("retryable"),
+                            "updated_at": now,
+                        }
+                    )
+                else:
+                    job.update(
+                        {
+                            "status": "done",
+                            "result": payload,
+                            "updated_at": now,
+                        }
+                    )
+
+        if lease is None:
+            _publish_terminal_job()
+        else:
+            # The session write and the asynchronous job publication are two
+            # distinct externally visible commits. Revalidate the same lease
+            # after persistence and hold it through terminal status mutation.
+            with lease.commit_guard():
+                _publish_terminal_job()
+    except (AgentRuntimeChangedError, ProfileGenerationMismatch) as exc:
+        error_type = (
+            "profile_generation_stale"
+            if isinstance(exc, ProfileGenerationMismatch)
+            else "agent_runtime_stale"
+        )
+        logger.warning(
+            "Manual compression worker found stale runtime/Profile for session %s",
+            sid,
+        )
         with _MANUAL_COMPRESSION_JOBS_LOCK:
             job = _MANUAL_COMPRESSION_JOBS.get(sid)
             if job:
@@ -26136,7 +26431,7 @@ def _run_manual_compression_job(sid, body):
                         "status": "error",
                         "error": str(exc),
                         "error_status": 409,
-                        "error_type": "agent_runtime_stale",
+                        "error_type": error_type,
                         "retryable": True,
                         "updated_at": time.time(),
                     }
@@ -26154,6 +26449,11 @@ def _run_manual_compression_job(sid, body):
                         "updated_at": time.time(),
                     }
                 )
+    finally:
+        if lease is not None:
+            lease.release()
+        elif run_id:
+            api_config.unregister_active_run(run_id)
 
 
 def _handle_session_compress_start(handler, body):
@@ -26189,9 +26489,76 @@ def _handle_session_compress_start(handler, body):
             if existing_payload.get("status") == "running":
                 return j(handler, existing_payload)
 
-    # Reject a stale local Agent runtime before creating the asynchronous job.
+    # Admit before inspecting the local Agent revision, then hold the same gate
+    # through job publication and successful worker start. A managed drain can
+    # therefore observe either no job at all or one count-visible active run.
+    now = time.time()
+    run_id = f"manual-compression-{uuid.uuid4().hex}"
+    job = None
+    lease = None
     try:
-        ensure_agent_runtime_current()
+        with run_admission_transaction():
+            lease = register_admitted_auxiliary_run(
+                run_id,
+                session_id=sid,
+                profile=str(getattr(s, "profile", "") or "").strip() or None,
+                phase="auxiliary-running",
+                backend="manual-compression",
+                started_at=now,
+            )
+            try:
+                ensure_agent_runtime_current()
+
+                # Another start request may have admitted a job while the first
+                # idempotence check ran. Re-check under the job lock.
+                with _MANUAL_COMPRESSION_JOBS_LOCK:
+                    _manual_compression_cleanup_locked(now)
+                    existing = _MANUAL_COMPRESSION_JOBS.get(sid)
+                    if existing:
+                        existing_payload = _manual_compression_status_payload(existing)
+                        if existing_payload.get("status") == "running":
+                            lease.release()
+                            lease = None
+                            return j(handler, existing_payload)
+                        # Stage-344 Opus SHOULD-FIX (#2128): always start fresh on re-invoke.
+                        # The prior implementation short-circuited and returned a stale `done`
+                        # payload for the full 10-minute TTL window when /compress/start was
+                        # re-invoked, so a user closing the tab mid-compress and re-running
+                        # /compress on a fresh open would get the previous result back rather
+                        # than a new compression. Drop the entry and fall through to the
+                        # fresh-worker path below.
+                        _MANUAL_COMPRESSION_JOBS.pop(sid, None)
+                    job = {
+                        "session_id": sid,
+                        "focus_topic": focus_topic,
+                        "status": "running",
+                        "run_id": run_id,
+                        "started_at": now,
+                        "updated_at": now,
+                    }
+                    _MANUAL_COMPRESSION_JOBS[sid] = job
+
+                worker = threading.Thread(
+                    target=_run_manual_compression_job,
+                    args=(sid, job_body, run_id, lease),
+                    name=f"manual-compress-{sid[:8]}",
+                    daemon=True,
+                )
+                worker.start()
+                lease = None  # Worker owns the admitted run after start succeeds.
+            except BaseException:
+                with _MANUAL_COMPRESSION_JOBS_LOCK:
+                    current = _MANUAL_COMPRESSION_JOBS.get(sid)
+                    if current is job or (
+                        isinstance(current, dict) and current.get("run_id") == run_id
+                    ):
+                        _MANUAL_COMPRESSION_JOBS.pop(sid, None)
+                if lease is not None:
+                    lease.release()
+                    lease = None
+                raise
+    except RunAdmissionRejected as exc:
+        return j(handler, exc.payload, status=503)
     except AgentRuntimeChangedError as exc:
         return j(
             handler,
@@ -26202,41 +26569,19 @@ def _handle_session_compress_start(handler, body):
             },
             status=409,
         )
-
-    # Another start request may have admitted a job while the runtime check ran.
-    # Re-check under the lock so only one worker is created.
-    now = time.time()
-    with _MANUAL_COMPRESSION_JOBS_LOCK:
-        _manual_compression_cleanup_locked(now)
-        existing = _MANUAL_COMPRESSION_JOBS.get(sid)
-        if existing:
-            existing_payload = _manual_compression_status_payload(existing)
-            if existing_payload.get("status") == "running":
-                return j(handler, existing_payload)
-            # Stage-344 Opus SHOULD-FIX (#2128): always start fresh on re-invoke.
-            # The prior implementation short-circuited and returned a stale `done`
-            # payload for the full 10-minute TTL window when /compress/start was
-            # re-invoked, so a user closing the tab mid-compress and re-running
-            # /compress on a fresh open would get the previous result back rather
-            # than a new compression. Drop the entry and fall through to the
-            # fresh-worker path below.
-            _MANUAL_COMPRESSION_JOBS.pop(sid, None)
-        job = {
-            "session_id": sid,
-            "focus_topic": focus_topic,
-            "status": "running",
-            "started_at": now,
-            "updated_at": now,
-        }
-        _MANUAL_COMPRESSION_JOBS[sid] = job
-
-    worker = threading.Thread(
-        target=_run_manual_compression_job,
-        args=(sid, job_body),
-        name=f"manual-compress-{sid[:8]}",
-        daemon=True,
-    )
-    worker.start()
+    except ProfileGenerationMismatch as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "profile_generation_stale",
+                "retryable": True,
+            },
+            status=409,
+        )
+    except Exception as exc:
+        logger.warning("Failed to start manual compression for session %s: %s", sid, exc)
+        return bad(handler, f"Failed to start compression: {_sanitize_error(exc)}", 500)
 
     with _MANUAL_COMPRESSION_JOBS_LOCK:
         return j(handler, _manual_compression_status_payload(_MANUAL_COMPRESSION_JOBS.get(sid, job)))
@@ -26261,7 +26606,66 @@ def _handle_session_compress_status(handler, sid):
         return j(handler, payload)
 
 
-def _handle_session_compress(handler, body):
+def _handle_session_compress(
+    handler,
+    body,
+    *,
+    lease: AuxiliaryRunLease | None = None,
+):
+    if lease is not None:
+        return _handle_session_compress_admitted(handler, body, lease=lease)
+
+    sid = str(body.get("session_id") or "").strip() if isinstance(body, dict) else ""
+    profile = None
+    if sid:
+        try:
+            profile = str(getattr(get_session(sid), "profile", "") or "").strip() or None
+        except KeyError:
+            pass
+    run_id = f"manual-compression-{uuid.uuid4().hex}"
+    try:
+        with admitted_auxiliary_run(
+            run_id,
+            session_id=sid or "manual-compression",
+            profile=profile,
+            phase="auxiliary-running",
+            backend="manual-compression",
+        ) as admitted_lease:
+            return _handle_session_compress_admitted(
+                handler,
+                body,
+                lease=admitted_lease,
+            )
+    except RunAdmissionRejected as exc:
+        return j(handler, exc.payload, status=503)
+    except AgentRuntimeChangedError as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "agent_runtime_stale",
+                "retryable": True,
+            },
+            status=409,
+        )
+    except ProfileGenerationMismatch as exc:
+        return j(
+            handler,
+            {
+                "error": str(exc),
+                "type": "profile_generation_stale",
+                "retryable": True,
+            },
+            status=409,
+        )
+
+
+def _handle_session_compress_admitted(
+    handler,
+    body,
+    *,
+    lease: AuxiliaryRunLease,
+):
     def _anchor_message_key(m):
         if not isinstance(m, dict):
             return None
@@ -26493,79 +26897,113 @@ def _handle_session_compress(handler, body):
             focus_topic=focus_topic,
         )
 
-        with _cfg._get_session_agent_lock(sid):
-            # Re-read messages to detect concurrent edits during the LLM call.
-            # If the history changed, the compression result is stale — abort.
-            current_stream_state = (
-                getattr(s, "active_stream_id", None),
-                getattr(s, "pending_user_message", None),
-                copy.deepcopy(getattr(s, "pending_attachments", None)),
-                getattr(s, "pending_started_at", None),
+        with lease.commit_guard():
+            with _cfg._get_session_agent_lock(sid):
+                # Re-read messages to detect concurrent edits during the LLM call.
+                # If the history changed, the compression result is stale — abort.
+                current_stream_state = (
+                    getattr(s, "active_stream_id", None),
+                    getattr(s, "pending_user_message", None),
+                    copy.deepcopy(getattr(s, "pending_attachments", None)),
+                    getattr(s, "pending_started_at", None),
+                )
+                if current_stream_state != original_stream_state:
+                    return bad(
+                        handler,
+                        "Session stream state changed during compression; please retry.",
+                        409,
+                    )
+                if _sanitize_messages_for_api(s.messages) != original_messages:
+                    return bad(
+                        handler,
+                        "Session was modified during compression; please retry.",
+                        409,
+                    )
+
+                from api.session_ops import _truncation_watermark_for
+                from api.streaming import _stamp_missing_message_timestamps
+
+                compressed_copy = copy.deepcopy(compressed)
+                _stamp_missing_message_timestamps(compressed_copy)
+                s.context_messages = compressed_copy
+                s.active_stream_id = None
+                s.pending_user_message = None
+                s.pending_attachments = []
+                s.pending_started_at = None
+                s.pending_user_source = None
+                visible_after = visible_messages_for_anchor(s.messages, auto_compression=False)
+                s.compression_anchor_visible_idx = (
+                    max(0, len(visible_after) - 1) if visible_after else None
+                )
+                s.compression_anchor_message_key = (
+                    _anchor_message_key(visible_after[-1]) if visible_after else None
+                )
+                summary_text = None
+                if isinstance(summary, dict):
+                    summary_text = (
+                        summary.get("reference_message")
+                        or summary.get("token_line")
+                        or summary.get("headline")
+                    )
+                s.compression_anchor_summary = _compact_summary_text(
+                    summary_text
+                    or _compression_summary_from_messages(compressed)
+                    or ""
+                )
+                # Persist an intentional-shrink boundary so append-only state.db
+                # reconciliation does not replay pre-compression rows (#4836).
+                compress_watermark = _truncation_watermark_for(compressed_copy)
+                s.truncation_watermark = compress_watermark
+                s.truncation_boundary = compress_watermark
+                s.compression_anchor_mode = "manual"
+                s.last_prompt_tokens = new_tokens
+                s.save()
+                # Drop stale backups that would undo an intentional manual compress.
+                try:
+                    s.path.with_suffix(".json.bak").unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            session_payload = redact_session_data(
+                s.compact()
+                | {
+                    "messages": s.messages,
+                    "tool_calls": s.tool_calls,
+                    "active_stream_id": s.active_stream_id,
+                    "pending_user_message": s.pending_user_message,
+                    "pending_attachments": s.pending_attachments,
+                    "pending_started_at": s.pending_started_at,
+                    "compression_anchor_visible_idx": getattr(
+                        s,
+                        "compression_anchor_visible_idx",
+                        None,
+                    ),
+                    "compression_anchor_message_key": getattr(
+                        s,
+                        "compression_anchor_message_key",
+                        None,
+                    ),
+                }
             )
-            if current_stream_state != original_stream_state:
-                return bad(handler, "Session stream state changed during compression; please retry.", 409)
-            if _sanitize_messages_for_api(s.messages) != original_messages:
-                return bad(handler, "Session was modified during compression; please retry.", 409)
-
-            from api.session_ops import _truncation_watermark_for
-            from api.streaming import _stamp_missing_message_timestamps
-
-            compressed_copy = copy.deepcopy(compressed)
-            _stamp_missing_message_timestamps(compressed_copy)
-            s.context_messages = compressed_copy
-            s.active_stream_id = None
-            s.pending_user_message = None
-            s.pending_attachments = []
-            s.pending_started_at = None
-            s.pending_user_source = None
-            visible_after = visible_messages_for_anchor(s.messages, auto_compression=False)
-            s.compression_anchor_visible_idx = max(0, len(visible_after) - 1) if visible_after else None
-            s.compression_anchor_message_key = _anchor_message_key(visible_after[-1]) if visible_after else None
-            summary_text = None
-            if isinstance(summary, dict):
-                summary_text = summary.get("reference_message") or summary.get("token_line") or summary.get("headline")
-            s.compression_anchor_summary = _compact_summary_text(
-                summary_text or _compression_summary_from_messages(compressed) or ""
+            return j(
+                handler,
+                {
+                    "ok": True,
+                    "session": session_payload,
+                    "summary": summary,
+                    "focus_topic": focus_topic,
+                },
             )
-            # Persist an intentional-shrink boundary so append-only state.db
-            # reconciliation does not replay pre-compression rows (#4836).
-            compress_watermark = _truncation_watermark_for(compressed_copy)
-            s.truncation_watermark = compress_watermark
-            s.truncation_boundary = compress_watermark
-            s.compression_anchor_mode = "manual"
-            s.last_prompt_tokens = new_tokens
-            s.save()
-            # Drop stale backups that would undo an intentional manual compress.
-            try:
-                s.path.with_suffix(".json.bak").unlink(missing_ok=True)
-            except OSError:
-                pass
-
-        session_payload = redact_session_data(
-            s.compact() | {
-                "messages": s.messages,
-                "tool_calls": s.tool_calls,
-                "active_stream_id": s.active_stream_id,
-                "pending_user_message": s.pending_user_message,
-                "pending_attachments": s.pending_attachments,
-                "pending_started_at": s.pending_started_at,
-                "compression_anchor_visible_idx": getattr(s, "compression_anchor_visible_idx", None),
-                "compression_anchor_message_key": getattr(s, "compression_anchor_message_key", None),
-            }
-        )
-        return j(
-            handler,
-            {
-                "ok": True,
-                "session": session_payload,
-                "summary": summary,
-                "focus_topic": focus_topic,
-            },
-        )
     except AgentRuntimeChangedError as e:
         return j(handler, {
             "error": str(e),
             "type": "agent_runtime_stale",
+            "retryable": True,
+        }, status=409)
+    except ProfileGenerationMismatch as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "profile_generation_stale",
             "retryable": True,
         }, status=409)
     except Exception as e:
@@ -26798,14 +27236,23 @@ def _persist_handoff_summary(sid: str, summary: str, channel: str | None, rounds
     """Persist a handoff summary marker across local/session backends."""
     marker = _build_handoff_summary_tool_message(sid, summary, channel, rounds, fallback)
     is_messaging_session = _is_messaging_session_id(sid)
+    persisted_local = False
+    persisted_state_db = False
     if is_messaging_session:
-        _persist_handoff_summary_to_state_db(sid, marker)
-        _persist_handoff_summary_locally(sid, marker)
-        return marker
-    persisted_local = _persist_handoff_summary_locally(sid, marker)
-    if persisted_local:
-        return marker
-    return marker if _persist_handoff_summary_to_state_db(sid, marker) else marker
+        # Messaging sessions are authoritative in state.db, but a local shell
+        # may also exist and should stay refreshable.  Attempt both so one
+        # unavailable backend does not hide a successful durable write.
+        persisted_state_db = _persist_handoff_summary_to_state_db(sid, marker)
+        persisted_local = _persist_handoff_summary_locally(sid, marker)
+    else:
+        persisted_local = _persist_handoff_summary_locally(sid, marker)
+        if not persisted_local:
+            persisted_state_db = _persist_handoff_summary_to_state_db(sid, marker)
+    if not (persisted_local or persisted_state_db):
+        raise RuntimeError(
+            f"Could not persist handoff summary for session {sid} to any backend"
+        )
+    return marker
 
 
 def _handle_handoff_summary(handler, body):
@@ -27006,6 +27453,61 @@ def _handle_handoff_summary(handler, body):
             pass
         return channel_label
 
+    def _commit_fallback_handoff_summary(
+        profile_snapshot,
+        summary_text,
+        *,
+        warning=None,
+    ):
+        """Persist and publish a local fallback under one commit boundary."""
+        try:
+            with auxiliary_profile_commit_guard(profile_snapshot):
+                _persist_handoff_summary(
+                    sid,
+                    summary_text,
+                    _resolve_handoff_channel_label(),
+                    rounds,
+                    fallback=True,
+                )
+                response_payload = {
+                    "ok": True,
+                    "summary": summary_text,
+                    "message_count": len(msgs),
+                    "rounds": rounds,
+                    "fallback": True,
+                }
+                if warning:
+                    response_payload["warning"] = warning
+                return j(handler, response_payload)
+        except AgentRuntimeChangedError as exc:
+            return j(
+                handler,
+                {
+                    "error": str(exc),
+                    "type": "agent_runtime_stale",
+                    "retryable": True,
+                },
+                status=409,
+            )
+        except RunAdmissionRejected as exc:
+            return j(handler, exc.payload, status=503)
+        except ProfileGenerationMismatch as exc:
+            return j(
+                handler,
+                {
+                    "error": str(exc),
+                    "type": "profile_generation_stale",
+                    "retryable": True,
+                },
+                status=409,
+            )
+        except Exception as exc:
+            return j(
+                handler,
+                {"error": f"Handoff summary failed: {_sanitize_error(exc)}"},
+                status=500,
+            )
+
     def _agent_text_completion(agent, system_prompt, user_text, max_tokens=700):
         """Use the current Hermes Agent transport without mutating conversation history."""
         api_messages = [
@@ -27086,174 +27588,230 @@ def _handle_handoff_summary(handler, body):
             agent.reasoning_config = previous_reasoning
 
         # Call LLM for summary.
+    model_admission_started = False
+    profile_snapshot = None
     try:
-        ensure_agent_runtime_current()
-        import api.config as _cfg
-        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
-        import hermes_cli.runtime_provider as _runtime_provider
-        AIAgent = require_ai_agent_class()
-
-        # Try to resolve model from an existing session, fall back to default.
+        # Resolve the session Profile first, then reject drains and bind all
+        # provider probing plus eventual fallback/model commits to that exact
+        # Profile incarnation.
         resolved_model = None
-        resolved_provider = None
-        resolved_base_url = None
+        session_profile = None
         try:
             from api.models import get_session
+
             s_obj = get_session(sid)
             resolved_model = getattr(s_obj, "model", None)
+            session_profile = (
+                str(getattr(s_obj, "profile", "") or "").strip() or None
+            )
         except Exception:
             pass
 
-        resolved_model, resolved_provider, resolved_base_url = _cfg.resolve_model_provider(resolved_model)
+        profile_snapshot = capture_auxiliary_profile_snapshot(session_profile)
+        ensure_agent_runtime_current()
+        import api.config as _cfg
+        from api import profiles as profiles_api
+        from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
+        import hermes_cli.runtime_provider as _runtime_provider
 
-        resolved_api_key = None
-        try:
-            _rt = resolve_runtime_provider_with_anthropic_env_lock(
-                _runtime_provider.resolve_runtime_provider,
-                requested=resolved_provider,
+        with profiles_api.profile_env_for_background_worker(
+            profile_snapshot.profile,
+            "handoff summary preparation",
+            logger_override=logger,
+        ):
+            ensure_agent_runtime_current()
+            resolved_model, resolved_provider, resolved_base_url = (
+                _cfg.resolve_model_provider(resolved_model)
             )
-            resolved_api_key = _rt.get("api_key")
-            if not resolved_provider:
-                resolved_provider = _rt.get("provider")
-            if not resolved_base_url:
-                resolved_base_url = _rt.get("base_url")
-        except Exception as _e:
-            logger.warning("resolve_runtime_provider failed for handoff summary: %s", _e)
 
-        if isinstance(resolved_provider, str) and resolved_provider.startswith("custom:"):
-            _cp_key, _cp_base = _cfg.resolve_custom_provider_connection(resolved_provider)
-            if not resolved_api_key and _cp_key:
-                resolved_api_key = _cp_key
-            if not resolved_base_url and _cp_base:
-                resolved_base_url = _cp_base
+            resolved_api_key = None
+            try:
+                _rt = resolve_runtime_provider_with_anthropic_env_lock(
+                    _runtime_provider.resolve_runtime_provider,
+                    requested=resolved_provider,
+                )
+                resolved_api_key = _rt.get("api_key")
+                if not resolved_provider:
+                    resolved_provider = _rt.get("provider")
+                if not resolved_base_url:
+                    resolved_base_url = _rt.get("base_url")
+            except Exception as _e:
+                logger.warning(
+                    "resolve_runtime_provider failed for handoff summary: %s",
+                    _e,
+                )
+
+            if (
+                isinstance(resolved_provider, str)
+                and resolved_provider.startswith("custom:")
+            ):
+                _cp_key, _cp_base = _cfg.resolve_custom_provider_connection(
+                    resolved_provider
+                )
+                if not resolved_api_key and _cp_key:
+                    resolved_api_key = _cp_key
+                if not resolved_base_url and _cp_base:
+                    resolved_base_url = _cp_base
 
         if not resolved_api_key:
             summary_text = _fallback_handoff_summary(msgs)
+            return _commit_fallback_handoff_summary(
+                profile_snapshot,
+                summary_text,
+            )
+
+        model_admission_started = True
+        run_id = f"handoff-summary-{uuid.uuid4().hex}"
+        with admitted_auxiliary_run(
+            run_id,
+            session_id=sid,
+            profile_snapshot=profile_snapshot,
+            phase="auxiliary-running",
+            backend="handoff-summary",
+        ) as lease:
+            from api import profiles as profiles_api
+
+            agent = None
+            model_warning = None
+            summary_text = ""
+            fallback = True
             try:
+                with profiles_api.profile_env_for_background_worker(
+                    lease.profile,
+                    "handoff summary",
+                    logger_override=logger,
+                ):
+                    AIAgent = require_ai_agent_class()
+                    agent = AIAgent(
+                        model=resolved_model,
+                        provider=resolved_provider,
+                        base_url=resolved_base_url,
+                        api_key=resolved_api_key,
+                        platform="webui",
+                        quiet_mode=True,
+                        enabled_toolsets=[],
+                        session_id=sid,
+                    )
+
+                    summary_system_prompt = (
+                        "You are summarizing an external-channel conversation so a Web UI reader "
+                        "can quickly catch up after switching contexts.\n\n"
+                        "Only use the latest messages, and never copy raw transcript lines.\n"
+                        "Do not output role labels (no “你:” / “assistant:” / “user:” / “assistant”).\n"
+                        "Use direct 2–5 bullet points in the conversation language.\n"
+                        "English: speak using “you”.\n"
+                        "中文: 使用“你”。\n\n"
+                        "Focus on:\n"
+                        "- Unfinished tasks or action items\n"
+                        "- Pending questions that need replies\n"
+                        "- Key decisions made\n"
+                        "- Open disagreements or TBD items\n\n"
+                        "If the conversation is purely casual with no actionable items, "
+                        "say so in one sentence."
+                    )
+                    summary_user_text = f"Conversation transcript:\n{transcript}"
+
+                    first_pass = _agent_text_completion(
+                        agent,
+                        summary_system_prompt,
+                        summary_user_text,
+                        max_tokens=700,
+                    )
+                    summary_text = (
+                        first_pass.get("text")
+                        if isinstance(first_pass, dict)
+                        else ""
+                    )
+                    if _agent_summary_incomplete(first_pass):
+                        second_pass = _agent_text_completion(
+                            agent,
+                            summary_system_prompt,
+                            summary_user_text,
+                            max_tokens=1400,
+                        )
+                        summary_text = (
+                            second_pass.get("text")
+                            if isinstance(second_pass, dict)
+                            else ""
+                        )
+                        fallback = _agent_summary_incomplete(second_pass)
+                    else:
+                        fallback = False
+            except (
+                AgentRuntimeChangedError,
+                ProfileGenerationMismatch,
+                RunAdmissionRejected,
+            ):
+                raise
+            except Exception as exc:
+                logger.warning("Handoff summary model failed; using local fallback: %s", exc)
+                model_warning = exc
+                summary_text = ""
+                fallback = True
+            finally:
+                if agent is not None:
+                    try:
+                        agent.release_clients()
+                    except Exception:
+                        pass
+
+            if not summary_text or _summary_output_incomplete(summary_text):
+                summary_text = _fallback_handoff_summary(msgs)
+                fallback = True
+
+            channel_label = _resolve_handoff_channel_label()
+            with lease.commit_guard():
                 _persist_handoff_summary(
                     sid,
                     summary_text,
-                    _resolve_handoff_channel_label(),
+                    channel_label,
                     rounds,
-                    fallback=True,
+                    fallback=fallback,
                 )
-            except Exception:
-                pass
-            return j(handler, {
-                "ok": True,
-                "summary": summary_text,
-                "message_count": len(msgs),
-                "rounds": rounds,
-                "fallback": True,
-            })
-
-        agent = AIAgent(
-            model=resolved_model,
-            provider=resolved_provider,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            platform="webui",
-            quiet_mode=True,
-            enabled_toolsets=[],
-            session_id=sid,
-        )
-
-        summary_system_prompt = (
-            "You are summarizing an external-channel conversation so a Web UI reader "
-            "can quickly catch up after switching contexts.\n\n"
-            "Only use the latest messages, and never copy raw transcript lines.\n"
-            "Do not output role labels (no “你:” / “assistant:” / “user:” / “assistant”).\n"
-            "Use direct 2–5 bullet points in the conversation language.\n"
-            "English: speak using “you”.\n"
-            "中文: 使用“你”。\n\n"
-            "Focus on:\n"
-            "- Unfinished tasks or action items\n"
-            "- Pending questions that need replies\n"
-            "- Key decisions made\n"
-            "- Open disagreements or TBD items\n\n"
-            "If the conversation is purely casual with no actionable items, "
-            "say so in one sentence."
-        )
-        summary_user_text = f"Conversation transcript:\n{transcript}"
-
-        try:
-            first_pass = _agent_text_completion(
-                agent,
-                summary_system_prompt,
-                summary_user_text,
-                max_tokens=700,
-            )
-            summary_text = first_pass.get("text") if isinstance(first_pass, dict) else ""
-            if _agent_summary_incomplete(first_pass):
-                second_pass = _agent_text_completion(
-                    agent,
-                    summary_system_prompt,
-                    summary_user_text,
-                    max_tokens=1400,
-                )
-                summary_text = second_pass.get("text") if isinstance(second_pass, dict) else ""
-                if _agent_summary_incomplete(second_pass):
-                    summary_text = _fallback_handoff_summary(msgs)
-                    fallback = True
-                else:
-                    fallback = False
-            else:
-                fallback = False
-        finally:
-            try:
-                agent.release_clients()
-            except Exception:
-                pass
-        if not summary_text:
-            summary_text = _fallback_handoff_summary(msgs)
-            fallback = True
-        elif _summary_output_incomplete(summary_text):
-            if not fallback:
-                fallback = True
-
-        channel_label = _resolve_handoff_channel_label()
-        _persist_handoff_summary(
-            sid,
-            summary_text,
-            channel_label,
-            rounds,
-            fallback=fallback,
-        )
-
-        return j(handler, {
-            "ok": True,
-            "summary": summary_text,
-            "message_count": len(msgs),
-            "rounds": rounds,
-            "fallback": fallback,
-        })
+                response_payload = {
+                    "ok": True,
+                    "summary": summary_text,
+                    "message_count": len(msgs),
+                    "rounds": rounds,
+                    "fallback": fallback,
+                }
+                if model_warning is not None:
+                    response_payload["warning"] = (
+                        "Summary generation used local fallback: "
+                        f"{_sanitize_error(model_warning)}"
+                    )
+                return j(handler, response_payload)
     except AgentRuntimeChangedError as e:
         return j(handler, {
             "error": str(e),
             "type": "agent_runtime_stale",
             "retryable": True,
         }, status=409)
+    except RunAdmissionRejected as e:
+        return j(handler, e.payload, status=503)
+    except ProfileGenerationMismatch as e:
+        return j(handler, {
+            "error": str(e),
+            "type": "profile_generation_stale",
+            "retryable": True,
+        }, status=409)
     except Exception as e:
         logger.warning("Handoff summary generation failed: %s", e)
-        summary_text = _fallback_handoff_summary(msgs)
-        try:
-            _persist_handoff_summary(
-                sid,
-                summary_text,
-                _resolve_handoff_channel_label(),
-                rounds,
-                fallback=True,
+        if model_admission_started or profile_snapshot is None:
+            return bad(
+                handler,
+                f"Handoff summary failed after admission: {_sanitize_error(e)}",
+                500,
             )
-        except Exception:
-            pass
-        return j(handler, {
-            "ok": True,
-            "summary": summary_text,
-            "message_count": len(msgs),
-            "rounds": rounds,
-            "fallback": True,
-            "warning": f"Summary generation used local fallback: {_sanitize_error(e)}",
-        })
+        summary_text = _fallback_handoff_summary(msgs)
+        return _commit_fallback_handoff_summary(
+            profile_snapshot,
+            summary_text,
+            warning=(
+                "Summary generation used local fallback: "
+                f"{_sanitize_error(e)}"
+            ),
+        )
 
 
 def _handle_skill_save(handler, body):

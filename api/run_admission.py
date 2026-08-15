@@ -10,19 +10,26 @@ and every later admission is rejected.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import stat
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
 try:  # Unix production path (Linux/macOS/WSL).
     import fcntl
-except ImportError:  # pragma: no cover - Windows fallback is thread-local only.
+except ImportError:  # pragma: no cover - native Windows.
     fcntl = None
+
+try:  # Native Windows cross-process byte-range locking.
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX.
+    msvcrt = None
 
 from api.config import STATE_DIR
 
@@ -46,6 +53,95 @@ class RunAdmissionRejected(RuntimeError):
 
 class RunAdmissionConflict(RuntimeError):
     """Raised when a different release attempt owns the persistent drain."""
+
+
+@dataclass(frozen=True)
+class AuxiliaryProfileSnapshot:
+    """One resolved Profile incarnation captured before auxiliary preparation."""
+
+    profile: str
+    profile_home: Path
+    profile_generation: str
+    profile_identity: tuple[int, int] | None
+    named_profile: bool
+
+
+@dataclass
+class AuxiliaryRunLease:
+    """Admission record plus the Profile incarnation allowed to commit results."""
+
+    run_id: str
+    session_id: str
+    profile: str
+    profile_home: Path
+    profile_generation: str
+    profile_identity: tuple[int, int] | None
+    named_profile: bool
+    _released: bool = field(default=False, init=False, repr=False)
+    _release_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+
+    def _assert_profile_current_locked(self) -> None:
+        """Verify the captured named Profile while its mutation lock is held."""
+        if not self.named_profile:
+            return
+
+        from api.profile_generation import (
+            ProfileGenerationError,
+            ProfileGenerationMismatch,
+            profile_home_identity,
+            read_profile_generation,
+        )
+
+        try:
+            current_identity = profile_home_identity(self.profile_home)
+            current_generation = read_profile_generation(self.profile_home)
+        except (FileNotFoundError, OSError, ProfileGenerationError) as exc:
+            raise ProfileGenerationMismatch(
+                "Active profile generation changed; reload and retry"
+            ) from exc
+        if (
+            current_identity != self.profile_identity
+            or current_generation != self.profile_generation
+        ):
+            raise ProfileGenerationMismatch(
+                "Active profile generation changed; reload and retry"
+            )
+
+    @contextlib.contextmanager
+    def commit_guard(self) -> Iterator[None]:
+        """Hold commit permission through the caller's final response or write."""
+        from api.agent_runtime import ensure_agent_runtime_current
+
+        if not self.named_profile:
+            ensure_agent_runtime_current()
+            yield
+            return
+
+        from api.skill_ui_descriptions import skill_transaction
+
+        with skill_transaction(str(self.profile_home)):
+            ensure_agent_runtime_current()
+            self._assert_profile_current_locked()
+            yield
+
+    def assert_current(self) -> None:
+        """Reject results produced by a stale Agent or Profile incarnation."""
+        with self.commit_guard():
+            pass
+
+    def release(self) -> None:
+        """Idempotently remove this run from the worker-lifecycle registry."""
+        from api import config
+
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+        config.unregister_active_run(self.run_id)
 
 
 def run_drain_marker_path() -> Path:
@@ -171,12 +267,32 @@ def _read_marker_locked() -> dict:
 
 
 def _fsync_parent(path: Path) -> None:
+    if os.name == "nt":
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path.parent, flags)
     try:
-        os.fsync(fd)
+        fd = os.open(path.parent, flags)
+    except PermissionError:
+        return
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno not in {
+                errno.EINVAL,
+                errno.ENOTSUP,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            }:
+                raise
     finally:
         os.close(fd)
+
+
+def _set_private_fd_mode(fd: int) -> None:
+    """Tighten a file descriptor where the platform exposes POSIX modes."""
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(fd, 0o600)
 
 
 def _write_marker_locked(payload: dict) -> None:
@@ -199,7 +315,7 @@ def _write_marker_locked(payload: dict) -> None:
     )
     fd = os.open(temp, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        _set_private_fd_mode(fd)
         view = memoryview(raw)
         while view:
             written = os.write(fd, view)
@@ -218,7 +334,6 @@ def _write_marker_locked(payload: dict) -> None:
 
     try:
         os.replace(temp, path)
-        os.chmod(path, 0o600, follow_symlinks=False)
         _fsync_parent(path)
     except BaseException:
         temp.unlink(missing_ok=True)
@@ -243,9 +358,19 @@ def _exclusive_gate() -> Iterator[None]:
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(lock_path, flags, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            _set_private_fd_mode(fd)
             if fcntl is not None:
                 fcntl.flock(fd, fcntl.LOCK_EX)
+            elif msvcrt is not None:
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                    os.fsync(fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                raise RuntimeError(
+                    "cross-process run admission locking is unavailable"
+                )
             _GATE_LOCAL.depth = 1
             try:
                 yield
@@ -253,6 +378,9 @@ def _exclusive_gate() -> Iterator[None]:
                 _GATE_LOCAL.depth = 0
                 if fcntl is not None:
                     fcntl.flock(fd, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         finally:
             os.close(fd)
 
@@ -423,6 +551,165 @@ def register_admitted_run(stream_id: str, *, session_id: str, **metadata) -> Non
         run_metadata.setdefault("phase", "admitted")
         run_metadata.setdefault("started_at", time.time())
         config.register_active_run(stream_id, session_id=session_id, **run_metadata)
+
+
+def _capture_auxiliary_profile_snapshot_locked(
+    profile: str | None = None,
+) -> AuxiliaryProfileSnapshot:
+    """Resolve one Profile incarnation while the admission gate is held."""
+    from api import profiles
+    from api.profile_generation import (
+        ProfileGenerationError,
+        ProfileGenerationMismatch,
+        generation_for_profile_home,
+        is_named_profile_home,
+        profile_home_identity,
+    )
+    from api.skill_ui_descriptions import skill_transaction
+
+    profile_name = str(profile or profiles.get_active_profile_name() or "default")
+    profile_home = Path(
+        profiles.get_hermes_home_for_profile(profile_name)
+    ).expanduser().resolve(strict=False)
+    named_profile = is_named_profile_home(profile_home)
+    profile_identity = None
+    try:
+        if named_profile:
+            with skill_transaction(str(profile_home)):
+                profile_identity = profile_home_identity(profile_home)
+                profile_generation = generation_for_profile_home(
+                    profile_home,
+                    named=True,
+                )
+                if profile_home_identity(profile_home) != profile_identity:
+                    raise ProfileGenerationMismatch(
+                        "Active profile generation changed; reload and retry"
+                    )
+        else:
+            profile_generation = generation_for_profile_home(
+                profile_home,
+                named=False,
+            )
+    except ProfileGenerationMismatch:
+        raise
+    except (FileNotFoundError, OSError, ProfileGenerationError) as exc:
+        raise ProfileGenerationMismatch(
+            "Active profile generation changed; reload and retry"
+        ) from exc
+    return AuxiliaryProfileSnapshot(
+        profile=profile_name,
+        profile_home=profile_home,
+        profile_generation=profile_generation,
+        profile_identity=profile_identity,
+        named_profile=named_profile,
+    )
+
+
+def capture_auxiliary_profile_snapshot(
+    profile: str | None = None,
+) -> AuxiliaryProfileSnapshot:
+    """Reject drains before preparation and capture the selected Profile."""
+    with run_admission_transaction():
+        return _capture_auxiliary_profile_snapshot_locked(profile)
+
+
+def _assert_auxiliary_profile_snapshot_locked(
+    snapshot: AuxiliaryProfileSnapshot,
+) -> None:
+    """Fail closed when preparation crossed a Profile replacement."""
+    probe = _capture_auxiliary_profile_snapshot_locked(snapshot.profile)
+    if probe != snapshot:
+        from api.profile_generation import ProfileGenerationMismatch
+
+        raise ProfileGenerationMismatch(
+            "Active profile generation changed; reload and retry"
+        )
+
+
+@contextlib.contextmanager
+def auxiliary_profile_commit_guard(
+    snapshot: AuxiliaryProfileSnapshot,
+) -> Iterator[None]:
+    """Guard a non-model auxiliary commit without publishing an active run."""
+    from api.agent_runtime import ensure_agent_runtime_current
+
+    with run_admission_transaction():
+        if not snapshot.named_profile:
+            ensure_agent_runtime_current()
+            _assert_auxiliary_profile_snapshot_locked(snapshot)
+            yield
+            return
+
+        from api.skill_ui_descriptions import skill_transaction
+
+        with skill_transaction(str(snapshot.profile_home)):
+            ensure_agent_runtime_current()
+            _assert_auxiliary_profile_snapshot_locked(snapshot)
+            yield
+
+
+def register_admitted_auxiliary_run(
+    run_id: str,
+    *,
+    session_id: str,
+    profile: str | None = None,
+    profile_snapshot: AuxiliaryProfileSnapshot | None = None,
+    **metadata,
+) -> AuxiliaryRunLease:
+    """Admit auxiliary work and bind its eventual commit to one Profile."""
+    from api import config
+
+    with run_admission_transaction():
+        if profile_snapshot is None:
+            snapshot = _capture_auxiliary_profile_snapshot_locked(profile)
+        else:
+            if profile and str(profile) != profile_snapshot.profile:
+                raise ValueError("profile does not match profile_snapshot")
+            _assert_auxiliary_profile_snapshot_locked(profile_snapshot)
+            snapshot = profile_snapshot
+
+        run_metadata = dict(metadata)
+        run_metadata.setdefault("phase", "admitted")
+        run_metadata.setdefault("started_at", time.time())
+        run_metadata.setdefault("profile", snapshot.profile)
+        run_metadata.setdefault("profile_generation", snapshot.profile_generation)
+        config.register_active_run(
+            run_id,
+            session_id=session_id,
+            **run_metadata,
+        )
+        return AuxiliaryRunLease(
+            run_id=run_id,
+            session_id=session_id,
+            profile=snapshot.profile,
+            profile_home=snapshot.profile_home,
+            profile_generation=snapshot.profile_generation,
+            profile_identity=snapshot.profile_identity,
+            named_profile=snapshot.named_profile,
+        )
+
+
+@contextlib.contextmanager
+def admitted_auxiliary_run(
+    run_id: str,
+    *,
+    session_id: str,
+    profile: str | None = None,
+    profile_snapshot: AuxiliaryProfileSnapshot | None = None,
+    **metadata,
+) -> Iterator[AuxiliaryRunLease]:
+    """Count non-SSE model work from admission until its final cleanup."""
+    lease = register_admitted_auxiliary_run(
+        run_id,
+        session_id=session_id,
+        profile=profile,
+        profile_snapshot=profile_snapshot,
+        **metadata,
+    )
+    try:
+        yield lease
+    finally:
+        lease.release()
 
 
 def runtime_admission_snapshot() -> dict:
