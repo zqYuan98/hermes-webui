@@ -64,6 +64,35 @@ def test_process_wide_switch_still_blocks_when_stream_is_active(tmp_path, monkey
         profiles._tls.profile = None
 
 
+def test_process_wide_switch_blocks_when_auxiliary_run_is_active(
+    tmp_path, monkeypatch
+):
+    profiles = _prepare_profile_tree(tmp_path, monkeypatch)
+    from api.config import ACTIVE_RUNS, ACTIVE_RUNS_LOCK, STREAMS, STREAMS_LOCK
+
+    with STREAMS_LOCK:
+        STREAMS.clear()
+    with ACTIVE_RUNS_LOCK:
+        ACTIVE_RUNS.clear()
+        ACTIVE_RUNS["auxiliary-profile-switch"] = {
+            "stream_id": "auxiliary-profile-switch",
+            "session_id": "session-default",
+            "backend": "auxiliary",
+        }
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="Cannot switch profiles while an agent is running",
+        ):
+            profiles.switch_profile("writer", process_wide=True)
+    finally:
+        with ACTIVE_RUNS_LOCK:
+            ACTIVE_RUNS.clear()
+        with STREAMS_LOCK:
+            STREAMS.clear()
+        profiles._tls.profile = None
+
+
 def test_per_client_switch_allowed_when_stream_is_active(tmp_path, monkeypatch):
     profiles = _prepare_profile_tree(tmp_path, monkeypatch)
     from api.config import STREAMS

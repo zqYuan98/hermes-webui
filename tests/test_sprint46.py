@@ -457,6 +457,418 @@ def test_session_compress_start_is_async_and_reuses_running_job(monkeypatch, cle
     assert [m.get("content") for m in persisted.context_messages] == ["one", "four"]
 
 
+def test_session_compress_async_run_is_count_visible_until_worker_finishes(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.config as config
+    import api.routes as routes
+
+    class BlockingCompressor:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            self.entered.set()
+            assert self.release.wait(timeout=5), "test timed out waiting to release compression"
+            return [messages[0], messages[-1]]
+
+    class BlockingAgent:
+        def __init__(self, **kwargs):
+            self.context_compressor = BlockingCompressor()
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    _install_fake_compression_runtime(monkeypatch, BlockingAgent)
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.clear()
+        config.LAST_RUN_FINISHED_AT = None
+
+    try:
+        first = _FakeHandler()
+        routes._handle_session_compress_start(first, {"session_id": sid})
+        assert first.status == 200
+        assert BlockingCompressor.entered.wait(timeout=2)
+
+        with config.ACTIVE_RUNS_LOCK:
+            matching = {
+                run_id: dict(entry)
+                for run_id, entry in config.ACTIVE_RUNS.items()
+                if entry.get("session_id") == sid
+                and entry.get("backend") == "manual-compression"
+            }
+        assert len(matching) == 1
+        run_id = next(iter(matching))
+        assert matching[run_id]["phase"] == "auxiliary-running"
+
+        duplicate = _FakeHandler()
+        routes._handle_session_compress_start(duplicate, {"session_id": sid})
+        assert duplicate.status == 200
+        with config.ACTIVE_RUNS_LOCK:
+            assert [
+                key
+                for key, entry in config.ACTIVE_RUNS.items()
+                if entry.get("session_id") == sid
+                and entry.get("backend") == "manual-compression"
+            ] == [run_id]
+    finally:
+        BlockingCompressor.release.set()
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        with config.ACTIVE_RUNS_LOCK:
+            if run_id not in config.ACTIVE_RUNS:
+                break
+        time.sleep(0.02)
+    with config.ACTIVE_RUNS_LOCK:
+        assert run_id not in config.ACTIVE_RUNS
+        assert isinstance(config.LAST_RUN_FINISHED_AT, float)
+
+
+def test_session_compress_direct_run_is_count_visible_and_cleans_up(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.config as config
+    import api.routes as routes
+
+    observed = []
+
+    class InspectingCompressor:
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            with config.ACTIVE_RUNS_LOCK:
+                observed.extend(
+                    dict(entry)
+                    for entry in config.ACTIVE_RUNS.values()
+                    if entry.get("backend") == "manual-compression"
+                )
+            return [messages[0], messages[-1]]
+
+    class InspectingAgent:
+        def __init__(self, **kwargs):
+            self.context_compressor = InspectingCompressor()
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    _install_fake_compression_runtime(monkeypatch, InspectingAgent)
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.clear()
+
+    handler = _FakeHandler()
+    routes._handle_session_compress(handler, {"session_id": sid})
+
+    assert handler.status == 200
+    assert len(observed) == 1
+    assert observed[0]["session_id"] == sid
+    assert observed[0]["phase"] == "auxiliary-running"
+    with config.ACTIVE_RUNS_LOCK:
+        assert not [
+            entry
+            for entry in config.ACTIVE_RUNS.values()
+            if entry.get("session_id") == sid
+            and entry.get("backend") == "manual-compression"
+        ]
+
+
+def test_session_compress_rechecks_runtime_before_persisting(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.agent_runtime as agent_runtime
+    import api.routes as routes
+
+    compressed = threading.Event()
+
+    class CompletingCompressor:
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            compressed.set()
+            return [messages[0], messages[-1]]
+
+    class CompletingAgent:
+        def __init__(self, **kwargs):
+            self.context_compressor = CompletingCompressor()
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    before = Session.load(sid).compact()
+    _install_fake_compression_runtime(monkeypatch, CompletingAgent)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: CompletingAgent)
+    monkeypatch.setattr(
+        agent_runtime,
+        "ensure_agent_runtime_current",
+        lambda: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("runtime changed during compression")
+        ),
+    )
+
+    handler = _FakeHandler()
+    routes._handle_session_compress(handler, {"session_id": sid})
+
+    assert compressed.is_set()
+    assert handler.status == 409
+    assert handler.payload() == {
+        "error": "runtime changed during compression",
+        "type": "agent_runtime_stale",
+        "retryable": True,
+    }
+    assert Session.load(sid).compact() == before
+
+
+def test_session_compress_profile_stale_is_typed_and_does_not_persist(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.routes as routes
+
+    compressed = threading.Event()
+
+    class CompletingCompressor:
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            compressed.set()
+            return [messages[0], messages[-1]]
+
+    class CompletingAgent:
+        def __init__(self, **kwargs):
+            self.context_compressor = CompletingCompressor()
+
+    class StaleLease:
+        profile = "default"
+
+        @contextlib.contextmanager
+        def commit_guard(self):
+            raise routes.ProfileGenerationMismatch("profile changed")
+            yield
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    before = Session.load(sid).compact()
+    _install_fake_compression_runtime(monkeypatch, CompletingAgent)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: CompletingAgent)
+
+    handler = _FakeHandler()
+    routes._handle_session_compress(
+        handler,
+        {"session_id": sid},
+        lease=StaleLease(),
+    )
+
+    assert compressed.is_set()
+    assert handler.status == 409
+    assert handler.payload() == {
+        "error": "profile changed",
+        "type": "profile_generation_stale",
+        "retryable": True,
+    }
+    assert Session.load(sid).compact() == before
+
+
+def test_session_compress_async_runtime_stale_does_not_persist_and_cleans_run(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.agent_runtime as agent_runtime
+    import api.config as config
+    import api.routes as routes
+
+    compressed = threading.Event()
+
+    class CompletingCompressor:
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            compressed.set()
+            return [messages[0], messages[-1]]
+
+    class CompletingAgent:
+        def __init__(self, **kwargs):
+            self.context_compressor = CompletingCompressor()
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    before = Session.load(sid).compact()
+    _install_fake_compression_runtime(monkeypatch, CompletingAgent)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: CompletingAgent)
+    monkeypatch.setattr(
+        agent_runtime,
+        "ensure_agent_runtime_current",
+        lambda: (_ for _ in ()).throw(
+            routes.AgentRuntimeChangedError("runtime changed during compression")
+        ),
+    )
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.clear()
+
+    start = _FakeHandler()
+    routes._handle_session_compress_start(start, {"session_id": sid})
+    assert start.status == 200
+    assert compressed.wait(timeout=2)
+
+    deadline = time.time() + 5
+    error_payload = None
+    while time.time() < deadline:
+        status = _FakeHandler()
+        routes._handle_session_compress_status(status, sid)
+        payload = status.payload()
+        if payload.get("status") == "error":
+            error_payload = payload
+            break
+        time.sleep(0.02)
+
+    assert error_payload is not None
+    assert error_payload["error_status"] == 409
+    assert error_payload["type"] == "agent_runtime_stale"
+    assert error_payload["retryable"] is True
+    assert Session.load(sid).compact() == before
+    with config.ACTIVE_RUNS_LOCK:
+        assert not [
+            entry
+            for entry in config.ACTIVE_RUNS.values()
+            if entry.get("session_id") == sid
+            and entry.get("backend") == "manual-compression"
+        ]
+
+
+def test_session_compress_async_profile_stale_is_typed_and_cleans_run(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.config as config
+    import api.routes as routes
+
+    compressed = threading.Event()
+
+    class CompletingCompressor:
+        def compress(self, messages, current_tokens=None, focus_topic=None):
+            compressed.set()
+            return [messages[0], messages[-1]]
+
+    class CompletingAgent:
+        def __init__(self, **kwargs):
+            self.context_compressor = CompletingCompressor()
+
+    @contextlib.contextmanager
+    def stale_commit_guard(_lease):
+        raise routes.ProfileGenerationMismatch("profile changed during compression")
+        yield
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    before = Session.load(sid).compact()
+    _install_fake_compression_runtime(monkeypatch, CompletingAgent)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: CompletingAgent)
+    monkeypatch.setattr(
+        routes.AuxiliaryRunLease,
+        "commit_guard",
+        stale_commit_guard,
+    )
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.clear()
+
+    start = _FakeHandler()
+    routes._handle_session_compress_start(start, {"session_id": sid})
+    assert start.status == 200
+    assert compressed.wait(timeout=2)
+
+    deadline = time.time() + 5
+    error_payload = None
+    while time.time() < deadline:
+        status = _FakeHandler()
+        routes._handle_session_compress_status(status, sid)
+        payload = status.payload()
+        if payload.get("status") == "error":
+            error_payload = payload
+            break
+        time.sleep(0.02)
+
+    assert error_payload is not None
+    assert error_payload["error_status"] == 409
+    assert error_payload["type"] == "profile_generation_stale"
+    assert error_payload["retryable"] is True
+    assert Session.load(sid).compact() == before
+    with config.ACTIVE_RUNS_LOCK:
+        assert not [
+            entry
+            for entry in config.ACTIVE_RUNS.values()
+            if entry.get("session_id") == sid
+            and entry.get("backend") == "manual-compression"
+        ]
+
+
+def test_session_compress_start_drain_rejects_before_runtime_and_job_publication(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.config as config
+    import api.routes as routes
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    payload = {
+        "error": "draining",
+        "type": "service_draining",
+        "retryable": True,
+    }
+
+    class RejectingAdmission:
+        def __enter__(self):
+            raise routes.RunAdmissionRejected(payload)
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(routes, "run_admission_transaction", lambda: RejectingAdmission())
+    monkeypatch.setattr(
+        routes,
+        "ensure_agent_runtime_current",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("runtime check ran before drain admission")
+        ),
+    )
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        routes._MANUAL_COMPRESSION_JOBS.pop(sid, None)
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.clear()
+
+    handler = _FakeHandler()
+    routes._handle_session_compress_start(handler, {"session_id": sid})
+
+    assert handler.status == 503
+    assert handler.payload() == payload
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        assert sid not in routes._MANUAL_COMPRESSION_JOBS
+    with config.ACTIVE_RUNS_LOCK:
+        assert config.ACTIVE_RUNS == {}
+
+
+def test_session_compress_start_failure_rolls_back_job_and_active_run(
+    monkeypatch, cleanup_test_sessions
+):
+    import api.config as config
+    import api.routes as routes
+
+    sid = _make_session()
+    cleanup_test_sessions.append(sid)
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr(routes.threading, "Thread", FailingThread)
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        routes._MANUAL_COMPRESSION_JOBS.pop(sid, None)
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.clear()
+
+    handler = _FakeHandler()
+    routes._handle_session_compress_start(handler, {"session_id": sid})
+
+    assert handler.status == 500
+    assert "failed to start" in handler.payload()["error"].lower()
+    with routes._MANUAL_COMPRESSION_JOBS_LOCK:
+        assert sid not in routes._MANUAL_COMPRESSION_JOBS
+    with config.ACTIVE_RUNS_LOCK:
+        assert config.ACTIVE_RUNS == {}
+
+
 def test_session_compress_status_reports_worker_error_without_raw_paths(monkeypatch, cleanup_test_sessions):
     import api.routes as routes
 

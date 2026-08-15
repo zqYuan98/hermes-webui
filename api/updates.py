@@ -27,6 +27,8 @@ from urllib.parse import urlparse
 from api.agent_health import get_active_profile_gateway_running_pid
 from api.gateway_restart import restart_active_profile_gateway
 from api.profiles import get_active_profile_name
+from api.profile_generation import ProfileGenerationMismatch
+from api.run_admission import RunAdmissionRejected
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
 
 logger = logging.getLogger(__name__)
@@ -1599,14 +1601,26 @@ def _update_summary_prompt(details: list[dict]) -> tuple[str, str]:
     return system, '\n'.join(user_lines)
 
 
-def summarize_update_payload(updates: dict, llm_callback=None, *, target: str | None = None, use_cache: bool = True) -> dict:
+def summarize_update_payload(
+    updates: dict,
+    llm_callback=None,
+    *,
+    target: str | None = None,
+    use_cache: bool = True,
+    llm_runner=None,
+    result_commit=None,
+    local_result_commit=None,
+):
     """Build a human-readable What's New summary and keep regular diff comparison links.
 
-    ``llm_callback`` receives ``(system_prompt, user_prompt)`` and returns text.
-    The caller may wire that to AIAgent; this module keeps a deterministic
-    fallback so the banner remains useful when no LLM provider is configured.
-    Summaries are cached per exact update range so refreshes do not generate
-    slightly different wording for the same available updates.
+    ``llm_callback`` is the backwards-compatible two-argument model callback.
+    ``llm_runner`` additionally receives ``commit=...`` and is responsible for
+    invoking that callback while its admission lease is still current. This
+    lets the WebUI route keep formatting, cache mutation, and response
+    construction inside the same Profile/runtime commit guard.
+    ``local_result_commit`` runs one callable inside the equivalent guarded
+    publication boundary for cache hits and deterministic fallbacks without
+    counting them as model work.
     """
     if not isinstance(updates, dict):
         updates = {}
@@ -1619,9 +1633,11 @@ def summarize_update_payload(updates: dict, llm_callback=None, *, target: str | 
         if not isinstance(info, dict) or int(info.get('behind') or 0) <= 0:
             continue
         commit_limit = 24
-        commits, commits_truncated = _commit_subjects_for_update_with_limit({'name': key, **info}, limit=commit_limit)
+        commits, commits_truncated = _commit_subjects_for_update_with_limit(
+            {'name': key, **info}, limit=commit_limit
+        )
         behind = int(info.get('behind') or 0)
-        item = {
+        details.append({
             'name': key,
             'label': label,
             'behind': behind,
@@ -1630,47 +1646,76 @@ def summarize_update_payload(updates: dict, llm_callback=None, *, target: str | 
             'compare_url': info.get('compare_url'),
             'commits': commits,
             'commits_limit': commit_limit,
-            'commits_truncated': bool(commits_truncated or (commits and behind > len(commits))),
-        }
-        details.append(item)
-    cache_key = _summary_cache_key(updates, details)
-    if use_cache:
-        with _cache_lock:
-            cached = _summary_cache.get(cache_key)
-            if cached:
-                _summary_cache.move_to_end(cache_key)
-        if cached:
-            result = dict(cached)
-            result['cached'] = True
-            return result
+            'commits_truncated': bool(
+                commits_truncated or (commits and behind > len(commits))
+            ),
+        })
 
-    generated_by = 'fallback'
+    cache_key = _summary_cache_key(updates, details)
+
+    def _deliver(result):
+        return result_commit(result) if callable(result_commit) else result
+
+    def _commit_local(operation):
+        if callable(local_result_commit):
+            return local_result_commit(operation)
+        return operation()
+
+    if use_cache:
+        cache_miss = object()
+
+        def _deliver_cached():
+            with _cache_lock:
+                cached = _summary_cache.get(cache_key)
+                if not cached:
+                    return cache_miss
+                _summary_cache.move_to_end(cache_key)
+                result = dict(cached)
+            result['cached'] = True
+            return _deliver(result)
+
+        cached_result = _commit_local(_deliver_cached)
+        if cached_result is not cache_miss:
+            return cached_result
+
+    def _finalize(raw_candidate):
+        candidate = str(raw_candidate or '').strip()
+        generated_by = 'llm' if candidate else 'fallback'
+        sections, summary = _format_update_summary_sections(candidate, details)
+        result = {
+            'ok': True,
+            'summary': summary,
+            'summary_sections': sections,
+            'generated_by': generated_by,
+            'cached': False,
+            'cache_key': cache_key,
+            'target': requested_target,
+            'targets': details,
+        }
+        if use_cache:
+            with _cache_lock:
+                if (
+                    len(_summary_cache) >= _SUMMARY_CACHE_MAX
+                    and cache_key not in _summary_cache
+                ):
+                    _summary_cache.popitem(last=False)
+                _summary_cache[cache_key] = dict(result)
+        return _deliver(result)
+
+    if details and callable(llm_runner):
+        system, prompt = _update_summary_prompt(details)
+        return llm_runner(system, prompt, commit=_finalize)
+
     candidate = ''
     if details and callable(llm_callback):
         system, prompt = _update_summary_prompt(details)
         try:
-            candidate = (llm_callback(system, prompt) or '').strip()
-            if candidate:
-                generated_by = 'llm'
+            candidate = llm_callback(system, prompt) or ''
+        except (RunAdmissionRejected, ProfileGenerationMismatch):
+            raise
         except Exception:
             candidate = ''
-    sections, summary = _format_update_summary_sections(candidate, details)
-    result = {
-        'ok': True,
-        'summary': summary,
-        'summary_sections': sections,
-        'generated_by': generated_by,
-        'cached': False,
-        'cache_key': cache_key,
-        'target': requested_target,
-        'targets': details,
-    }
-    if use_cache:
-        with _cache_lock:
-            if len(_summary_cache) >= _SUMMARY_CACHE_MAX and cache_key not in _summary_cache:
-                _summary_cache.popitem(last=False)
-            _summary_cache[cache_key] = dict(result)
-    return result
+    return _commit_local(lambda: _finalize(candidate))
 
 
 # ── Self-update application ───────────────────────────────────────────────────

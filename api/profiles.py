@@ -1601,11 +1601,14 @@ def _switch_profile_process_wide(name: str) -> tuple[Path, dict, bool]:
     global _active_profile
 
     from api.config import (
+        ACTIVE_RUNS,
+        ACTIVE_RUNS_LOCK,
         STREAMS,
         STREAMS_LOCK,
         get_config_snapshot,
         reload_config,
     )
+    from api.run_admission import run_admission_transaction
     from api.skill_ui_descriptions import profile_transaction
 
     root_home = _DEFAULT_HERMES_HOME.expanduser().resolve()
@@ -1623,22 +1626,28 @@ def _switch_profile_process_wide(name: str) -> tuple[Path, dict, bool]:
         root_home,
         candidate_home,
     )
-    with profile_transaction(lock_homes):
-        is_root = _is_root_profile(name)
-        if isolated:
-            home = candidate_home
-        elif is_root:
-            home = root_home
-        else:
-            home = candidate_home
-            if not home.is_dir():
-                raise ValueError(f"Profile '{name}' does not exist.")
+    # Admission gate is outermost so the empty lifecycle check and process-wide
+    # publication are one atomic boundary with every chat/auxiliary admission.
+    # Profile transactions remain inside that gate for filesystem consistency.
+    with run_admission_transaction():
+        with profile_transaction(lock_homes):
+            is_root = _is_root_profile(name)
+            if isolated:
+                home = candidate_home
+            elif is_root:
+                home = root_home
+            else:
+                home = candidate_home
+                if not home.is_dir():
+                    raise ValueError(f"Profile '{name}' does not exist.")
 
-        # Profile transaction is always outermost. Holding STREAMS_LOCK through
-        # the global mutation prevents a new run from being admitted after the
-        # empty check but before HERMES_HOME/config publication completes.
-        with STREAMS_LOCK:
-            if STREAMS:
+            # Admission publication owns ACTIVE_RUNS_LOCK and STREAMS_LOCK only
+            # separately while the shared gate excludes new registrations.
+            with ACTIVE_RUNS_LOCK:
+                active_runs = bool(ACTIVE_RUNS)
+            with STREAMS_LOCK:
+                active_streams = bool(STREAMS)
+            if active_runs or active_streams:
                 raise RuntimeError(
                     'Cannot switch profiles while an agent is running. '
                     'Cancel or wait for it to finish.'

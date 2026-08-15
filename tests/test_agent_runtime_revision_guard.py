@@ -446,7 +446,6 @@ def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gatew
     """The barrier and worker must share one immutable backend decision."""
     from api import routes
     from api import turn_journal
-    from api.config import unregister_stream_owner
 
     gateway_reads = []
     revision_checks = []
@@ -511,9 +510,7 @@ def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gatew
         assert worker_targets == [expected_worker]
     finally:
         stream_id = str(response.get("stream_id") or "")
-        with routes.STREAMS_LOCK:
-            routes.STREAMS.pop(stream_id, None)
-        unregister_stream_owner(stream_id)
+        routes.rollback_admitted_stream(stream_id)
         routes.STREAM_GOAL_RELATED.pop(stream_id, None)
 
 

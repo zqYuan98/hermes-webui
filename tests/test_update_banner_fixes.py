@@ -1665,6 +1665,7 @@ class TestUpdateSummaryRouteModelSelection:
 
         captured = {}
         profile_home = tmp_path / 'profiles' / 'work'
+        profile_home.mkdir(parents=True)
         fake_skill_module = types.ModuleType('tools.skills_tool')
         setattr(fake_skill_module, 'HERMES_HOME', 'default-home')
         setattr(fake_skill_module, 'SKILLS_DIR', 'default-home/skills')

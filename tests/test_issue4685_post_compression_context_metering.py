@@ -1,9 +1,42 @@
 import json
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _install_token_estimator_modules(
+    monkeypatch,
+    *,
+    request_estimator=None,
+    message_estimator=None,
+    budget_estimator=None,
+):
+    """Install per-test estimator modules without process-wide leakage."""
+    agent_package = sys.modules.get("agent")
+    if agent_package is None:
+        agent_package = types.ModuleType("agent")
+        agent_package.__path__ = []
+        monkeypatch.setitem(sys.modules, "agent", agent_package)
+
+    metadata = types.ModuleType("agent.model_metadata")
+    if request_estimator is not None:
+        metadata.estimate_request_tokens_rough = request_estimator
+    if message_estimator is not None:
+        metadata.estimate_messages_tokens_rough = message_estimator
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", metadata)
+    monkeypatch.setattr(agent_package, "model_metadata", metadata, raising=False)
+
+    if budget_estimator is None:
+        return None
+    compressor = types.ModuleType("agent.context_compressor")
+    compressor._estimate_msg_budget_tokens = budget_estimator
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor)
+    monkeypatch.setattr(agent_package, "context_compressor", compressor, raising=False)
+    return compressor
 
 
 def _run_context_indicator(usage):
@@ -60,7 +93,7 @@ def test_post_compression_estimate_uses_pruned_request_and_preserves_last_prompt
         calls.append((messages, system_prompt, tools))
         return 4_096
 
-    monkeypatch.setattr("agent.model_metadata.estimate_request_tokens_rough", estimate, raising=False)
+    _install_token_estimator_modules(monkeypatch, request_estimator=estimate)
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
 
@@ -77,8 +110,7 @@ def test_post_compression_estimate_falls_back_when_request_estimator_is_unavaila
         calls.append(messages)
         return len(messages) * 100
 
-    monkeypatch.delattr("agent.model_metadata.estimate_request_tokens_rough", raising=False)
-    monkeypatch.setattr("agent.model_metadata.estimate_messages_tokens_rough", estimate_messages, raising=False)
+    _install_token_estimator_modules(monkeypatch, message_estimator=estimate_messages)
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
 
@@ -91,14 +123,15 @@ def test_post_compression_estimate_falls_back_when_request_estimator_is_unavaila
 
 
 def test_post_compression_estimate_uses_compressor_budget_counter_without_metadata_estimators(monkeypatch):
-    import pytest
-
     from api.streaming import _estimate_post_compression_context_tokens
 
-    context_compressor = pytest.importorskip("agent.context_compressor")
+    def estimate_budget(message):
+        return len(str(message.get("content") or "")) + 10
 
-    monkeypatch.delattr("agent.model_metadata.estimate_request_tokens_rough", raising=False)
-    monkeypatch.delattr("agent.model_metadata.estimate_messages_tokens_rough", raising=False)
+    context_compressor = _install_token_estimator_modules(
+        monkeypatch,
+        budget_estimator=estimate_budget,
+    )
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
     expected_messages = [

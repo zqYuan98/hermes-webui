@@ -304,6 +304,596 @@ def test_stale_runtime_handoff_summary_returns_typed_409_without_persisting(monk
     }
 
 
+def test_handoff_summary_drain_returns_typed_503_without_persisting(monkeypatch):
+    """Drain rejection must not be downgraded to a persisted fallback summary."""
+    import contextlib
+
+    import api.config as cfg
+    import api.models as models
+    import api.routes as routes
+
+    payload = {
+        "error": "draining",
+        "type": "service_draining",
+        "retryable": True,
+    }
+    monkeypatch.setattr(routes, "require", lambda body, *keys: None)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, body, status=200, extra_headers=None: {
+            "status": status,
+            "payload": body,
+        },
+    )
+    monkeypatch.setattr(
+        models,
+        "count_conversation_rounds",
+        lambda sid, since=None: models.CONVERSATION_ROUND_THRESHOLD,
+    )
+    monkeypatch.setattr(
+        models,
+        "get_cli_session_messages",
+        lambda sid: [
+            {"role": "user", "content": "Need a handoff", "timestamp": 1.0},
+            {"role": "assistant", "content": "Context is ready", "timestamp": 2.0},
+        ],
+    )
+    monkeypatch.setattr(
+        routes,
+        "_persist_handoff_summary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("drain rejection persisted a fallback summary")
+        ),
+    )
+    monkeypatch.setattr(
+        cfg,
+        "resolve_model_provider",
+        lambda resolved_model=None: ("gpt-test", "openrouter", None),
+    )
+
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = lambda requested=None: {
+        "api_key": "configured-key",
+        "provider": "openrouter",
+        "base_url": None,
+    }
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.__path__ = []
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
+
+    @contextlib.contextmanager
+    def reject(*_args, **_kwargs):
+        raise routes.RunAdmissionRejected(payload)
+        yield
+
+    monkeypatch.setattr(routes, "admitted_auxiliary_run", reject)
+    monkeypatch.setattr(
+        routes,
+        "require_ai_agent_class",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Agent constructed before handoff admission")
+        ),
+    )
+
+    response = routes._handle_handoff_summary(object(), {"session_id": "drained-handoff"})
+
+    assert response == {"status": 503, "payload": payload}
+
+
+def test_handoff_summary_model_run_is_count_visible_and_cleans_up(monkeypatch):
+    """Real handoff model work must be visible in the unified active-run registry."""
+    import api.agent_runtime as agent_runtime
+    import api.config as cfg
+    import api.models as models
+    import api.routes as routes
+
+    sid = "handoff-count-visible"
+    observed = []
+    persisted = []
+
+    monkeypatch.setattr(routes, "require", lambda body, *keys: None)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200, extra_headers=None: {
+            "status": status,
+            "payload": payload,
+        },
+    )
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(agent_runtime, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(
+        models,
+        "count_conversation_rounds",
+        lambda _sid, since=None: models.CONVERSATION_ROUND_THRESHOLD,
+    )
+    monkeypatch.setattr(
+        models,
+        "get_cli_session_messages",
+        lambda _sid: [
+            {"role": "user", "content": "What remains?", "timestamp": 1.0},
+            {"role": "assistant", "content": "One review remains.", "timestamp": 2.0},
+        ],
+    )
+    monkeypatch.setattr(
+        models,
+        "get_session",
+        lambda _sid: types.SimpleNamespace(model="gpt-test", profile="default"),
+    )
+    monkeypatch.setattr(
+        cfg,
+        "resolve_model_provider",
+        lambda resolved_model=None: ("gpt-test", "openrouter", None),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_persist_handoff_summary",
+        lambda *args, **kwargs: persisted.append((args, kwargs)) or {"ok": True},
+    )
+
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = lambda requested=None: {
+        "api_key": "configured-key",
+        "provider": "openrouter",
+        "base_url": None,
+    }
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.__path__ = []
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
+
+    def completion_create(*args, **kwargs):
+        with cfg.ACTIVE_RUNS_LOCK:
+            active = [
+                dict(entry)
+                for entry in cfg.ACTIVE_RUNS.values()
+                if entry.get("backend") == "handoff-summary"
+            ]
+        observed.append(active)
+        return types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(content="- You should complete the review."),
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ]
+        )
+
+    class _CountingAgent:
+        api_mode = ""
+
+        def __init__(self, *args, **kwargs):
+            self.model = kwargs.get("model")
+            self.reasoning_config = None
+
+        def _build_api_kwargs(self, *args, **kwargs):
+            return {}
+
+        def _ensure_primary_openai_client(self, reason=None):
+            return types.SimpleNamespace(
+                chat=types.SimpleNamespace(
+                    completions=types.SimpleNamespace(create=completion_create)
+                )
+            )
+
+        def release_clients(self):
+            return None
+
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: _CountingAgent)
+    with cfg.ACTIVE_RUNS_LOCK:
+        cfg.ACTIVE_RUNS.clear()
+
+    response = routes._handle_handoff_summary(object(), {"session_id": sid})
+
+    assert response["status"] == 200
+    assert response["payload"]["ok"] is True
+    assert len(observed) == 1
+    assert len(observed[0]) == 1
+    assert observed[0][0]["session_id"] == sid
+    assert observed[0][0]["profile"] == "default"
+    assert len(persisted) == 1
+    with cfg.ACTIVE_RUNS_LOCK:
+        assert cfg.ACTIVE_RUNS == {}
+
+
+def test_handoff_summary_rechecks_lease_before_persisting(monkeypatch):
+    """A stale Profile result must not be persisted or downgraded to fallback."""
+    import contextlib
+
+    import api.config as cfg
+    import api.models as models
+    import api.routes as routes
+
+    sid = "handoff-profile-stale"
+    persisted = []
+    admitted_kwargs = []
+    commit_calls = []
+    profile_snapshot = types.SimpleNamespace(profile="work")
+
+    monkeypatch.setattr(routes, "require", lambda body, *keys: None)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200, extra_headers=None: {
+            "status": status,
+            "payload": payload,
+        },
+    )
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(
+        routes,
+        "capture_auxiliary_profile_snapshot",
+        lambda profile=None: profile_snapshot if profile == "work" else None,
+    )
+    monkeypatch.setattr(
+        models,
+        "count_conversation_rounds",
+        lambda _sid, since=None: models.CONVERSATION_ROUND_THRESHOLD,
+    )
+    monkeypatch.setattr(
+        models,
+        "get_cli_session_messages",
+        lambda _sid: [
+            {"role": "user", "content": "Prepare a handoff.", "timestamp": 1.0},
+            {"role": "assistant", "content": "The handoff is ready.", "timestamp": 2.0},
+        ],
+    )
+    monkeypatch.setattr(
+        models,
+        "get_session",
+        lambda _sid: types.SimpleNamespace(model="gpt-test", profile="work"),
+    )
+    monkeypatch.setattr(
+        cfg,
+        "resolve_model_provider",
+        lambda resolved_model=None: ("gpt-test", "openrouter", None),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_persist_handoff_summary",
+        lambda *args, **kwargs: persisted.append((args, kwargs)) or {"ok": True},
+    )
+
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = lambda requested=None: {
+        "api_key": "configured-key",
+        "provider": "openrouter",
+        "base_url": None,
+    }
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.__path__ = []
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
+
+    class _CompletingAgent:
+        api_mode = ""
+
+        def __init__(self, *args, **kwargs):
+            self.model = kwargs.get("model")
+            self.reasoning_config = None
+
+        def _build_api_kwargs(self, *args, **kwargs):
+            return {}
+
+        def _ensure_primary_openai_client(self, reason=None):
+            return types.SimpleNamespace(
+                chat=types.SimpleNamespace(
+                    completions=types.SimpleNamespace(
+                        create=lambda **kwargs: types.SimpleNamespace(
+                            choices=[
+                                types.SimpleNamespace(
+                                    message=types.SimpleNamespace(
+                                        content="- You should continue with the pending review."
+                                    ),
+                                    finish_reason="stop",
+                                    stop_reason=None,
+                                )
+                            ]
+                        )
+                    )
+                )
+            )
+
+        def release_clients(self):
+            return None
+
+    class _StaleLease:
+        profile = "work"
+
+        @contextlib.contextmanager
+        def commit_guard(self):
+            commit_calls.append(True)
+            raise routes.ProfileGenerationMismatch("profile changed")
+            yield
+
+    @contextlib.contextmanager
+    def admitted(*args, **kwargs):
+        admitted_kwargs.append(dict(kwargs))
+        yield _StaleLease()
+
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: _CompletingAgent)
+    monkeypatch.setattr(routes, "admitted_auxiliary_run", admitted)
+
+    response = routes._handle_handoff_summary(object(), {"session_id": sid})
+
+    assert admitted_kwargs == [
+        {
+            "session_id": sid,
+            "profile_snapshot": profile_snapshot,
+            "phase": "auxiliary-running",
+            "backend": "handoff-summary",
+        }
+    ]
+    assert commit_calls == [True]
+    assert persisted == []
+    assert response == {
+        "status": 409,
+        "payload": {
+            "error": "profile changed",
+            "type": "profile_generation_stale",
+            "retryable": True,
+        },
+    }
+
+
+def test_handoff_commit_failure_does_not_persist_outside_lease(monkeypatch):
+    """Once admitted, a commit failure must not trigger an unguarded second write."""
+    import contextlib
+
+    import api.config as cfg
+    import api.models as models
+    import api.routes as routes
+
+    sid = "handoff-commit-failure"
+    persist_attempts = []
+
+    monkeypatch.setattr(routes, "require", lambda body, *keys: None)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200, extra_headers=None: {
+            "status": status,
+            "payload": payload,
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "bad",
+        lambda _handler, message, status=400: {
+            "status": status,
+            "payload": {"error": message},
+        },
+    )
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(
+        models,
+        "count_conversation_rounds",
+        lambda _sid, since=None: models.CONVERSATION_ROUND_THRESHOLD,
+    )
+    monkeypatch.setattr(
+        models,
+        "get_cli_session_messages",
+        lambda _sid: [
+            {"role": "user", "content": "Prepare a handoff.", "timestamp": 1.0},
+            {"role": "assistant", "content": "The handoff is ready.", "timestamp": 2.0},
+        ],
+    )
+    monkeypatch.setattr(
+        models,
+        "get_session",
+        lambda _sid: types.SimpleNamespace(model="gpt-test", profile="default"),
+    )
+    monkeypatch.setattr(
+        cfg,
+        "resolve_model_provider",
+        lambda resolved_model=None: ("gpt-test", "openrouter", None),
+    )
+
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = lambda requested=None: {
+        "api_key": "configured-key",
+        "provider": "openrouter",
+        "base_url": None,
+    }
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.__path__ = []
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
+
+    class _CompletingAgent:
+        api_mode = ""
+
+        def __init__(self, *args, **kwargs):
+            self.model = kwargs.get("model")
+            self.reasoning_config = None
+
+        def _build_api_kwargs(self, *args, **kwargs):
+            return {}
+
+        def _ensure_primary_openai_client(self, reason=None):
+            return types.SimpleNamespace(
+                chat=types.SimpleNamespace(
+                    completions=types.SimpleNamespace(
+                        create=lambda **kwargs: types.SimpleNamespace(
+                            choices=[
+                                types.SimpleNamespace(
+                                    message=types.SimpleNamespace(
+                                        content="- You should finish the pending review."
+                                    ),
+                                    finish_reason="stop",
+                                    stop_reason=None,
+                                )
+                            ]
+                        )
+                    )
+                )
+            )
+
+        def release_clients(self):
+            return None
+
+    class _Lease:
+        profile = "default"
+
+        @contextlib.contextmanager
+        def commit_guard(self):
+            yield
+
+    @contextlib.contextmanager
+    def admitted(*args, **kwargs):
+        yield _Lease()
+
+    def fail_persist(*args, **kwargs):
+        persist_attempts.append((args, kwargs))
+        raise RuntimeError("intentional persistence failure")
+
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: _CompletingAgent)
+    monkeypatch.setattr(routes, "admitted_auxiliary_run", admitted)
+    monkeypatch.setattr(routes, "_persist_handoff_summary", fail_persist)
+
+    response = routes._handle_handoff_summary(object(), {"session_id": sid})
+
+    assert len(persist_attempts) == 1
+    assert response == {
+        "status": 500,
+        "payload": {
+            "error": "Handoff summary failed after admission: intentional persistence failure"
+        },
+    }
+
+
+def test_exception_handoff_summary_fallback_rechecks_lease_before_persisting(
+    monkeypatch,
+):
+    """A model failure may fall back, but stale leases must still block commit."""
+    import contextlib
+
+    import api.config as cfg
+    import api.models as models
+    import api.routes as routes
+
+    persisted = []
+    commit_calls = []
+    profile_snapshot = types.SimpleNamespace(profile="work")
+    monkeypatch.setattr(routes, "require", lambda body, *keys: None)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200, extra_headers=None: {
+            "status": status,
+            "payload": payload,
+        },
+    )
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", lambda: None)
+    monkeypatch.setattr(
+        routes,
+        "capture_auxiliary_profile_snapshot",
+        lambda profile=None: profile_snapshot if profile == "work" else None,
+    )
+    monkeypatch.setattr(
+        models,
+        "count_conversation_rounds",
+        lambda sid, since=None: models.CONVERSATION_ROUND_THRESHOLD,
+    )
+    monkeypatch.setattr(
+        models,
+        "get_cli_session_messages",
+        lambda sid: [
+            {"role": "user", "content": "Could you check this?", "timestamp": 1.0},
+            {"role": "assistant", "content": "Sure, I can help", "timestamp": 2.0},
+        ],
+    )
+    monkeypatch.setattr(
+        models,
+        "get_session",
+        lambda sid: types.SimpleNamespace(model="gpt-test", profile="work"),
+    )
+    monkeypatch.setattr(
+        cfg,
+        "resolve_model_provider",
+        lambda resolved_model=None: ("gpt-test", "openrouter", None),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_persist_handoff_summary",
+        lambda *args, **kwargs: persisted.append((args, kwargs)) or {"ok": True},
+    )
+
+    fake_runtime_module = types.ModuleType("hermes_cli.runtime_provider")
+    fake_runtime_module.resolve_runtime_provider = lambda requested=None: {
+        "api_key": "configured-key",
+        "provider": "openrouter",
+        "base_url": None,
+    }
+    fake_hermes_cli = types.ModuleType("hermes_cli")
+    fake_hermes_cli.__path__ = []
+    fake_hermes_cli.runtime_provider = fake_runtime_module
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", fake_runtime_module)
+
+    class _FailingAgent:
+        api_mode = ""
+
+        def __init__(self, *args, **kwargs):
+            self.model = kwargs.get("model")
+            self.reasoning_config = None
+
+        def _build_api_kwargs(self, *args, **kwargs):
+            return {}
+
+        def _ensure_primary_openai_client(self, reason=None):
+            def fail(**kwargs):
+                raise RuntimeError("intentional handoff-summary failure")
+
+            return types.SimpleNamespace(
+                chat=types.SimpleNamespace(
+                    completions=types.SimpleNamespace(create=fail)
+                )
+            )
+
+        def release_clients(self):
+            return None
+
+    class _StaleLease:
+        profile = "work"
+
+        @contextlib.contextmanager
+        def commit_guard(self):
+            commit_calls.append(True)
+            raise routes.ProfileGenerationMismatch("profile changed")
+            yield
+
+    @contextlib.contextmanager
+    def admitted(*args, **kwargs):
+        assert kwargs["profile_snapshot"] is profile_snapshot
+        yield _StaleLease()
+
+    monkeypatch.setattr(routes, "require_ai_agent_class", lambda: _FailingAgent)
+    monkeypatch.setattr(routes, "admitted_auxiliary_run", admitted)
+
+    response = routes._handle_handoff_summary(
+        object(), {"session_id": "handoff-failure-stale"}
+    )
+
+    assert commit_calls == [True]
+    assert persisted == []
+    assert response == {
+        "status": 409,
+        "payload": {
+            "error": "profile changed",
+            "type": "profile_generation_stale",
+            "retryable": True,
+        },
+    }
+
+
 def test_exception_handoff_summary_persists_fallback_summary(monkeypatch):
     """Unhandled summary exception should still persist a fallback handoff marker."""
     import api.routes as routes
