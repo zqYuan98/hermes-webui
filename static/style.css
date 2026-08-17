@@ -2821,7 +2821,7 @@
   /* container-type/name lets descendants run @container queries against the
      panel's width so the header can collapse less-essential elements as the
      user resizes the panel narrower. */
-  .rightpanel{width:300px;background:var(--sidebar);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;min-width:0;opacity:1;transform:translateX(0);transform-origin:right center;transition:width .24s cubic-bezier(.22,1,.36,1),opacity .18s ease,transform .24s cubic-bezier(.22,1,.36,1),border-color .24s ease;container-type:inline-size;container-name:rightpanel;}
+  .rightpanel{width:300px;background:var(--sidebar);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;min-width:0;opacity:1;transform:translateX(0);transform-origin:right center;/* Width is intentionally discrete: interpolating it reflows the full three-column chat layout every frame and stalls pointer input on long transcripts. */transition:opacity .18s ease,transform .24s cubic-bezier(.22,1,.36,1),border-color .24s ease;container-type:inline-size;container-name:rightpanel;}
   .panel-header{padding:12px 16px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:6px;overflow:visible;}
   .workspace-panel-title-group{grid-column:1;grid-row:1;display:flex;align-items:center;min-width:0;}
   .workspace-panel-title-group > span:first-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}

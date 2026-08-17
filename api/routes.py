@@ -14146,6 +14146,9 @@ def handle_get(handler, parsed) -> bool:
         include_ui = _webui_query_truthy(qs.get("include_ui", [None])[0])
         if include_ui:
             from api.profile_generation import ProfileGenerationError
+            from api.skill_ui_descriptions import (
+                SharedProfileMutationLockUnavailable,
+            )
             try:
                 with _locked_skill_profile_context() as context:
                     _assert_skill_profile_context_current(context)
@@ -14160,6 +14163,16 @@ def handle_get(handler, parsed) -> bool:
                         profile_key=context.profile_key,
                         profile_generation=context.generation,
                     )
+            except SharedProfileMutationLockUnavailable as exc:
+                logger.warning(
+                    "Skill UI descriptions are unavailable; falling back to "
+                    "the runtime-only list: %s",
+                    exc,
+                )
+                data = _skills_list_from_dir(
+                    _active_skills_dir(), category=category
+                )
+                return j(handler, {"skills": data.get("skills", [])})
             except (
                 OSError,
                 TypeError,
@@ -14248,7 +14261,10 @@ def handle_get(handler, parsed) -> bool:
         include_ui = _webui_query_truthy(qs.get("include_ui", [None])[0])
         if include_ui:
             from api.profile_generation import ProfileGenerationError
-            from api.skill_ui_descriptions import get_ui_description_state
+            from api.skill_ui_descriptions import (
+                SharedProfileMutationLockUnavailable,
+                get_ui_description_state,
+            )
 
             try:
                 with _locked_skill_profile_context() as context:
@@ -14287,6 +14303,15 @@ def handle_get(handler, parsed) -> bool:
                     if ui_state.get("stale"):
                         data["ui_description_stale"] = True
                     data["profile_generation"] = context.generation
+            except SharedProfileMutationLockUnavailable as exc:
+                logger.warning(
+                    "Skill UI descriptions are unavailable; falling back to "
+                    "the runtime-only detail: %s",
+                    exc,
+                )
+                data = _skill_view_from_active_dir(name)
+                if not isinstance(data.get("linked_files"), dict):
+                    data["linked_files"] = {}
             except (
                 OSError,
                 TypeError,

@@ -108,6 +108,42 @@ def test_outline_opt_in_layout_and_render_state_contract():
     assert "window._outlineRenderHooked = true" not in missing_render_block
 
 
+def test_outline_resize_updates_stay_scoped_off_the_document_root():
+    """Workspace-panel resizing must not invalidate the full long transcript.
+
+    ``--outline-workspace-offset`` is consumed only by the floating outline
+    wrapper.  Putting it on ``:root`` made every ResizeObserver callback during
+    the right-panel width animation trigger a document-wide style recalc, which
+    manifested as pointer lag on long sessions.  Keep the write local, skip all
+    work while the outline is closed, and deduplicate unchanged widths.
+    """
+    sync_start = OUTLINE_JS.index("function _syncOutlinePosition()")
+    sync_end = OUTLINE_JS.index("\n}\n\nfunction applyConversationOutlinePreference", sync_start)
+    sync_body = OUTLINE_JS[sync_start:sync_end]
+
+    assert "if (!_panelOpen) return;" in sync_body
+    assert "document.getElementById('outlinePanelWrapper')" in sync_body
+    assert "wrapper.style.setProperty('--outline-workspace-offset', offset)" in sync_body
+    assert "root.style.setProperty('--outline-workspace-offset'" not in OUTLINE_JS
+    assert "if (offset === _outlineWorkspaceOffset) return;" in sync_body
+    assert "let _outlineWorkspaceOffset = '';" in OUTLINE_JS
+
+
+def test_workspace_panel_width_switch_is_discrete_for_long_transcripts():
+    """The right rail may fade/translate, but its width must not interpolate.
+
+    Width animation reflows the sidebar, transcript, composer, and workspace
+    rail on every frame.  On long transcripts that monopolizes the main thread
+    and makes pointer movement appear stuck while the rail opens or closes.
+    """
+    right_panel = _css_rule_body(".rightpanel")
+
+    assert "transition:" in right_panel
+    assert "opacity .18s ease" in right_panel
+    assert "transform .24s" in right_panel
+    assert not re.search(r"transition:[^;]*\bwidth\b", right_panel)
+
+
 def test_outline_is_chat_only_and_closes_on_panel_switch():
     """The outline is a chat-view affordance: leaving chat must hide the toggle
     AND close the panel, and returning to chat restores the toggle. (Auto-close

@@ -850,6 +850,100 @@ def test_profile_transaction_delegates_complete_key_set_to_agent(monkeypatch):
     assert entered == [("/profiles/b", "/profiles/a", "/profiles/b")]
 
 
+def test_ui_list_read_falls_back_when_agent_shared_lock_api_is_missing(monkeypatch):
+    import hermes_constants
+    import api.routes as routes
+
+    skills_dir = pathlib.Path("/profiles/default/skills")
+    expected_skills = [{"name": "demo", "description": "Runtime only"}]
+    calls = []
+
+    monkeypatch.delattr(hermes_constants, "profile_mutation_locks", raising=False)
+    monkeypatch.setattr(routes, "_active_skills_dir", lambda: skills_dir)
+
+    def fake_list(
+        selected_dir,
+        category=None,
+        *,
+        profile_home=None,
+        include_runtime_paths=False,
+    ):
+        calls.append(
+            (selected_dir, category, profile_home, include_runtime_paths)
+        )
+        return {"skills": expected_skills}
+
+    monkeypatch.setattr(routes, "_skills_list_from_dir", fake_list)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200: {"status": status, **payload},
+    )
+
+    payload = routes.handle_get(
+        object(), urllib.parse.urlparse("/api/skills?include_ui=1")
+    )
+
+    assert payload == {"status": 200, "skills": expected_skills}
+    assert calls == [(skills_dir, None, None, False)]
+    assert "profile_generation" not in payload
+    assert "ui_description" not in payload["skills"][0]
+
+
+def test_ui_detail_read_falls_back_when_agent_shared_lock_api_is_missing(monkeypatch):
+    import hermes_constants
+    import api.routes as routes
+
+    skills_dir = pathlib.Path("/profiles/default/skills")
+    monkeypatch.delattr(hermes_constants, "profile_mutation_locks", raising=False)
+    monkeypatch.setattr(routes, "_active_skills_dir", lambda: skills_dir)
+    monkeypatch.setattr(
+        routes,
+        "_skill_view_from_active_dir",
+        lambda name: {
+            "name": name,
+            "content": "---\nname: demo\ndescription: Runtime only\n---\n",
+            "linked_files": None,
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200: {"status": status, **payload},
+    )
+
+    payload = routes.handle_get(
+        object(),
+        urllib.parse.urlparse(
+            "/api/skills/content?name=demo&include_ui=1"
+        ),
+    )
+
+    assert payload["status"] == 200
+    assert payload["name"] == "demo"
+    assert payload["linked_files"] == {}
+    assert "profile_generation" not in payload
+    assert "ui_description" not in payload
+
+
+def test_missing_agent_shared_lock_api_keeps_skill_transactions_fail_closed(
+    tmp_path, monkeypatch
+):
+    import hermes_constants
+    import api.skill_ui_descriptions as descriptions
+
+    entered = False
+    monkeypatch.delattr(hermes_constants, "profile_mutation_locks", raising=False)
+
+    with pytest.raises(
+        RuntimeError, match="Hermes Agent shared Profile mutation lock is unavailable"
+    ):
+        with descriptions.skill_transaction(str(tmp_path)):
+            entered = True
+
+    assert entered is False
+
+
 def test_ui_list_read_waits_for_profile_transaction_snapshot(tmp_path, monkeypatch):
     """A UI list read must not observe skill metadata/sidecar mid-commit."""
     import api.routes as routes

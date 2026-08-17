@@ -24,6 +24,11 @@ This file tracks UI bugs and polish items. Fixed items are kept for reference.
 
 ## Fixed
 
+### ~~Opening or closing the workspace sidebar stalled pointer input~~ -- Fixed
+
+- **Was:** The workspace rail animated its `width`, forcing the full three-column chat layout to reflow on every frame. At the same time, the outline `ResizeObserver` wrote `--outline-workspace-offset` on `:root` during each width step, invalidating styles across long transcripts. A 3,000-row Chromium stress probe reproduced roughly 400 ms frame gaps and 2.91 s of style recalculation, making the mouse appear stuck or uncontrolled.
+- **Fix:** Keep the visual opacity/translate transition but switch panel width discretely, scope the outline offset variable to the outline element instead of `:root`, and skip observer writes while the outline is closed. Under the same 4× CPU-throttled probe, maximum frame delay fell to about 67 ms and style recalculation to about 0.15 s; regression tests pin both constraints.
+
 ### ~~External directory views could not upload files~~ -- Fixed
 
 - **Was:** Escape-target grants were correctly read-only, but the workspace Upload button and OS drag/drop were blocked along with every mutation, so an explicitly opened external directory had no safe upload workflow.
