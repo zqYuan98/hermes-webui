@@ -3269,16 +3269,15 @@ def _cancelled_run_is_stale(run_entry) -> bool:
     phase="cancelling". ``started_at`` is accepted as a fallback anchor so runs
     cancelled before the stamp was introduced are still reclaimed eventually.
     """
-    if not isinstance(run_entry, dict) or run_entry.get("phase") != "cancelling":
-        return False
-    anchor = run_entry.get("cancelled_at") or run_entry.get("started_at")
-    if not anchor:
-        return False
     try:
-        age = time.time() - float(anchor)
-    except (TypeError, ValueError):
+        from api import config as _live_config
+
+        return _live_config.active_run_cancel_is_stale(
+            run_entry,
+            grace_seconds=_STALE_CANCELLED_RUN_GRACE_SECONDS,
+        )
+    except Exception:
         return False
-    return age >= _STALE_CANCELLED_RUN_GRACE_SECONDS
 
 
 def _clear_stale_stream_state(session) -> bool:
@@ -23685,6 +23684,12 @@ def _handle_goal_command(handler, body):
         require(body, "session_id")
     except ValueError as e:
         return bad(handler, str(e))
+    if _is_silent_control_message(body.get("args") or body.get("text")):
+        return j(
+            handler,
+            {"status": "suppressed", "reason": "silent_control_message"},
+            status=200,
+        )
     if _session_is_subagent_view_only(str(body.get("session_id") or "")):
         return bad(handler, "Subagent sessions are view-only and cannot run /goal from WebUI", 400)
     try:
