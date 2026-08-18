@@ -50,6 +50,10 @@ class SkillUIDescriptionStale(RuntimeError):
     """Stored UI metadata is not bound to the currently visible Skill bytes."""
 
 
+class SharedProfileMutationLockUnavailable(RuntimeError):
+    """The paired Agent does not expose the shared Profile lock contract."""
+
+
 class _SkillUIDescriptionSnapshot(str):
     """String-compatible rollback value carrying one entry's v2 binding state."""
 
@@ -85,13 +89,21 @@ def _shared_profile_mutation_locks(profile_keys):
     transaction must never silently fall back to a second lock domain.
     """
     try:
-        from hermes_constants import profile_mutation_locks
+        import hermes_constants
     except ModuleNotFoundError as exc:
         if exc.name != "hermes_constants":
             raise
-        raise RuntimeError(
+        raise SharedProfileMutationLockUnavailable(
             "Hermes Agent shared Profile mutation lock is unavailable"
         ) from exc
+
+    profile_mutation_locks = getattr(
+        hermes_constants, "profile_mutation_locks", None
+    )
+    if not callable(profile_mutation_locks):
+        raise SharedProfileMutationLockUnavailable(
+            "Hermes Agent shared Profile mutation lock is unavailable"
+        )
 
     with profile_mutation_locks(profile_keys):
         yield

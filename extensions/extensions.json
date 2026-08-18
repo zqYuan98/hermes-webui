@@ -1,11 +1,25 @@
 {
   "extensions": [
     {
+      "enabled": true,
       "id": "hermes-hub",
       "name": "Hermes Hub",
+      "scripts": [
+        "hub/hub-store.js",
+        "hub/agent-cost.js",
+        "hub/hub.js"
+      ],
+      "stylesheets": [
+        "hub/hub.css"
+      ]
+    },
+    {
       "enabled": true,
-      "stylesheets": ["hub/hub.css"],
-      "scripts": ["hub/hub-store.js", "hub/agent-cost.js", "hub/hub.js"]
+      "id": "skill-zh-mirror",
+      "name": "Skill 中文说明镜像",
+      "scripts": [
+        "skill-zh-mirror/skill-zh-mirror.js"
+      ]
     }
   ]
 }

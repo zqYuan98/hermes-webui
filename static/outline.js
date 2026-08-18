@@ -10,6 +10,7 @@ let _outlineSid = null;       // session id the panel was last built for
 let _panelOpen  = false;      // whether the panel is currently visible
 let _outlineResizeObserver = null;
 let _outlineWorkspaceObserver = null;
+let _outlineWorkspaceOffset = '';
 
 // Returns the current session id, or null if no session is loaded.
 function _currentSid() {
@@ -30,11 +31,23 @@ function _outlineAllowed() {
 }
 
 function _syncOutlinePosition() {
+  // The offset is consumed only by #outlinePanelWrapper. Writing it to :root
+  // invalidated styles across the entire transcript on every ResizeObserver
+  // callback while the workspace panel animated (or was drag-resized). Long
+  // sessions therefore stalled pointer input for hundreds of milliseconds.
+  // Keep the custom property local and do no layout work while the outline is
+  // closed; toggleOutlinePanel() performs an immediate sync before opening it.
+  if (!_panelOpen) return;
+  const wrapper = document.getElementById('outlinePanelWrapper');
+  if (!wrapper) return;
   const root = document.documentElement;
   const panel = document.querySelector('.rightpanel');
   const open = root.dataset.workspacePanel === 'open';
   const width = open && panel ? Math.max(0, Math.round(panel.offsetWidth || 0)) : 0;
-  root.style.setProperty('--outline-workspace-offset', width + 'px');
+  const offset = width + 'px';
+  if (offset === _outlineWorkspaceOffset) return;
+  _outlineWorkspaceOffset = offset;
+  wrapper.style.setProperty('--outline-workspace-offset', offset);
 }
 
 function applyConversationOutlinePreference() {
@@ -42,12 +55,12 @@ function applyConversationOutlinePreference() {
   const wrapper = document.getElementById('outlinePanelWrapper');
   const enabled = _outlineAllowed();
   document.documentElement.dataset.conversationOutline = enabled ? 'enabled' : 'disabled';
-  _syncOutlinePosition();
   if (toggle) toggle.hidden = !enabled;
   if (!enabled) {
     _panelOpen = false;
     if (wrapper) wrapper.hidden = true;
   }
+  _syncOutlinePosition();
 }
 
 function _expandOutlineRenderWindow() {

@@ -3269,16 +3269,15 @@ def _cancelled_run_is_stale(run_entry) -> bool:
     phase="cancelling". ``started_at`` is accepted as a fallback anchor so runs
     cancelled before the stamp was introduced are still reclaimed eventually.
     """
-    if not isinstance(run_entry, dict) or run_entry.get("phase") != "cancelling":
-        return False
-    anchor = run_entry.get("cancelled_at") or run_entry.get("started_at")
-    if not anchor:
-        return False
     try:
-        age = time.time() - float(anchor)
-    except (TypeError, ValueError):
+        from api import config as _live_config
+
+        return _live_config.active_run_cancel_is_stale(
+            run_entry,
+            grace_seconds=_STALE_CANCELLED_RUN_GRACE_SECONDS,
+        )
+    except Exception:
         return False
-    return age >= _STALE_CANCELLED_RUN_GRACE_SECONDS
 
 
 def _clear_stale_stream_state(session) -> bool:
@@ -14147,6 +14146,9 @@ def handle_get(handler, parsed) -> bool:
         include_ui = _webui_query_truthy(qs.get("include_ui", [None])[0])
         if include_ui:
             from api.profile_generation import ProfileGenerationError
+            from api.skill_ui_descriptions import (
+                SharedProfileMutationLockUnavailable,
+            )
             try:
                 with _locked_skill_profile_context() as context:
                     _assert_skill_profile_context_current(context)
@@ -14161,6 +14163,16 @@ def handle_get(handler, parsed) -> bool:
                         profile_key=context.profile_key,
                         profile_generation=context.generation,
                     )
+            except SharedProfileMutationLockUnavailable as exc:
+                logger.warning(
+                    "Skill UI descriptions are unavailable; falling back to "
+                    "the runtime-only list: %s",
+                    exc,
+                )
+                data = _skills_list_from_dir(
+                    _active_skills_dir(), category=category
+                )
+                return j(handler, {"skills": data.get("skills", [])})
             except (
                 OSError,
                 TypeError,
@@ -14249,7 +14261,10 @@ def handle_get(handler, parsed) -> bool:
         include_ui = _webui_query_truthy(qs.get("include_ui", [None])[0])
         if include_ui:
             from api.profile_generation import ProfileGenerationError
-            from api.skill_ui_descriptions import get_ui_description_state
+            from api.skill_ui_descriptions import (
+                SharedProfileMutationLockUnavailable,
+                get_ui_description_state,
+            )
 
             try:
                 with _locked_skill_profile_context() as context:
@@ -14288,6 +14303,15 @@ def handle_get(handler, parsed) -> bool:
                     if ui_state.get("stale"):
                         data["ui_description_stale"] = True
                     data["profile_generation"] = context.generation
+            except SharedProfileMutationLockUnavailable as exc:
+                logger.warning(
+                    "Skill UI descriptions are unavailable; falling back to "
+                    "the runtime-only detail: %s",
+                    exc,
+                )
+                data = _skill_view_from_active_dir(name)
+                if not isinstance(data.get("linked_files"), dict):
+                    data["linked_files"] = {}
             except (
                 OSError,
                 TypeError,
@@ -23685,6 +23709,12 @@ def _handle_goal_command(handler, body):
         require(body, "session_id")
     except ValueError as e:
         return bad(handler, str(e))
+    if _is_silent_control_message(body.get("args") or body.get("text")):
+        return j(
+            handler,
+            {"status": "suppressed", "reason": "silent_control_message"},
+            status=200,
+        )
     if _session_is_subagent_view_only(str(body.get("session_id") or "")):
         return bad(handler, "Subagent sessions are view-only and cannot run /goal from WebUI", 400)
     try:
