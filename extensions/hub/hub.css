@@ -1149,6 +1149,249 @@ main.main.showing-hub > #mainHub { display: flex; }
 
 .hub-toolbar .hub-input { flex: 1; min-width: 180px; max-width: 340px; }
 
+/* ── Agent 月度成本 ──────────────────────────────────────────────── */
+
+.hub-agent-cost { display: grid; gap: 14px; padding-right: 36px; }
+
+.hub-agent-cost-head {
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.hub-agent-cost-month-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hub-agent-cost-month-control .hub-input {
+  width: 150px;
+  min-width: 0;
+}
+
+.hub-agent-cost .hub-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  margin: 10px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+}
+
+.hub-agent-cost .hub-tab {
+  appearance: none;
+  border: 0;
+  border-radius: 6px;
+  padding: 7px 13px;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hub-agent-cost .hub-tab:hover { color: var(--text); background: var(--surface-hover); }
+.hub-agent-cost .hub-tab.active { color: #111827; background: var(--accent); font-weight: 600; }
+
+.hub-agent-cost-stats {
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  padding-right: 10px;
+}
+
+.hub-agent-cost-metric .hub-stat-value {
+  white-space: nowrap;
+  font-size: clamp(17px, 1.7vw, 22px);
+}
+
+.hub-agent-cost-metric.warning .hub-stat-value,
+.hub-agent-cost-amount.pending { color: var(--warning); }
+
+.hub-agent-cost-note {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.hub-agent-cost-overview {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.hub-agent-cost-panel { margin: 0; }
+.hub-agent-cost-trend-panel { grid-column: 1 / -1; }
+
+.hub-agent-cost-breakdown { display: grid; gap: 10px; }
+
+.hub-agent-cost-breakdown-row {
+  display: grid;
+  grid-template-columns: 96px minmax(80px, 1fr) 100px;
+  align-items: center;
+  gap: 10px;
+  color: var(--text2);
+  font-size: 12px;
+}
+
+.hub-agent-cost-breakdown-row strong {
+  color: var(--text);
+  font-weight: 600;
+  text-align: right;
+}
+
+.hub-agent-cost-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.hub-agent-cost-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.hub-agent-cost-budget {
+  display: grid;
+  grid-template-columns: minmax(130px, .7fr) minmax(180px, 1.3fr) auto;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.hub-agent-cost-trend {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(72px, 1fr));
+  align-items: end;
+  gap: 10px;
+  min-height: 176px;
+}
+
+.hub-agent-cost-trend-item {
+  display: grid;
+  grid-template-rows: auto 112px auto;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.hub-agent-cost-trend-value {
+  overflow: hidden;
+  color: var(--text2);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hub-agent-cost-bar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  height: 112px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--surface2, var(--surface));
+}
+
+.hub-agent-cost-bar i {
+  display: block;
+  width: min(32px, 55%);
+  min-height: 2px;
+  border-radius: 5px 5px 2px 2px;
+  background: var(--accent);
+}
+
+.hub-agent-cost-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.hub-agent-cost-table {
+  width: 100%;
+  min-width: 1080px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.hub-agent-cost-table th,
+.hub-agent-cost-table td:nth-child(2),
+.hub-agent-cost-table td:nth-child(3),
+.hub-agent-cost-table td:nth-child(5),
+.hub-agent-cost-table td:nth-child(6),
+.hub-agent-cost-table td:nth-child(7),
+.hub-agent-cost-table td:nth-child(8),
+.hub-agent-cost-table td:last-child {
+  white-space: nowrap;
+}
+
+.hub-agent-cost-table th,
+.hub-agent-cost-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text2);
+  text-align: left;
+  vertical-align: top;
+}
+
+.hub-agent-cost-table th {
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.hub-agent-cost-table tr:last-child td { border-bottom: none; }
+.hub-agent-cost-table strong { color: var(--text); }
+
+.hub-agent-cost-table small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+}
+
+.hub-agent-cost-amount {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid var(--border2);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.hub-agent-cost-amount.confirmed { color: var(--text); }
+.hub-agent-cost-amount.no-cost { color: var(--muted); }
+
+.hub-agent-cost-form-hint {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+@media (max-width: 1100px) {
+  .hub-agent-cost-stats { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
+}
+
+@media (max-width: 720px) {
+  .hub-agent-cost-head { display: grid; }
+  .hub-agent-cost-month-control { width: 100%; }
+  .hub-agent-cost-month-control .hub-input { flex: 1; width: auto; }
+  .hub-agent-cost-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .hub-agent-cost-overview { grid-template-columns: 1fr; }
+  .hub-agent-cost-trend-panel { grid-column: auto; }
+  .hub-agent-cost-budget { grid-template-columns: 1fr; }
+  .hub-agent-cost-breakdown-row { grid-template-columns: 84px minmax(50px, 1fr) 88px; gap: 7px; }
+  .hub-agent-cost-trend { gap: 5px; overflow-x: auto; }
+  .hub-agent-cost-trend-item { min-width: 58px; }
+  .hub-agent-cost-table-wrap { border: none; background: transparent; }
+}
+
 /* ── 配置引导 ─────────────────────────────────────────────────────── */
 
 .hub-setup { max-width: 620px; margin: 40px auto; }

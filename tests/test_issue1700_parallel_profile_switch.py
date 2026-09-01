@@ -4,6 +4,7 @@ A WebUI profile switch uses cookie/thread-local profile state, so it should be
 allowed while another session is streaming. Only process-wide profile switches
 must remain blocked because they mutate global Hermes runtime state.
 """
+import contextlib
 import re
 from pathlib import Path
 
@@ -77,6 +78,63 @@ def test_per_client_switch_allowed_when_stream_is_active(tmp_path, monkeypatch):
 
     assert result["active"] == "writer"
     assert result["default_model"] == "gpt-5.5"
+
+
+def test_process_wide_switch_holds_root_target_transaction_through_reload(
+    tmp_path, monkeypatch
+):
+    profiles = _prepare_profile_tree(tmp_path, monkeypatch)
+    import api.config as config
+    import api.skill_ui_descriptions as descriptions
+
+    root = profiles._DEFAULT_HERMES_HOME.resolve()
+    target = (root / "profiles" / "writer").resolve()
+    entered = []
+    state = {"active": False}
+
+    @contextlib.contextmanager
+    def tracked_transaction(keys):
+        entered.append(tuple(str(Path(key).resolve()) for key in keys))
+        state["active"] = True
+        try:
+            yield
+        finally:
+            state["active"] = False
+
+    def tracked_reload():
+        assert state["active"], "config reload escaped the Profile transaction"
+
+    def tracked_snapshot():
+        assert state["active"], "config snapshot escaped the Profile transaction"
+        return {"model": {"provider": "openai-codex", "default": "gpt-5.5"}}
+
+    atomic_calls = []
+    real_atomic_write = profiles._atomic_write_text
+
+    def tracked_atomic_write(path, text, **kwargs):
+        assert state["active"], "sticky pointer write escaped the Profile transaction"
+        atomic_calls.append((Path(path), text, dict(kwargs)))
+        return real_atomic_write(path, text, **kwargs)
+
+    monkeypatch.setattr(descriptions, "profile_transaction", tracked_transaction)
+    monkeypatch.setattr(config, "reload_config", tracked_reload)
+    monkeypatch.setattr(config, "get_config_snapshot", tracked_snapshot)
+    monkeypatch.setattr(profiles, "_atomic_write_text", tracked_atomic_write)
+    monkeypatch.setattr(profiles, "_reload_dotenv", lambda _home: None)
+    monkeypatch.setattr(profiles, "_set_hermes_home", lambda _home: None)
+
+    result = profiles.switch_profile("writer", process_wide=True)
+
+    assert result["active"] == "writer"
+    assert entered == [(str(root), str(target))]
+    assert atomic_calls == [
+        (
+            root / "active_profile",
+            "writer\n",
+            {"encoding": "utf-8", "require_atomic_replace": True},
+        )
+    ]
+    assert (root / "active_profile").read_text(encoding="utf-8") == "writer\n"
 
 
 def test_frontend_profile_switch_no_longer_blocks_on_busy_state():

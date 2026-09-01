@@ -712,7 +712,10 @@ def test_mobile_skill_selection_closes_sidebar_after_detail_load():
     assert "if(typeof _isDesktopWidth==='function'&&_isDesktopWidth())return" in helper
     assert "closeMobileSidebar()" in helper
     body = _js_function_body(panels_js, "openSkill")
-    assert "_renderSkillDetail(name, data.content || '', data.linked_files || {})" in body
+    assert (
+        "_renderSkillDetail(name, data.content || '', data.linked_files || {}, "
+        "data.ui_description || '')" in body
+    )
     assert "_closeMobileSidebarAfterPanelSelection()" in body
 
 

@@ -29,6 +29,7 @@
     design: '<path d="M12 19a7 7 0 1 0 0-14 7 7 0 0 0 0 14z"/><path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/><path d="M12 2v3"/><path d="M12 19v3"/><path d="M2 12h3"/><path d="M19 12h3"/>',
     meetings: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4"/><path d="M8 3v4"/><path d="M3 10h18"/><path d="M8 14h3"/><path d="M8 17h6"/>',
     ops: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 7.5h.01"/><path d="M7 17.5h.01"/>',
+    agentCosts: '<circle cx="8" cy="8" r="3"/><circle cx="16" cy="16" r="3"/><path d="M6 16h4"/><path d="M14 8h4"/><path d="M8 11v2"/><path d="M16 11v2"/>',
     resources: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
     inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
     plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
@@ -50,6 +51,7 @@
     { id: 'design', label: '产品设计', icon: ICON.design, sub: '需求与设计稿从想法走到交付' },
     { id: 'meetings', label: '会议', icon: ICON.meetings, sub: '纪要、决策与行动项闭环' },
     { id: 'ops', label: '项目运维', icon: ICON.ops, sub: '服务清单、状态与常用命令速查' },
+    { id: 'agentCosts', label: 'Agent 成本', icon: ICON.agentCosts, sub: '公司每月 Agent 消耗与订阅费用' },
     { id: 'resources', label: '资源库', icon: ICON.resources, sub: '链接、文档与提示词的统一收藏' },
     { id: 'inbox', label: '收件箱', icon: ICON.inbox, sub: '先记下来，之后再归类' }
   ];
@@ -156,6 +158,8 @@
     opsQuery: '',
     opsSelectedService: '',
     opsMachine: '',
+    agentCostTab: 'overview',
+    agentCostMonth: localDateKey().slice(0, 7),
     setupError: ''
   };
 
@@ -399,6 +403,7 @@
       case 'design': host.innerHTML = renderDesign(); break;
       case 'meetings': host.innerHTML = renderMeetings(); break;
       case 'ops': host.innerHTML = renderOps(); break;
+      case 'agentCosts': host.innerHTML = renderAgentCosts(); break;
       case 'resources': host.innerHTML = renderResources(); break;
       case 'inbox': host.innerHTML = renderInbox(); break;
       default: host.innerHTML = renderHome();
@@ -415,6 +420,7 @@
       design: d ? d.design.items.length : '',
       meetings: d ? d.meetings.items.length : '',
       ops: d ? (d.ops.services.length + d.ops.commands.length) : '',
+      agentCosts: d ? AgentCost.monthlyRecordCount(d.agentCosts || {}, selectedAgentCostMonth()) : '',
       resources: d ? d.resources.items.length : '',
       inbox: d ? d.inbox.items.filter(function (i) { return !i.done; }).length : ''
     };
@@ -587,6 +593,298 @@
         }).join('') + '</div>'
         : '<div class="hub-empty">还没有记录。从上面的快速捕获开始，或者进任意工作台新建一条。</div>') +
       '</div>';
+  }
+
+  /* ── 公司 Agent 月度成本 ──────────────────────────────────────────── */
+
+  var AGENT_COST_TABS = [
+    { id: 'overview', label: '概览' },
+    { id: 'subscriptions', label: '固定订阅' },
+    { id: 'expenses', label: '月度费用' }
+  ];
+  var AGENT_SUBSCRIPTION_STATUS = [
+    { id: 'active', label: '在用' },
+    { id: 'configured', label: '已配置待核验' },
+    { id: 'paused', label: '停用' }
+  ];
+  var AGENT_AMOUNT_STATUS = [
+    { id: 'confirmed', label: '已确认' },
+    { id: 'pending', label: '待补录' }
+  ];
+  var AGENT_EXPENSE_STATUS = [
+    { id: 'confirmed', label: '已确认' },
+    { id: 'pending', label: '待补录' },
+    { id: 'no_cost', label: '本月无费用' }
+  ];
+  var AGENT_COST_CATEGORIES = [
+    { id: 'agent_subscription', label: 'Agent 账号订阅' },
+    { id: 'model_usage', label: '模型/API 按量消耗' },
+    { id: 'cloud_server', label: '云服务器' },
+    { id: 'proxy_subscription', label: '代理与网络订阅' },
+    { id: 'other', label: '其他费用' }
+  ];
+  var AGENT_REGIONS = [
+    { id: 'domestic', label: '国内' },
+    { id: 'overseas', label: '境外' },
+    { id: 'mixed', label: '混合/不适用' },
+    { id: 'pending', label: '待核验' }
+  ];
+  var AGENT_ALLOCATIONS = [
+    { id: 'company_self', label: '公司自用' },
+    { id: 'customer_project', label: '客户项目' },
+    { id: 'internal_department', label: '公司其他部门' },
+    { id: 'personal_reimbursement', label: '个人代付待报销' },
+    { id: 'unassigned', label: '待归属' }
+  ];
+  var AGENT_PAYMENT_OWNERS = [
+    { id: 'company', label: '公司支付' },
+    { id: 'personal', label: '个人代付' },
+    { id: 'customer', label: '客户支付' },
+    { id: 'department', label: '内部部门支付' },
+    { id: 'pending', label: '待核验' }
+  ];
+  var AGENT_DEPLOYMENT_USES = [
+    { id: 'general', label: '通用/公司服务' },
+    { id: 'customer_openclaw', label: '客户小龙虾' },
+    { id: 'department_openclaw', label: '内部部门小龙虾' },
+    { id: 'model_gateway', label: '模型网关/Agent 基础设施' },
+    { id: 'other', label: '其他用途' }
+  ];
+
+  function legacyAgentCostCategory(row, subscription) {
+    if (row.costCategory) return row.costCategory;
+    if (subscription) return 'agent_subscription';
+    if (row.costType === 'usage') return 'model_usage';
+    return row.costType === 'infrastructure' ? 'other' : 'other';
+  }
+
+  function agentCostAllocationLabel(row) {
+    var label = labelOf(AGENT_ALLOCATIONS, row.allocation || 'company_self', '待归属');
+    return row.allocationName ? label + ' · ' + row.allocationName : label;
+  }
+
+  function agentCostData() {
+    return view.data.agentCosts || { version: 1, updatedAt: '', subscriptions: [], expenses: [], budgets: [] };
+  }
+
+  function selectedAgentCostMonth() {
+    var fallback = localDateKey().slice(0, 7);
+    view.agentCostMonth = AgentCost.normalizeMonth(view.agentCostMonth, fallback);
+    return view.agentCostMonth;
+  }
+
+  function money(value) {
+    if (value === null || typeof value === 'undefined' || value === '') return '—';
+    return '¥' + Number(value || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function signedMoney(value) {
+    if (value === null || typeof value === 'undefined') return '未设置预算';
+    return (Number(value) > 0 ? '+' : '') + money(value);
+  }
+
+  function percent(value) {
+    if (value === null || typeof value === 'undefined') return '暂无基期';
+    return (Number(value) > 0 ? '+' : '') + Number(value).toFixed(1) + '%';
+  }
+
+  function amountBadge(row, amountField, month) {
+    if (amountField === 'monthlyAmount' && month && AgentCost.subscriptionNeedsAttention(row, month)) {
+      return '<span class="hub-agent-cost-amount pending">待补录</span>';
+    }
+    if (row.amountStatus === 'no_cost') return '<span class="hub-agent-cost-amount no-cost">本月无费用</span>';
+    if (row.amountStatus !== 'confirmed' || !AgentCost.hasAmount(row[amountField])) {
+      return '<span class="hub-agent-cost-amount pending">待补录</span>';
+    }
+    return '<span class="hub-agent-cost-amount confirmed">' + esc(money(row[amountField])) + '</span>';
+  }
+
+  function agentCostRowActions(kind, id) {
+    return '<div class="hub-cardlet-actions">' +
+      iconBtn('edit-agent-' + kind, id, ICON.edit, '编辑') +
+      iconBtn('del-agent-' + kind, id, ICON.trash, '删除', 'danger') + '</div>';
+  }
+
+  function agentCostTable(headers, rows, empty) {
+    if (!rows.length) return '<div class="hub-empty">' + esc(empty) + '</div>';
+    return '<div class="hub-agent-cost-table-wrap"><table class="hub-agent-cost-table"><thead><tr>' +
+      headers.map(function (header) { return '<th>' + esc(header) + '</th>'; }).join('') +
+      '</tr></thead><tbody>' + rows.join('') + '</tbody></table></div>';
+  }
+
+  function agentCostMonthControl(month) {
+    return '<div class="hub-agent-cost-month-control" aria-label="费用月份">' +
+      '<button class="hub-icon-btn" data-hub-action="agent-cost-prev-month" title="上一个月" aria-label="上一个月">' + svg(ICON.left, 14) + '</button>' +
+      '<input class="hub-input" type="month" value="' + esc(month) + '" data-agent-cost-month>' +
+      '<button class="hub-icon-btn" data-hub-action="agent-cost-next-month" title="下一个月" aria-label="下一个月">' + svg(ICON.right, 14) + '</button></div>';
+  }
+
+  function agentCostMetric(value, label, note, cls) {
+    return '<div class="hub-stat hub-agent-cost-metric ' + (cls || '') + '"><div class="hub-stat-value">' + esc(value) + '</div>' +
+      '<div class="hub-stat-label">' + esc(label) + '</div>' + (note ? '<div class="hub-agent-cost-note">' + esc(note) + '</div>' : '') + '</div>';
+  }
+
+  function renderAgentCostOverview(data, month, summary) {
+    var trend = AgentCost.trend(data, month, 6);
+    var max = trend.reduce(function (value, row) { return Math.max(value, row.total); }, 0) || 1;
+    var budget = (data.budgets || []).filter(function (row) { return row.month === month; }).slice(-1)[0] || {};
+    var renewals = AgentCost.renewals(data, new Date(), 45);
+    var allocations = AgentCost.allocationBreakdown(data, month);
+    var pendingRows = (data.subscriptions || []).filter(function (row) {
+      return AgentCost.subscriptionNeedsAttention(row, month);
+    }).concat((data.expenses || []).filter(function (row) {
+      return row.month === month && row.amountStatus !== 'confirmed' && row.amountStatus !== 'no_cost';
+    }));
+    var breakdown = [
+      { label: 'Agent 账号订阅', value: summary.subscription },
+      { label: '模型/API 按量', value: summary.usage },
+      { label: '云服务器', value: summary.cloudServer },
+      { label: '代理与网络', value: summary.proxyNetwork },
+      { label: '其他费用', value: summary.other }
+    ];
+    var breakdownMax = breakdown.reduce(function (value, row) { return Math.max(value, row.value); }, 0) || 1;
+
+    return '<div class="hub-agent-cost-overview">' +
+      '<div class="hub-section hub-agent-cost-panel"><div class="hub-section-head"><div><span class="hub-section-title">费用结构</span>' +
+      '<div class="hub-cardlet-meta">只汇总已确认金额；待补录不按 0 元处理。</div></div></div>' +
+      '<div class="hub-agent-cost-breakdown">' + breakdown.map(function (row) {
+        return '<div class="hub-agent-cost-breakdown-row"><span>' + esc(row.label) + '</span><div class="hub-agent-cost-track"><i style="width:' +
+          Math.round((row.value / breakdownMax) * 100) + '%"></i></div><strong>' + esc(money(row.value)) + '</strong></div>';
+      }).join('') + '</div></div>' +
+
+      '<div class="hub-section hub-agent-cost-panel"><div class="hub-section-head"><div><span class="hub-section-title">费用归属</span>' +
+      '<div class="hub-cardlet-meta">区分公司自用、客户项目、公司其他部门及个人代付。</div></div></div>' +
+      '<div class="hub-agent-cost-breakdown">' + [
+        { label: '公司自用', value: allocations.company_self },
+        { label: '客户项目', value: allocations.customer_project },
+        { label: '公司其他部门', value: allocations.internal_department },
+        { label: '个人代付待报销', value: allocations.personal_reimbursement },
+        { label: '待归属', value: allocations.unassigned }
+      ].map(function (row) {
+        return '<div class="hub-agent-cost-breakdown-row"><span>' + esc(row.label) + '</span><div class="hub-agent-cost-track"><i style="width:' +
+          Math.round((row.value / Math.max(summary.total, 1)) * 100) + '%"></i></div><strong>' + esc(money(row.value)) + '</strong></div>';
+      }).join('') + '</div></div>' +
+
+      '<div class="hub-section hub-agent-cost-panel"><div class="hub-section-head"><div><span class="hub-section-title">待补录与重复核验</span>' +
+      '<div class="hub-cardlet-meta">先确认真实账单与资源对应关系，再填写金额；线索项不得与已登记云服务器重复计费。</div></div><span class="hub-cardlet-meta">' + esc(String(pendingRows.length)) + ' 项</span></div>' +
+      (pendingRows.length ? '<div class="hub-list">' + pendingRows.map(function (row) {
+        return '<div class="hub-item"><div class="hub-item-main"><div class="hub-item-title">' + esc(row.name || '未命名费用') + '</div>' +
+          '<div class="hub-item-sub">' + esc(labelOf(AGENT_COST_CATEGORIES, legacyAgentCostCategory(row, Boolean(row.monthlyAmount !== undefined)), '其他费用')) +
+          ' · ' + esc(agentCostAllocationLabel(row)) + (row.note ? ' · ' + esc(row.note) : '') + '</div></div><span class="hub-agent-cost-amount pending">待补录</span></div>';
+      }).join('') + '</div>' : '<div class="hub-empty compact">本月没有待补录项。</div>') + '</div>' +
+
+      '<div class="hub-section hub-agent-cost-panel"><div class="hub-section-head"><span class="hub-section-title">本月预算</span></div>' +
+      '<form class="hub-agent-cost-budget" data-hub-form="agent-budget">' +
+      '<input class="hub-input" name="amount" type="number" min="0" step="0.01" placeholder="输入人民币预算" value="' + esc(budget.amount == null ? '' : budget.amount) + '">' +
+      '<input class="hub-input" name="note" placeholder="预算说明（可选）" value="' + esc(budget.note || '') + '">' +
+      '<button class="hub-btn primary" type="submit" data-hub-action="save-agent-budget">保存预算</button></form>' +
+      '<div class="hub-cardlet-meta">当前实际 ' + esc(money(summary.total)) + (summary.budget === null ? '，尚未设置预算。' : '，预算 ' + esc(money(summary.budget)) + '。') + '</div></div>' +
+
+      '<div class="hub-section hub-agent-cost-panel hub-agent-cost-trend-panel"><div class="hub-section-head"><span class="hub-section-title">近 6 个月</span></div>' +
+      '<div class="hub-agent-cost-trend">' + trend.map(function (row) {
+        var height = row.total ? Math.max(8, Math.round((row.total / max) * 100)) : 2;
+        return '<div class="hub-agent-cost-trend-item"><div class="hub-agent-cost-trend-value">' + esc(money(row.total)) + '</div>' +
+          '<div class="hub-agent-cost-bar"><i style="height:' + height + '%"></i></div><span>' + esc(row.month.slice(5)) + '月</span></div>';
+      }).join('') + '</div></div>' +
+
+      '<div class="hub-section hub-agent-cost-panel"><div class="hub-section-head"><span class="hub-section-title">续费提醒</span><span class="hub-cardlet-meta">未来 45 天</span></div>' +
+      (renewals.length ? '<div class="hub-list">' + renewals.map(function (row) {
+        return '<div class="hub-item"><div class="hub-item-main"><div class="hub-item-title">' + esc(row.name || '未命名订阅') + '</div>' +
+          '<div class="hub-item-sub">' + esc(row.vendor || '供应商待补') + ' · ' + esc(row.renewalDate) + '</div></div>' + amountBadge(row, 'monthlyAmount', month) + '</div>';
+      }).join('') + '</div>' : '<div class="hub-empty compact">未来 45 天没有已登记的续费项。</div>') + '</div>' +
+      '</div>';
+  }
+
+  function renderAgentCosts() {
+    var data = agentCostData();
+    var month = selectedAgentCostMonth();
+    var summary = AgentCost.summarize(data, month);
+    var html = '<div class="hub-agent-cost"><div class="hub-section-head hub-agent-cost-head"><div><span class="hub-section-title">公司 Agent 月度成本</span>' +
+      '<div class="hub-cardlet-meta">Agent/API、云服务器、客户与内部部门小龙虾部署、海外 VPS 及代理订阅；金额单位为人民币，不保存任何凭据。</div></div>' + agentCostMonthControl(month) + '</div>';
+    html += '<div class="hub-tabs">' + AGENT_COST_TABS.map(function (tab) {
+      return '<button class="hub-tab' + (view.agentCostTab === tab.id ? ' active' : '') + '" data-hub-action="agent-cost-tab" data-hub-value="' + tab.id + '">' + esc(tab.label) + '</button>';
+    }).join('') + '</div>';
+    html += '<div class="hub-stats hub-agent-cost-stats">' +
+      agentCostMetric(money(summary.total), '总费用', month + ' 已确认') +
+      agentCostMetric(money(summary.subscription + summary.usage), 'Agent/API', '账号订阅 + 调用') +
+      agentCostMetric(money(summary.cloudServer), '云服务器', '云主机 + 小龙虾') +
+      agentCostMetric(money(summary.proxyNetwork), '代理与网络', '代理池 + 网络') +
+      agentCostMetric(signedMoney(summary.budgetVariance), '预算偏差', summary.budget === null ? '未设置预算' : (summary.budgetVariance <= 0 ? '预算内' : '超出预算'), summary.budgetVariance > 0 ? 'warning' : '') +
+      agentCostMetric(percent(summary.momPercent), '环比', signedMoney(summary.momAmount), summary.momAmount > 0 ? 'warning' : '') +
+      agentCostMetric(String(summary.pendingCount), '待补录', '不计入费用合计', summary.pendingCount ? 'warning' : '') + '</div>';
+
+    if (view.form && view.form.kind && view.form.kind.indexOf('agent-') === 0) html += agentCostForm(view.form.kind.slice(6));
+
+    if (view.agentCostTab === 'subscriptions') {
+      var subscriptions = (data.subscriptions || []).slice().sort(function (a, b) {
+        return String(a.status || '').localeCompare(String(b.status || '')) || String(a.name || '').localeCompare(String(b.name || ''));
+      });
+      html += '<div class="hub-section"><div class="hub-section-head"><div><span class="hub-section-title">固定订阅</span>' +
+        '<div class="hub-cardlet-meta">维护一次，按起止月份自动进入月度成本。</div></div><button class="hub-btn primary" data-hub-action="new-agent-subscription">' + svg(ICON.plus, 13) + '新增订阅</button></div>';
+      html += agentCostTable(['订阅/供应商', '类别', '区域', '费用归属', '每月金额', '状态', '有效月份', '续费日期', '操作'], subscriptions.map(function (row) {
+        return '<tr><td><strong>' + esc(row.name || '') + '</strong><small>' + esc(row.vendor || '供应商待补') + '</small></td>' +
+          '<td>' + esc(labelOf(AGENT_COST_CATEGORIES, legacyAgentCostCategory(row, true), 'Agent 账号订阅')) + '</td>' +
+          '<td>' + esc(labelOf(AGENT_REGIONS, row.region || 'pending', '待核验')) + '</td><td>' + esc(agentCostAllocationLabel(row)) + '</td>' +
+          '<td>' + amountBadge(row, 'monthlyAmount', month) + '</td><td>' + esc(labelOf(AGENT_SUBSCRIPTION_STATUS, row.status, '待核验')) + '</td>' +
+          '<td>' + esc(row.startMonth || '未设置') + ' → ' + esc(row.endMonth || '持续') + '</td><td>' + esc(row.renewalDate || '未登记') + '</td><td>' + agentCostRowActions('subscription', row.id) + '</td></tr>';
+      }), '还没有固定订阅。可录入 Agent 席位、国内外云服务器、海外 VPS、代理池或网络订阅。') + '</div>';
+    } else if (view.agentCostTab === 'expenses') {
+      var expenses = (data.expenses || []).filter(function (row) { return row.month === month; }).sort(function (a, b) {
+        return String(a.costType || '').localeCompare(String(b.costType || '')) || String(a.name || '').localeCompare(String(b.name || ''));
+      });
+      html += '<div class="hub-section"><div class="hub-section-head"><div><span class="hub-section-title">' + esc(month) + ' 月度费用</span>' +
+        '<div class="hub-cardlet-meta">按量调用、Agent 执行及直接相关基础设施费用。</div></div><button class="hub-btn primary" data-hub-action="new-agent-expense">' + svg(ICON.plus, 13) + '新增费用</button></div>';
+      html += agentCostTable(['费用项/供应商', '类别', '区域', '费用归属', '用途', '金额', '状态', '备注', '操作'], expenses.map(function (row) {
+        return '<tr><td><strong>' + esc(row.name || '') + '</strong><small>' + esc(row.vendor || '供应商待补') + '</small></td>' +
+          '<td>' + esc(labelOf(AGENT_COST_CATEGORIES, legacyAgentCostCategory(row, false), '其他费用')) + '</td>' +
+          '<td>' + esc(labelOf(AGENT_REGIONS, row.region || 'pending', '待核验')) + '</td><td>' + esc(agentCostAllocationLabel(row)) + '</td>' +
+          '<td>' + esc(labelOf(AGENT_DEPLOYMENT_USES, row.deploymentUse || 'general', '通用/公司服务')) + '</td><td>' + amountBadge(row, 'amount') + '</td>' +
+          '<td>' + esc(labelOf(AGENT_EXPENSE_STATUS, row.amountStatus, '待补录')) + '</td><td>' + esc(row.note || '') + '</td><td>' + agentCostRowActions('expense', row.id) + '</td></tr>';
+      }), '这个月还没有费用记录。云服务器、客户/内部部门小龙虾部署和代理订阅也要纳入；未知金额请选择“待补录”。') + '</div>';
+    } else {
+      html += renderAgentCostOverview(data, month, summary);
+    }
+    return html + '</div>';
+  }
+
+  function agentCostForm(kind) {
+    var data = agentCostData();
+    var id = view.form.id;
+    var item = kind === 'subscription' ? findById(data.subscriptions || [], id) : findById(data.expenses || [], id);
+    item = item || {};
+    var title = kind === 'subscription' ? '固定订阅' : '月度费用';
+    var html = '<form class="hub-card hub-section hub-agent-cost-form" data-hub-form="agent-' + kind + '"><div class="hub-section-head"><span class="hub-section-title">' +
+      (id ? '编辑' : '新增') + title + '</span></div><div class="hub-form-grid">';
+    if (kind === 'subscription') {
+      html += field('name', '订阅/资源名称', item.name, 'text', true) + field('vendor', '供应商', item.vendor) +
+        selectField('costCategory', '费用类别', AGENT_COST_CATEGORIES, legacyAgentCostCategory(item, true)) +
+        field('billingResourceId', '云资源/实例标识（云服务器确认金额时必填）', item.billingResourceId) +
+        selectField('region', '国内外', AGENT_REGIONS, item.region || 'pending') +
+        selectField('allocation', '费用归属', AGENT_ALLOCATIONS, item.allocation || 'company_self') +
+        field('allocationName', '客户/项目/部门名称', item.allocationName) +
+        selectField('paymentOwner', '付款归属', AGENT_PAYMENT_OWNERS, item.paymentOwner || 'pending') +
+        selectField('deploymentUse', '部署用途', AGENT_DEPLOYMENT_USES, item.deploymentUse || 'general') +
+        field('owner', '负责人', item.owner) + field('monthlyAmount', '每月金额（元）', item.monthlyAmount, 'number') +
+        selectField('amountStatus', '金额状态', AGENT_AMOUNT_STATUS, item.amountStatus || 'pending') +
+        selectField('status', '使用状态', AGENT_SUBSCRIPTION_STATUS, item.status || 'active') +
+        field('startMonth', '开始月份', item.startMonth || selectedAgentCostMonth(), 'month', true) + field('endMonth', '结束月份（暂停时必填）', item.endMonth, 'month') +
+        field('renewalDate', '续费日期', item.renewalDate, 'date') + textAreaField('note', '备注（不得填写密钥、密码或 Token）', item.note);
+    } else {
+      html += field('month', '费用月份', item.month || selectedAgentCostMonth(), 'month', true) + field('name', '费用项/资源名称', item.name, 'text', true) +
+        field('vendor', '供应商', item.vendor) + selectField('costCategory', '费用类别', AGENT_COST_CATEGORIES, legacyAgentCostCategory(item, false)) +
+        field('billingResourceId', '云资源/实例标识（云服务器确认金额时必填）', item.billingResourceId) +
+        selectField('region', '国内外', AGENT_REGIONS, item.region || 'pending') +
+        selectField('allocation', '费用归属', AGENT_ALLOCATIONS, item.allocation || 'company_self') +
+        field('allocationName', '客户/项目/部门名称', item.allocationName) +
+        selectField('paymentOwner', '付款归属', AGENT_PAYMENT_OWNERS, item.paymentOwner || 'pending') +
+        selectField('deploymentUse', '部署用途', AGENT_DEPLOYMENT_USES, item.deploymentUse || 'general') +
+        field('amount', '金额（元）', item.amount, 'number') + selectField('amountStatus', '金额状态', AGENT_EXPENSE_STATUS, item.amountStatus || 'pending') +
+        field('owner', '负责人', item.owner) + textAreaField('note', '备注', item.note);
+    }
+    var amountHint = kind === 'subscription'
+      ? '金额未知请选择“待补录”并保持金额为空；明确免费请填写 0 并选择“已确认”。'
+      : '金额未知请选择“待补录”并保持金额为空；确认本月免费请选择“本月无费用”。';
+    return html + '</div><div class="hub-agent-cost-form-hint">' + esc(amountHint) + '</div>' + formActions() + '</form>';
   }
 
   /* 把各模块最近更新的条目合成一条时间线，作为主页的"我最近在忙什么"。 */
@@ -1753,7 +2051,7 @@
   function field(name, label, value, type, required) {
     return '<label class="hub-field"><span class="hub-field-label">' + esc(label) + '</span>' +
       '<input class="hub-input" name="' + esc(name) + '" type="' + (type || 'text') + '" ' +
-      (required ? 'required ' : '') + 'value="' + esc(value || '') + '"></label>';
+      (required ? 'required ' : '') + 'value="' + esc(value == null ? '' : value) + '"></label>';
   }
 
   function selectField(name, label, list, selected) {
@@ -1787,6 +2085,27 @@
       renderSidebar();
     }, function (err) {
       toast('保存失败：' + ((err && err.message) || '未知错误'), 'error');
+    });
+  }
+
+  function saveAgentCosts(afterMsg) {
+    return HubStore.write('agentCosts', view.data.agentCosts).then(function () {
+      return HubStore.read('agentCosts');
+    }).then(function (persisted) {
+      view.data.agentCosts = persisted;
+      if (afterMsg) toast(afterMsg, 'success');
+      render();
+      renderSidebar();
+    }, function (err) {
+      HubStore.invalidate();
+      return HubStore.read('agentCosts', { strict: true }).then(function (remote) {
+        view.data.agentCosts = remote;
+        toast('保存失败：' + ((err && err.message) || '未知错误') + '；已重新读取磁盘数据', 'error');
+        render();
+        renderSidebar();
+      }, function () {
+        toast('保存失败：' + ((err && err.message) || '未知错误') + '；重新读取磁盘数据也失败', 'error');
+      });
     });
   }
 
@@ -1935,6 +2254,13 @@
   }
 
   function onChange(e) {
+    if (e.target && e.target.matches('[data-agent-cost-month]')) {
+      if (view.form) { toast('请先保存或取消当前编辑', 'error'); e.target.value = selectedAgentCostMonth(); return; }
+      view.agentCostMonth = AgentCost.normalizeMonth(e.target.value, selectedAgentCostMonth());
+      render();
+      renderSidebar();
+      return;
+    }
     if (e.target && e.target.matches('[data-hub-kind-filter]')) {
       if (view.form) { toast('请先保存或取消当前编辑', 'error'); return; }
       view.opsKind = e.target.value || 'all';
@@ -1958,6 +2284,76 @@
       d.inbox.items.unshift({ id: HubStore.newId(), text: text, done: false, createdAt: nowIso() });
       form.reset();
       save('inbox', '已记入收件箱');
+      return;
+    }
+
+    if (kind === 'agent-budget') {
+      var budgetAmount = get('amount');
+      if (budgetAmount === '' || !isFinite(Number(budgetAmount)) || Number(budgetAmount) < 0) {
+        toast('请填写有效的非负预算金额', 'error');
+        return;
+      }
+      var budgetMonth = selectedAgentCostMonth();
+      var existingBudget = (d.agentCosts.budgets || []).filter(function (row) { return row.month === budgetMonth; })[0];
+      var budgetPayload = { month: budgetMonth, amount: Number(budgetAmount), note: get('note'), updatedAt: nowIso() };
+      if (existingBudget) Object.assign(existingBudget, budgetPayload);
+      else d.agentCosts.budgets.push(Object.assign({ id: HubStore.newId() }, budgetPayload));
+      d.agentCosts.updatedAt = nowIso();
+      saveAgentCosts('预算已保存');
+      return;
+    }
+
+    if (kind === 'agent-subscription' || kind === 'agent-expense') {
+      var agentKind = kind.slice(6);
+      var agentList = agentKind === 'subscription' ? d.agentCosts.subscriptions : d.agentCosts.expenses;
+      var agentTarget = editing ? findById(agentList, editing) : null;
+      var agentAmountStatus = get('amountStatus') || 'pending';
+      var rawAmount = get(agentKind === 'subscription' ? 'monthlyAmount' : 'amount');
+      if (agentAmountStatus === 'confirmed' && (rawAmount === '' || !isFinite(Number(rawAmount)) || Number(rawAmount) < 0)) {
+        toast('已确认金额必须填写有效的非负数字；未知金额请选择“待补录”', 'error');
+        return;
+      }
+      var agentPayload;
+      if (agentKind === 'subscription') {
+        var startMonth = AgentCost.normalizeMonth(get('startMonth'), '');
+        var endMonth = AgentCost.normalizeMonth(get('endMonth'), '');
+        var subscriptionValidation = AgentCost.validateSubscription({
+          status: get('status') || 'active', startMonth: startMonth, endMonth: endMonth
+        });
+        if (subscriptionValidation) {
+          toast(subscriptionValidation, 'error');
+          return;
+        }
+        agentPayload = {
+          name: get('name'), vendor: get('vendor'), owner: get('owner'),
+          costCategory: get('costCategory') || 'agent_subscription', billingResourceId: get('billingResourceId'), region: get('region') || 'pending',
+          allocation: get('allocation') || 'company_self', allocationName: get('allocationName'),
+          paymentOwner: get('paymentOwner') || 'pending', deploymentUse: get('deploymentUse') || 'general',
+          monthlyAmount: agentAmountStatus === 'confirmed' ? Number(rawAmount) : '', amountStatus: agentAmountStatus,
+          status: get('status') || 'active', startMonth: startMonth, endMonth: endMonth,
+          renewalDate: get('renewalDate'), note: get('note'), updatedAt: nowIso()
+        };
+      } else {
+        agentPayload = {
+          month: AgentCost.normalizeMonth(get('month'), selectedAgentCostMonth()), name: get('name'), vendor: get('vendor'),
+          costCategory: get('costCategory') || 'model_usage', billingResourceId: get('billingResourceId'), region: get('region') || 'pending',
+          allocation: get('allocation') || 'company_self', allocationName: get('allocationName'),
+          paymentOwner: get('paymentOwner') || 'pending', deploymentUse: get('deploymentUse') || 'general',
+          amount: agentAmountStatus === 'confirmed' ? Number(rawAmount) : '', amountStatus: agentAmountStatus,
+          owner: get('owner'), note: get('note'), updatedAt: nowIso()
+        };
+      }
+      if (!agentPayload.name) return;
+      var cloudIdentityError = AgentCost.validateCloudIdentity(agentPayload, d.agentCosts, editing || '');
+      if (cloudIdentityError) {
+        toast(cloudIdentityError, 'error');
+        return;
+      }
+      if (agentTarget) Object.assign(agentTarget, agentPayload);
+      else agentList.unshift(Object.assign({ id: HubStore.newId(), createdAt: nowIso() }, agentPayload));
+      d.agentCosts.updatedAt = nowIso();
+      view.form = null;
+      saveAgentCosts(agentTarget ? 'Agent 成本已更新' : 'Agent 成本已新增');
       return;
     }
 
@@ -2186,6 +2582,22 @@
       case 'edit-command': view.form = { kind: 'command', id: id }; render(); return;
       case 'new-resource': view.form = { kind: 'resource', id: '' }; render(); return;
       case 'edit-resource': view.form = { kind: 'resource', id: id }; render(); return;
+      case 'agent-cost-tab': if (guardOpsForm()) return; view.agentCostTab = value || 'overview'; view.form = null; render(); return;
+      case 'agent-cost-prev-month': if (guardOpsForm()) return; view.agentCostMonth = AgentCost.shiftMonth(selectedAgentCostMonth(), -1); render(); renderSidebar(); return;
+      case 'agent-cost-next-month': if (guardOpsForm()) return; view.agentCostMonth = AgentCost.shiftMonth(selectedAgentCostMonth(), 1); render(); renderSidebar(); return;
+      case 'new-agent-subscription': view.agentCostTab = 'subscriptions'; view.form = { kind: 'agent-subscription', id: '' }; render(); return;
+      case 'new-agent-expense': view.agentCostTab = 'expenses'; view.form = { kind: 'agent-expense', id: '' }; render(); return;
+      case 'edit-agent-subscription': view.agentCostTab = 'subscriptions'; view.form = { kind: 'agent-subscription', id: id }; render(); return;
+      case 'edit-agent-expense': view.agentCostTab = 'expenses'; view.form = { kind: 'agent-expense', id: id }; render(); return;
+      case 'del-agent-subscription':
+      case 'del-agent-expense': {
+        if (!confirm('删除这条 Agent 成本记录？')) return;
+        var agentDeleteKey = action === 'del-agent-subscription' ? 'subscriptions' : 'expenses';
+        d.agentCosts[agentDeleteKey] = (d.agentCosts[agentDeleteKey] || []).filter(function (row) { return row.id !== id; });
+        d.agentCosts.updatedAt = nowIso();
+        saveAgentCosts('Agent 成本记录已删除');
+        return;
+      }
 
       case 'edit-focus': {
         var cur = d.profile.focus || '';

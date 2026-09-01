@@ -35,6 +35,14 @@ import queue
 import threading
 import types
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _enable_explicit_process_auto_wake(monkeypatch):
+    """This suite exercises the explicitly enabled autonomous wakeup path."""
+    monkeypatch.setenv("HERMES_WEBUI_PROCESS_AUTO_WAKE", "1")
+
 
 # --------------------------------------------------------------------------
 # Fakes / fixtures (mirrors test_process_complete_ab_coexistence +

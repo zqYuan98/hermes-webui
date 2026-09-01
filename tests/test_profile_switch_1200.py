@@ -729,12 +729,29 @@ def test_chat_start_retags_empty_session_to_request_profile(monkeypatch, tmp_pat
         "model_provider": fake.model_provider,
         "profile": "work",
     }
-    routes._handle_chat_start(Handler(), body)
+    stream_id = None
+    try:
+        routes._handle_chat_start(Handler(), body)
 
-    assert fake.profile == "work"
-    assert fake.saved is True
-    assert started_threads, "chat_start should launch the stream after retagging"
-    assert payloads and payloads[-1][0] == 200
+        assert fake.profile == "work"
+        assert fake.saved is True
+        assert started_threads, "chat_start should launch the stream after retagging"
+        assert payloads and payloads[-1][0] == 200
+        stream_id = payloads[-1][1]["stream_id"]
+    finally:
+        if stream_id:
+            from api import config
+            from api.run_admission import rollback_admitted_stream
+
+            rollback_admitted_stream(stream_id)
+            config.clear_session_writeback_owner_if_owned(fake.session_id, stream_id)
+            fake.active_stream_id = None
+            with config.STREAMS_LOCK:
+                assert stream_id not in config.STREAMS
+            with config.ACTIVE_RUNS_LOCK:
+                assert stream_id not in config.ACTIVE_RUNS
+            assert config.stream_owner_session_id(stream_id) is None
+            assert config.session_writeback_owner(fake.session_id) is None
 
 
 def test_chat_start_does_not_retag_non_empty_session(monkeypatch, tmp_path):
@@ -781,20 +798,37 @@ def test_chat_start_does_not_retag_non_empty_session(monkeypatch, tmp_path):
     monkeypatch.setattr(routes.threading, "Thread", FakeThread)
     monkeypatch.setattr(routes, "j", lambda handler, payload, status=200, **kwargs: payload)
 
-    routes._handle_chat_start(
-        object(),
-        {
-            "session_id": fake.session_id,
-            "message": "hello",
-            "workspace": str(tmp_path),
-            "model": fake.model,
-            "model_provider": fake.model_provider,
-            "profile": "work",
-        },
-    )
+    stream_id = None
+    try:
+        result = routes._handle_chat_start(
+            object(),
+            {
+                "session_id": fake.session_id,
+                "message": "hello",
+                "workspace": str(tmp_path),
+                "model": fake.model,
+                "model_provider": fake.model_provider,
+                "profile": "work",
+            },
+        )
+        stream_id = result["stream_id"]
 
-    assert fake.profile == "default"
-    assert fake.saved is True
+        assert fake.profile == "default"
+        assert fake.saved is True
+    finally:
+        if stream_id:
+            from api import config
+            from api.run_admission import rollback_admitted_stream
+
+            rollback_admitted_stream(stream_id)
+            config.clear_session_writeback_owner_if_owned(fake.session_id, stream_id)
+            fake.active_stream_id = None
+            with config.STREAMS_LOCK:
+                assert stream_id not in config.STREAMS
+            with config.ACTIVE_RUNS_LOCK:
+                assert stream_id not in config.ACTIVE_RUNS
+            assert config.stream_owner_session_id(stream_id) is None
+            assert config.session_writeback_owner(fake.session_id) is None
 
 
 def test_chat_start_rejects_invalid_request_profile(monkeypatch):

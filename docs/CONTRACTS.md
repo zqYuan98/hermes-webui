@@ -113,6 +113,41 @@ the current code and tests prove that model still applies.
 For UI or UX work, include before/after evidence, verify relevant responsive
 states, and prefer stable class/data hooks over one-off visual behavior.
 
+### Skill human-description boundary
+
+The Skills panel may store a human-facing localized explanation in
+`$HERMES_WEBUI_STATE_DIR/skill-ui-descriptions.json`. This is WebUI state,
+partitioned by the active Profile's resolved Hermes home; it is not Skill runtime
+metadata.
+
+- `SKILL.md`, linked files, ordinary `GET /api/skills`, ordinary
+  `GET /api/skills/content`, slash-command resolution, and Agent skill discovery
+  must not expose `ui_description`.
+- Only the Skills management surface may request it, using explicit
+  `include_ui=1`; callers that omit the flag retain the previous response shape.
+- Saves must preserve the runtime/UI split. Combined `SKILL.md` + sidecar saves,
+  rollback, UI-only edits, Skill deletion, and `include_ui=1` Skills-management
+  list/detail snapshot reads share one Profile-scoped, cross-process transaction
+  lock. A management read must never observe new runtime content/metadata paired
+  with stale UI metadata (or the inverse); if the sidecar cannot persist, the
+  runtime write is rolled back rather than reported as success.
+- Sidecar writes are size-bounded, atomically published, cross-process serialized,
+  and scoped by Profile. Deleting a Skill prunes the matching UI entry. Same-name
+  Profile creation, deletion, and Skill mutations share the Profile transaction
+  lock. Deleting a Profile prunes its complete sidecar bucket, and a failed Profile
+  deletion restores that bucket rather than leaving a partial lifecycle state.
+  Stale Skills requests after deletion must not recreate the Profile home or its
+  sidecar metadata.
+- New local Skill save requests must already use the canonical lowercase component
+  form; the server must not silently normalize case, spaces, or surrounding
+  whitespace. The request name, physical directory name, and original frontmatter
+  `name` must match exactly. Existing historical Skills may still be found through
+  a physical-directory alias, but their parsed frontmatter `name` remains the
+  canonical sidecar identity for detail, edit, and delete operations.
+- Regression evidence must cover positive UI delivery, negative runtime absence,
+  canonical Skill identity, concurrent save/delete paths, and Profile
+  deletion/recreation.
+
 ## Choosing the relevant contract
 
 Before editing, identify which contract family the task exercises. This is a
