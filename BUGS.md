@@ -24,6 +24,11 @@ This file tracks UI bugs and polish items. Fixed items are kept for reference.
 
 ## Fixed
 
+### ~~Upstream merge reintroduced long-session workspace sidebar layout jank~~ -- Fixed
+
+- **Was:** The v0.21.0 paired merge restored two old layout hot paths: `outline.js` wrote `--outline-workspace-offset` on `document.documentElement` from every workspace-panel observer callback, invalidating styles across the full transcript, and `.rightpanel` animated its `width`, reflowing the three-column layout every frame. A 3,564-message read-only canary reproduced root-level writes, width interpolation, and over-one-second style recalculation.
+- **Fix:** Scoped the outline offset to `#outlinePanelWrapper`, skipped closed-outline work, deduplicated unchanged widths, and made workspace-panel width switching discrete while retaining opacity/transform transitions. Added static regressions and a real-session canary that first exercises the current bounded tail contract, then loads the complete 3,564-message transcript through `_ensureAllMessagesLoaded()`. The fixed canary reports zero root writes, no width transition, and bounded style recalculation.
+
 ### ~~Custom-provider actions could cross a named Profile recreation boundary~~ -- Fixed
 
 - **Was:** The custom-provider management GET returned no Profile incarnation token, and save/test/discover/activate/delete requests were guarded only by the reusable Profile name/path. A browser action queued against named Profile generation A could therefore acquire the same path lock after delete + same-name recreate and mutate generation B.
