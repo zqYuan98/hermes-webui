@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -1243,6 +1244,69 @@ def test_custom_lock_delegates_to_canonical_profile_transaction(
         assert state["entered"] is True
 
 
+def test_generation_cas_and_publication_are_inside_profile_lock(monkeypatch, tmp_path):
+    from api import custom_models, profiles
+    from api.profile_generation import ensure_profile_generation
+
+    home = tmp_path / ".hermes" / "profiles" / "demo"
+    home.mkdir(parents=True)
+    generation = ensure_profile_generation(home)
+    events = []
+
+    @contextmanager
+    def tracked_lock(_profile_key):
+        events.append("profile-enter")
+        try:
+            yield
+        finally:
+            events.append("profile-exit")
+
+    real_require = custom_models._require_profile_generation_locked
+    real_load = custom_models._load_config
+    real_commit = custom_models._commit_config_and_env
+
+    def tracked_require(profile_home, body):
+        events.append("generation-check")
+        return real_require(profile_home, body)
+
+    def tracked_load(profile_home):
+        events.append("config-read")
+        return real_load(profile_home)
+
+    def tracked_commit(profile_home, config_data, **kwargs):
+        events.append("publish")
+        return real_commit(profile_home, config_data, **kwargs)
+
+    monkeypatch.setattr(custom_models, "_active_home", lambda: home)
+    monkeypatch.setattr(custom_models, "_shared_profile_mutation_lock", tracked_lock)
+    monkeypatch.setattr(custom_models, "_require_profile_generation_locked", tracked_require)
+    monkeypatch.setattr(custom_models, "_load_config", tracked_load)
+    monkeypatch.setattr(custom_models, "_commit_config_and_env", tracked_commit)
+    monkeypatch.setattr(custom_models, "_refresh_runtime_caches", lambda *_a, **_k: None)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "demo")
+
+    result = custom_models.upsert_custom_model(
+        {
+            "profile": "demo",
+            "profile_generation": generation,
+            "name": "Locked Provider",
+            "base_url": "https://locked.example/v1",
+            "api_mode": "chat_completions",
+            "models": ["m1"],
+            "default_model": "m1",
+        }
+    )
+
+    assert result["ok"] is True
+    assert events == [
+        "profile-enter",
+        "generation-check",
+        "config-read",
+        "publish",
+        "profile-exit",
+    ]
+
+
 def test_profile_home_is_rechecked_after_lock_acquisition(monkeypatch, tmp_path):
     from api import custom_models
 
@@ -1292,3 +1356,125 @@ def test_routes_expose_custom_model_management_contract():
     assert '"/api/providers/custom-models/discover"' in source
     assert 'parsed.path == "/api/providers/custom-models/activate"' in source
     assert 'parsed.path == "/api/providers/custom-models/delete"' in source
+    assert 'payload["code"] = exc.code' in source
+    assert "return j(handler, payload, status=exc.status)" in source
+
+
+def _install_named_profile_home(monkeypatch, tmp_path):
+    from api import custom_models, profiles
+
+    home = tmp_path / ".hermes" / "profiles" / "demo"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(custom_models, "_active_home", lambda: home)
+    monkeypatch.setattr(custom_models, "_shared_profile_mutation_lock", _no_lock)
+    monkeypatch.setattr(custom_models, "_refresh_runtime_caches", lambda *_a, **_k: None)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "demo")
+    return custom_models, home
+
+
+def test_named_profile_custom_model_snapshot_requires_generation_on_write(
+    monkeypatch, tmp_path
+):
+    custom_models, home = _install_named_profile_home(monkeypatch, tmp_path)
+
+    snapshot = custom_models.list_custom_models()
+    generation = snapshot["profile_generation"]
+    assert generation
+
+    body = {
+        "profile": "demo",
+        "name": "Generation Guard",
+        "base_url": "https://generation.example/v1",
+        "api_mode": "chat_completions",
+        "models": ["m1"],
+        "default_model": "m1",
+    }
+    with pytest.raises(custom_models.CustomModelError) as excinfo:
+        custom_models.upsert_custom_model(body)
+    assert excinfo.value.status == 409
+    assert excinfo.value.code == "profile_generation_mismatch"
+    assert not (home / "config.yaml").exists()
+
+    result = custom_models.upsert_custom_model(
+        {**body, "profile_generation": generation}
+    )
+    assert result["ok"] is True
+    assert result["profile_generation"] == generation
+
+
+@pytest.mark.parametrize(
+    "operation,body",
+    [
+        ("discover_custom_models", {"base_url": "https://example.invalid/v1"}),
+        (
+            "test_custom_model",
+            {
+                "base_url": "https://example.invalid/v1",
+                "api_mode": "chat_completions",
+                "model": "m1",
+            },
+        ),
+        ("activate_custom_model", {"uid": "providers:missing", "model": "m1"}),
+        ("delete_custom_model", {"uid": "providers:missing"}),
+    ],
+)
+def test_named_profile_all_custom_model_actions_require_snapshot_generation(
+    monkeypatch, tmp_path, operation, body
+):
+    custom_models, _home = _install_named_profile_home(monkeypatch, tmp_path)
+    custom_models.list_custom_models()
+
+    with pytest.raises(custom_models.CustomModelError) as excinfo:
+        getattr(custom_models, operation)({"profile": "demo", **body})
+    assert excinfo.value.status == 409
+    assert excinfo.value.code == "profile_generation_mismatch"
+
+
+def test_stale_custom_model_request_cannot_mutate_recreated_named_profile(
+    monkeypatch, tmp_path
+):
+    custom_models, home = _install_named_profile_home(monkeypatch, tmp_path)
+    generation_a = custom_models.list_custom_models()["profile_generation"]
+
+    shutil.rmtree(home)
+    home.mkdir(parents=True)
+    sentinel = "providers:\n  replacement:\n    api: https://replacement.example/v1\n"
+    (home / "config.yaml").write_text(sentinel, encoding="utf-8")
+    generation_b = custom_models.list_custom_models()["profile_generation"]
+    assert generation_b != generation_a
+
+    with pytest.raises(custom_models.CustomModelError) as excinfo:
+        custom_models.upsert_custom_model(
+            {
+                "profile": "demo",
+                "profile_generation": generation_a,
+                "name": "Stale A",
+                "base_url": "https://stale.example/v1",
+                "api_mode": "chat_completions",
+                "models": ["m1"],
+                "default_model": "m1",
+            }
+        )
+    assert excinfo.value.status == 409
+    assert excinfo.value.code == "profile_generation_mismatch"
+    assert (home / "config.yaml").read_text(encoding="utf-8") == sentinel
+
+
+def test_default_profile_custom_model_calls_remain_tokenless_compatible(
+    monkeypatch, tmp_path
+):
+    custom_models, _home = _install_isolated_home(monkeypatch, tmp_path)
+    snapshot = custom_models.list_custom_models()
+    assert snapshot["profile_generation"] == "default-profile"
+
+    result = custom_models.upsert_custom_model(
+        {
+            "name": "Default Compatible",
+            "base_url": "https://default.example/v1",
+            "api_mode": "chat_completions",
+            "models": ["m1"],
+            "default_model": "m1",
+        }
+    )
+    assert result["ok"] is True
+    assert result["profile_generation"] == "default-profile"

@@ -11380,7 +11380,7 @@ const _SELF_HOSTED_DEFAULT_BASE_URLS = Object.freeze({
   ollama: 'http://localhost:11434/v1',
   lmstudio: 'http://localhost:1234/v1',
 });
-let _customModelData={providers:[],active_provider:null,active_model:null};
+let _customModelData={providers:[],active_provider:null,active_model:null,profile:null,profile_generation:null};
 let _customModelEditorUid=null;
 let _customModelEditorDirty=false;
 let _providersLoadGeneration=0;
@@ -11391,6 +11391,18 @@ function _customModelProfile(){
 
 function _customModelProfileMatches(owner){
   return owner===_customModelProfile();
+}
+
+function _handleCustomModelGenerationConflict(error){
+  if(!error||error.status!==409) return false;
+  let code='';
+  try{code=JSON.parse(error.body||'{}').code||'';}catch(_e){}
+  if(code!=='profile_generation_mismatch') return false;
+  _customModelEditorDirty=false;
+  _customModelEditorUid=null;
+  _customModelData={providers:[],active_provider:null,active_model:null,profile:_customModelProfile(),profile_generation:null};
+  if(typeof showToast==='function') showToast(error.message||'Profile changed; providers were reloaded.',5000,'error');
+  return Promise.resolve(loadProvidersPanel()).then(()=>true);
 }
 
 async function _confirmDiscardCustomModelEditor(){
@@ -11460,7 +11472,7 @@ async function loadProvidersPanel(){
       _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()})),
     ]);
     if(generation!==_providersLoadGeneration||!_customModelProfileMatches(ownerProfile)) return;
-    _customModelData=customData&&typeof customData==='object'?customData:{providers:[]};
+    _customModelData=customData&&typeof customData==='object'?customData:{providers:[],profile_generation:null};
     _customModelData.profile=ownerProfile;
     const customProviderIds=new Set((_customModelData.providers||[]).map(p=>p.provider_id));
     const providers=(data.providers||[]).filter(p=>(p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider||p.is_self_hosted)&&!customProviderIds.has(p.id));
@@ -11892,6 +11904,7 @@ function _customModelPayload(editor){
   const payload={
     uid:editor.uid||undefined,
     profile:editor.profile||_customModelProfile(),
+    profile_generation:editor.profileGeneration||_customModelData.profile_generation||null,
     name:(editor.nameInput&&editor.nameInput.value||'').trim(),
     base_url:(editor.baseUrlInput&&editor.baseUrlInput.value||'').trim(),
     api_mode:(editor.apiModeSelect&&editor.apiModeSelect.value||'chat_completions').trim(),
@@ -12008,7 +12021,7 @@ async function _discoverCustomModelsEditor(editor){
   _customModelStatus(editor.statusEl,t('providers_custom_discovering'),null);
   try{
     const result=await api('/api/providers/custom-models/discover',{
-      method:'POST',body:JSON.stringify(payload),
+      method:'POST',body:JSON.stringify({...payload,profile_generation:editor.profileGeneration||_customModelData.profile_generation||null}),
     });
     if(!_customModelProfileMatches(editor.profile)) return;
     const models=Array.isArray(result&&result.models)?result.models.filter(Boolean):[];
@@ -12027,6 +12040,7 @@ async function _discoverCustomModelsEditor(editor){
     _customModelStatus(editor.statusEl,t('providers_custom_discover_success',models.length),true);
     if(models.length===1) _useDiscoveredCustomModel(editor);
   }catch(error){
+    if(await _handleCustomModelGenerationConflict(error)) return;
     _customModelStatus(editor.statusEl,t('providers_custom_discover_failed',error&&error.message||'Request failed'),false);
   }finally{
     button.disabled=false;
@@ -12048,7 +12062,7 @@ async function _testCustomModelEditor(editor){
   _customModelStatus(editor.statusEl,t('providers_custom_testing'),null);
   try{
     const result=await api('/api/providers/custom-models/test',{
-      method:'POST',body:JSON.stringify({...payload,model:payload.default_model}),
+      method:'POST',body:JSON.stringify({...payload,model:payload.default_model,profile_generation:editor.profileGeneration||_customModelData.profile_generation||null}),
     });
     if(!_customModelProfileMatches(editor.profile)) return;
     if(result&&result.ok){
@@ -12057,6 +12071,7 @@ async function _testCustomModelEditor(editor){
       _customModelStatus(editor.statusEl,t('providers_custom_test_failed',(result&&result.error)||'Unknown error'),false);
     }
   }catch(error){
+    if(await _handleCustomModelGenerationConflict(error)) return;
     _customModelStatus(editor.statusEl,t('providers_custom_test_failed',error&&error.message||'Request failed'),false);
   }finally{
     button.disabled=false;
@@ -12087,6 +12102,7 @@ async function _saveCustomModelEditor(editor){
     _refreshModelDropdownsAfterProviderChange();
     await loadProvidersPanel();
   }catch(error){
+    if(await _handleCustomModelGenerationConflict(error)) return;
     _customModelStatus(editor.statusEl,error&&error.message||'Save failed',false);
     editor.saveBtn.disabled=false;
     editor.saveBtn.textContent=original;
@@ -12099,7 +12115,7 @@ async function _activateCustomModel(provider,button){
   button.disabled=true;
   try{
     const result=await api('/api/providers/custom-models/activate',{
-      method:'POST',body:JSON.stringify({uid:provider.uid,model:provider.default_model,profile:provider._profile}),
+      method:'POST',body:JSON.stringify({uid:provider.uid,model:provider.default_model,profile:provider._profile,profile_generation:provider._profile_generation}),
     });
     if(!_customModelProfileMatches(provider._profile)) return;
     if(!result||!result.ok) throw new Error(result&&result.error||'Activation failed');
@@ -12107,6 +12123,7 @@ async function _activateCustomModel(provider,button){
     _refreshModelDropdownsAfterProviderChange();
     await loadProvidersPanel();
   }catch(error){
+    if(await _handleCustomModelGenerationConflict(error)) return;
     showToast(error&&error.message||'Activation failed',5000,'error');
     button.disabled=false;
     button.textContent=previous;
@@ -12129,7 +12146,7 @@ async function _deleteCustomModel(provider,button){
   button.textContent=t('providers_removing');
   try{
     const result=await api('/api/providers/custom-models/delete',{
-      method:'POST',body:JSON.stringify({uid:provider.uid,profile:provider._profile}),
+      method:'POST',body:JSON.stringify({uid:provider.uid,profile:provider._profile,profile_generation:provider._profile_generation}),
     });
     if(!_customModelProfileMatches(provider._profile)) return;
     if(!result||!result.ok) throw new Error(result&&result.error||'Delete failed');
@@ -12139,6 +12156,7 @@ async function _deleteCustomModel(provider,button){
     _refreshModelDropdownsAfterProviderChange();
     await loadProvidersPanel();
   }catch(error){
+    if(await _handleCustomModelGenerationConflict(error)) return;
     showToast(error&&error.message||'Delete failed',6000,'error');
     button.disabled=false;
     button.textContent=previous;
@@ -12146,7 +12164,7 @@ async function _deleteCustomModel(provider,button){
 }
 
 function _buildCustomModelEditor(provider){
-  const draft=provider||{uid:null,name:'',base_url:'',api_mode:'chat_completions',models:[''],default_model:'',context_length:'',has_api_key:false,is_active:false,enabled:true,test_supported:true,_profile:_customModelProfile()};
+  const draft=provider||{uid:null,name:'',base_url:'',api_mode:'chat_completions',models:[''],default_model:'',context_length:'',has_api_key:false,is_active:false,enabled:true,test_supported:true,_profile:_customModelProfile(),_profile_generation:_customModelData.profile_generation||null};
   const card=document.createElement('div');
   card.className='provider-card custom-model-card open';
   card.dataset.provider=draft.provider_id||'new';
@@ -12180,6 +12198,7 @@ function _buildCustomModelEditor(provider){
   const editor={
     uid:draft.uid||null,
     profile:draft._profile||_customModelProfile(),
+    profileGeneration:draft._profile_generation||_customModelData.profile_generation||null,
     key:(draft.provider_id||'new').replace(/[^a-z0-9_-]/gi,'-'),
     initialContextLength:String(draft.context_length??''),
     initialApiModeExplicit:draft.api_mode_explicit!==false,
@@ -12305,11 +12324,12 @@ function _buildCustomModelSummary(provider){
     _customModelStatus(status,t('providers_custom_testing'),null);
     try{
       const result=await api('/api/providers/custom-models/test',{
-        method:'POST',body:JSON.stringify({uid:provider.uid,model:provider.default_model,profile:provider._profile}),
+        method:'POST',body:JSON.stringify({uid:provider.uid,model:provider.default_model,profile:provider._profile,profile_generation:provider._profile_generation}),
       });
       if(!_customModelProfileMatches(provider._profile)) return;
       _customModelStatus(status,result&&result.ok?t('providers_custom_test_success',result.latency_ms):t('providers_custom_test_failed',(result&&result.error)||'Unknown error'),!!(result&&result.ok));
     }catch(error){
+      if(await _handleCustomModelGenerationConflict(error)) return;
       _customModelStatus(status,t('providers_custom_test_failed',error&&error.message||'Request failed'),false);
     }finally{
       testBtn.disabled=false;
@@ -12346,7 +12366,7 @@ function _buildCustomModelsSection(data){
   const providers=Array.isArray(data.providers)?data.providers:[];
   if(_customModelEditorUid==='new') list.appendChild(_buildCustomModelEditor(null));
   for(const providerData of providers){
-    const provider={...providerData,_profile:data.profile||_customModelProfile()};
+    const provider={...providerData,_profile:data.profile||_customModelProfile(),_profile_generation:data.profile_generation||null};
     list.appendChild(_customModelEditorUid===provider.uid?_buildCustomModelEditor(provider):_buildCustomModelSummary(provider));
   }
   if(!providers.length&&_customModelEditorUid!=='new'){

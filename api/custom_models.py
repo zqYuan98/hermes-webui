@@ -57,9 +57,10 @@ _FALLBACK_PROFILE_LOCK = None
 class CustomModelError(RuntimeError):
     """Expected validation/conflict failure with an HTTP status."""
 
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, *, code: str | None = None):
         super().__init__(message)
         self.status = int(status)
+        self.code = str(code or "").strip() or None
 
 
 def _active_home() -> Path:
@@ -88,6 +89,49 @@ def _assert_expected_profile(body: dict[str, Any]) -> None:
             "Active profile changed before this custom model action completed. Reload and try again.",
             409,
         )
+
+
+def _profile_generation_mismatch() -> CustomModelError:
+    return CustomModelError(
+        "Active profile generation changed; reload and retry",
+        409,
+        code="profile_generation_mismatch",
+    )
+
+
+def _current_profile_generation_locked(home: Path) -> str:
+    """Capture one Profile incarnation while its canonical lifecycle lock is held."""
+    from api.profile_generation import (
+        ProfileGenerationError,
+        generation_for_profile_home,
+        is_named_profile_home,
+        profile_home_identity,
+    )
+
+    named = is_named_profile_home(home)
+    try:
+        identity = profile_home_identity(home) if named else None
+        generation = generation_for_profile_home(home, named=named)
+        if named and profile_home_identity(home) != identity:
+            raise _profile_generation_mismatch()
+        return generation
+    except CustomModelError:
+        raise
+    except (FileNotFoundError, OSError, ProfileGenerationError) as exc:
+        raise _profile_generation_mismatch() from exc
+
+
+def _require_profile_generation_locked(home: Path, body: dict[str, Any]) -> str:
+    """Reject stale or tokenless named-Profile actions inside the Profile lock."""
+    from api.profile_generation import is_named_profile_home
+
+    generation = _current_profile_generation_locked(home)
+    expected = str(body.get("profile_generation") or "").strip()
+    if (is_named_profile_home(home) and not expected) or (
+        expected and expected != generation
+    ):
+        raise _profile_generation_mismatch()
+    return generation
 
 
 @contextmanager
@@ -740,10 +784,14 @@ def list_custom_models() -> dict[str, Any]:
     home = _active_home()
     with _shared_profile_mutation_lock(home):
         _assert_profile_home(home)
+        generation = _current_profile_generation_locked(home)
         config_data = _load_config(home)
         _validate_config_containers(config_data)
         env_values = _load_env_file(home / ".env")
-        return _custom_models_payload(config_data, env_values)
+        return {
+            **_custom_models_payload(config_data, env_values),
+            "profile_generation": generation,
+        }
 
 
 def _validated_models(body: dict[str, Any]) -> tuple[list[str], str]:
@@ -952,6 +1000,7 @@ def upsert_custom_model(body: dict[str, Any]) -> dict[str, Any]:
     home = _active_home()
     with _shared_profile_mutation_lock(home):
         _assert_profile_home(home)
+        generation = _require_profile_generation_locked(home, body)
         config_path = home / "config.yaml"
         revision = _config_revision(config_path)
         config_data = _load_config(home)
@@ -1136,7 +1185,12 @@ def upsert_custom_model(body: dict[str, Any]) -> dict[str, Any]:
         )
 
     _refresh_runtime_caches(provider_id)
-    return {"ok": True, "provider": provider, **payload}
+    return {
+        "ok": True,
+        "provider": provider,
+        **payload,
+        "profile_generation": generation,
+    }
 
 
 def activate_custom_model(body: dict[str, Any]) -> dict[str, Any]:
@@ -1146,6 +1200,7 @@ def activate_custom_model(body: dict[str, Any]) -> dict[str, Any]:
     home = _active_home()
     with _shared_profile_mutation_lock(home):
         _assert_profile_home(home)
+        generation = _require_profile_generation_locked(home, body)
         revision = _config_revision(home / "config.yaml")
         config_data = _load_config(home)
         _validate_config_containers(config_data)
@@ -1164,7 +1219,13 @@ def activate_custom_model(body: dict[str, Any]) -> dict[str, Any]:
         _assign_default(config_data, provider_id, model, entry)
         _save_config(home, config_data, expected_revision=revision)
     _refresh_runtime_caches(provider_id)
-    return {"ok": True, "uid": uid, "provider": provider_id, "model": model}
+    return {
+        "ok": True,
+        "uid": uid,
+        "provider": provider_id,
+        "model": model,
+        "profile_generation": generation,
+    }
 
 
 def delete_custom_model(body: dict[str, Any]) -> dict[str, Any]:
@@ -1174,6 +1235,7 @@ def delete_custom_model(body: dict[str, Any]) -> dict[str, Any]:
     home = _active_home()
     with _shared_profile_mutation_lock(home):
         _assert_profile_home(home)
+        generation = _require_profile_generation_locked(home, body)
         revision = _config_revision(home / "config.yaml")
         config_data = _load_config(home)
         _validate_config_containers(config_data)
@@ -1222,7 +1284,12 @@ def delete_custom_model(body: dict[str, Any]) -> dict[str, Any]:
             config_data, _load_env_file(home / ".env")
         )
     _refresh_runtime_caches(provider_id)
-    return {"ok": True, "deleted": uid, **payload}
+    return {
+        "ok": True,
+        "deleted": uid,
+        **payload,
+        "profile_generation": generation,
+    }
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -1299,6 +1366,7 @@ def discover_custom_models(body: dict[str, Any]) -> dict[str, Any]:
     home = _active_home()
     with _shared_profile_mutation_lock(home):
         _assert_profile_home(home)
+        _require_profile_generation_locked(home, body)
         config_data = _load_config(home)
         _validate_config_containers(config_data)
         env_values = _load_env_file(home / ".env")
@@ -1363,6 +1431,7 @@ def test_custom_model(body: dict[str, Any]) -> dict[str, Any]:
     home = _active_home()
     with _shared_profile_mutation_lock(home):
         _assert_profile_home(home)
+        _require_profile_generation_locked(home, body)
         config_data = _load_config(home)
         _validate_config_containers(config_data)
         env_values = _load_env_file(home / ".env")

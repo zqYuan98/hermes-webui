@@ -13644,7 +13644,10 @@ def handle_get(handler, parsed) -> bool:
             ):
                 return j(handler, list_custom_models())
         except CustomModelError as exc:
-            return bad(handler, str(exc), status=exc.status)
+            payload = {"error": str(exc)}
+            if exc.code:
+                payload["code"] = exc.code
+            return j(handler, payload, status=exc.status)
 
     if parsed.path == "/api/providers":
         query = parse_qs(parsed.query)
@@ -16042,7 +16045,10 @@ def handle_post(handler, parsed) -> bool:
                 if parsed.path == "/api/providers/custom-models/delete":
                     return j(handler, delete_custom_model(body))
         except CustomModelError as exc:
-            return bad(handler, str(exc), status=exc.status)
+            payload = {"error": str(exc)}
+            if exc.code:
+                payload["code"] = exc.code
+            return j(handler, payload, status=exc.status)
         return bad(handler, "Unknown custom model action", status=404)
 
     if parsed.path == "/api/providers":

@@ -24,6 +24,11 @@ This file tracks UI bugs and polish items. Fixed items are kept for reference.
 
 ## Fixed
 
+### ~~Custom-provider actions could cross a named Profile recreation boundary~~ -- Fixed
+
+- **Was:** The custom-provider management GET returned no Profile incarnation token, and save/test/discover/activate/delete requests were guarded only by the reusable Profile name/path. A browser action queued against named Profile generation A could therefore acquire the same path lock after delete + same-name recreate and mutate generation B.
+- **Fix:** Bound the provider panel snapshot to `profile_generation`, require that token for every named-Profile custom-provider action inside the canonical Agent Profile lock, return a structured `profile_generation_mismatch` 409, and refresh the panel without replaying the stale mutation. The stable default Profile remains backward-compatible with tokenless callers. Added deterministic tokenless/stale/recreated-Profile, frontend propagation, structured-route, and non-replay refresh regressions.
+
 ### ~~Upstream sync broke chat admission and legacy custom-provider management~~ -- Fixed
 
 - **Was:** The synchronized WebUI called admitted run helpers with an undefined `regeneration` variable, so ordinary chat, wakeup, and drain paths could fail with `NameError`. The same paired upgrade introduced an Agent provider named `router`; WebUI then reclassified an existing legacy `providers.router` custom endpoint as the new official provider and hid it from custom-provider CRUD. Custom-provider discard/delete actions also still used native browser `confirm()` dialogs.

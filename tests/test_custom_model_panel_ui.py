@@ -52,6 +52,7 @@ const makeInput = (value, checked=false) => ({value, checked});
 const editor = {
   uid: 'providers:custom:router',
   profile: 'work',
+  profileGeneration: 'generation-a',
   nameInput: makeInput('Router'),
   baseUrlInput: makeInput('https://router.example/v1'),
   apiModeSelect: makeInput('chat_completions'),
@@ -73,6 +74,7 @@ process.stdout.write(JSON.stringify(fn(editor)));
     assert payload == {
         "uid": "providers:custom:router",
         "profile": "work",
+        "profile_generation": "generation-a",
         "name": "Router",
         "base_url": "https://router.example/v1",
         "api_mode": "chat_completions",
@@ -95,7 +97,7 @@ def test_existing_context_length_is_only_sent_when_changed(tmp_path):
 const fn = %s;
 const input = (value, checked=false) => ({value, checked});
 const base = {
-  uid: 'providers:router', profile: 'work', initialContextLength: '32000',
+  uid: 'providers:router', profile: 'work', profileGeneration: 'generation-a', initialContextLength: '32000',
   nameInput: input('Router'), baseUrlInput: input('https://router.example/v1'),
   apiModeSelect: input('bedrock_converse'), apiKeyInput: input(''),
   clearKeyInput: input('', false), makeDefaultInput: input('', false),
@@ -273,3 +275,66 @@ def test_custom_model_editor_has_mobile_layout_contract():
     assert ".custom-model-actions" in STYLE
     assert ".custom-model-discovery" in STYLE
     assert ".custom-model-field-actions" in STYLE
+
+
+def test_custom_model_frontend_binds_every_action_to_panel_generation():
+    assert "profileGeneration:draft._profile_generation||_customModelData.profile_generation||null" in PANELS
+    assert "profile_generation:editor.profileGeneration||_customModelData.profile_generation||null" in PANELS
+    assert "_profile_generation:data.profile_generation" in PANELS
+    for endpoint in (
+        "/api/providers/custom-models/test",
+        "/api/providers/custom-models/discover",
+        "/api/providers/custom-models/activate",
+        "/api/providers/custom-models/delete",
+    ):
+        start = PANELS.index(endpoint)
+        window = PANELS[start : start + 500]
+        assert "profile_generation" in window
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required")
+def test_generation_conflict_refreshes_without_replaying_mutation(tmp_path):
+    source = extract_function(PANELS, "_handleCustomModelGenerationConflict").replace(
+        "function _handleCustomModelGenerationConflict",
+        "async function _handleCustomModelGenerationConflict",
+        1,
+    )
+    script = tmp_path / "provider-generation-conflict.js"
+    script.write_text(
+        """
+let _customModelEditorDirty = true;
+let _customModelEditorUid = 'providers:custom:old';
+let _customModelData = {providers:[{uid:'old'}],profile_generation:'generation-a'};
+let reloads = 0;
+let toasts = 0;
+const _customModelProfile = () => 'demo';
+const loadProvidersPanel = async () => { reloads += 1; };
+const showToast = () => { toasts += 1; };
+const t = value => value;
+const fn = %s;
+(async()=>{
+  const handled = await fn({status:409,body:JSON.stringify({code:'profile_generation_mismatch'})});
+  const unrelated = await fn({status:409,body:JSON.stringify({code:'other_conflict'})});
+  process.stdout.write(JSON.stringify({handled,unrelated,reloads,toasts,dirty:_customModelEditorDirty,uid:_customModelEditorUid,data:_customModelData}));
+})().catch(error=>{console.error(error);process.exit(1);});
+""" % source,
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [NODE, str(script)], capture_output=True, text=True, check=True
+    )
+    assert json.loads(result.stdout) == {
+        "handled": True,
+        "unrelated": False,
+        "reloads": 1,
+        "toasts": 1,
+        "dirty": False,
+        "uid": None,
+        "data": {
+            "providers": [],
+            "active_provider": None,
+            "active_model": None,
+            "profile": "demo",
+            "profile_generation": None,
+        },
+    }
