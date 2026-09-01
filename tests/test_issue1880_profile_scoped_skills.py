@@ -171,9 +171,20 @@ def test_skill_save_and_delete_respect_profile_cookie():
     with _IsolatedSkillsDirs(profile) as dirs:
         content = "---\nname: profile-saved-skill-1880\ndescription: Saved profile skill\n---\n\n# Saved\n"
 
+        snapshot, snapshot_status = _get(
+            "/api/skills?include_ui=1", profile=profile
+        )
+        assert snapshot_status == 200
+        generation = snapshot.get("profile_generation")
+        assert generation
+
         saved, save_status = _post(
             "/api/skills/save",
-            {"name": "profile-saved-skill-1880", "content": content},
+            {
+                "name": "profile-saved-skill-1880",
+                "content": content,
+                "profile_generation": generation,
+            },
             profile=profile,
         )
 
@@ -185,7 +196,10 @@ def test_skill_save_and_delete_respect_profile_cookie():
 
         deleted, delete_status = _post(
             "/api/skills/delete",
-            {"name": "profile-saved-skill-1880"},
+            {
+                "name": "profile-saved-skill-1880",
+                "profile_generation": generation,
+            },
             profile=profile,
         )
         assert delete_status == 200

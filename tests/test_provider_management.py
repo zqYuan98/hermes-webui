@@ -847,21 +847,47 @@ class TestProviderCredentialTransactions:
             pytest.skip("test-only file lock uses fcntl")
         counter_path = tmp_path / "counter.txt"
         counter_path.write_text("0", encoding="utf-8")
+        helper_dir = tmp_path / "spawn_helper"
+        helper_dir.mkdir()
+        (helper_dir / "provider_lock_probe.py").write_text(
+            "import time\n"
+            "from pathlib import Path\n"
+            "from api.provider_transactions import active_profile_transaction\n"
+            "def increment(home_text, start_event):\n"
+            "    home = Path(home_text)\n"
+            "    start_event.wait(5)\n"
+            "    with active_profile_transaction(lambda: home):\n"
+            "        counter = home / 'counter.txt'\n"
+            "        current = int(counter.read_text(encoding='utf-8'))\n"
+            "        time.sleep(0.15)\n"
+            "        counter.write_text(str(current + 1), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        sys.path.insert(0, str(helper_dir))
+        import provider_lock_probe
+
         ctx = multiprocessing.get_context("spawn")
         start = ctx.Event()
         workers = [
             ctx.Process(
-                target=_increment_under_profile_transaction,
+                target=provider_lock_probe.increment,
                 args=(str(tmp_path), start),
             )
             for _ in range(2)
         ]
-        for worker in workers:
-            worker.start()
-        start.set()
-        for worker in workers:
-            worker.join(10)
-            assert worker.exitcode == 0
+        try:
+            for worker in workers:
+                worker.start()
+            start.set()
+            for worker in workers:
+                worker.join(10)
+                assert worker.exitcode == 0
+        finally:
+            sys.modules.pop("provider_lock_probe", None)
+            try:
+                sys.path.remove(str(helper_dir))
+            except ValueError:
+                pass
         assert counter_path.read_text(encoding="utf-8") == "2"
 
     def test_shared_profile_lock_is_outermost_for_key_write(

@@ -47,6 +47,10 @@ class _ConfigState:
 def _configure_named_custom_provider(tmp_path, monkeypatch, *, model=None):
     monkeypatch.setattr(config, "_models_cache_path", tmp_path / "models_cache.json")
     monkeypatch.setattr(config, "_get_auth_store_path", lambda: tmp_path / "auth.json")
+    # Keep get_available_models() on one coherent in-memory config snapshot.
+    # Matching _cfg_path/_cfg_mtime prevents the path-aware cache from replacing
+    # the fixture with an unrelated active Profile config during a full-suite run.
+    config_path = tmp_path / "missing-config.yaml"
     entry = {
         "name": "Broken Proxy",
         "base_url": "https://broken.example/v1",
@@ -54,12 +58,16 @@ def _configure_named_custom_provider(tmp_path, monkeypatch, *, model=None):
     }
     if model:
         entry["model"] = model
-    config.cfg = {
+    fixture = {
         "model": {"provider": "openai-codex", "default": "gpt-5.5"},
         "providers": {},
         "fallback_providers": [],
         "custom_providers": [entry],
     }
+    monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
+    monkeypatch.setattr(config, "_cfg_path", config_path)
+    monkeypatch.setattr(config, "_cfg_cache", fixture)
+    monkeypatch.setattr(config, "cfg", fixture)
 
 
 def _groups_by_provider(data):
