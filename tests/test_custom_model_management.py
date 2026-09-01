@@ -174,6 +174,13 @@ def test_legacy_generic_custom_active_provider_matches_by_base_url(monkeypatch, 
 
 def test_modern_storage_key_alias_is_active_and_delete_protected(monkeypatch, tmp_path):
     custom_models, home = _install_isolated_home(monkeypatch, tmp_path)
+    # Simulate an Agent upgrade that adds an official provider named ``router``.
+    # The historical bare-key custom endpoint must retain its stored identity.
+    monkeypatch.setattr(
+        custom_models.webui_config,
+        "_is_known_model_provider",
+        lambda provider_id: str(provider_id).lower() == "router",
+    )
     (home / "config.yaml").write_text(
         yaml.safe_dump({
             "model": {"provider": "custom:router", "default": "m1"},
@@ -196,6 +203,34 @@ def test_modern_storage_key_alias_is_active_and_delete_protected(monkeypatch, tm
     with pytest.raises(custom_models.CustomModelError) as excinfo:
         custom_models.delete_custom_model({"uid": "providers:router"})
     assert excinfo.value.status == 409
+
+
+def test_active_official_provider_collision_stays_out_of_custom_manager(
+    monkeypatch, tmp_path
+):
+    custom_models, home = _install_isolated_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        custom_models.webui_config,
+        "_is_known_model_provider",
+        lambda provider_id: str(provider_id).lower() == "router",
+    )
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {"provider": "router", "default": "ramp/model"},
+                "providers": {
+                    "router": {
+                        "base_url": "https://api.router.com/v1",
+                        "api_key": "${ROUTER_API_KEY}",
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert custom_models.list_custom_models()["providers"] == []
 
 
 def test_delete_active_provider_fails_closed(monkeypatch, tmp_path):

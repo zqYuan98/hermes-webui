@@ -125,10 +125,10 @@ class TestSkipOnboardingEnvVar(unittest.TestCase):
 
 
 class TestApplyOnboardingKeySync(unittest.TestCase):
-    """Verify that apply_onboarding_setup sets os.environ synchronously."""
+    """Verify onboarding credentials remain scoped to the selected Profile."""
 
-    def test_api_key_set_in_os_environ_after_apply(self):
-        """After apply_onboarding_setup with a key, os.environ must have the key."""
+    def test_api_key_does_not_leak_into_process_global_environ(self):
+        """Publishing Profile .env must not contaminate another request's environment."""
         import pathlib
 
         os.environ.pop("OPENAI_API_KEY", None)
@@ -151,9 +151,10 @@ class TestApplyOnboardingKeySync(unittest.TestCase):
                 "api_key": "sk-test-key-123",
             })
 
-        self.assertEqual(os.environ.get("OPENAI_API_KEY"), "sk-test-key-123",
-                         "OPENAI_API_KEY must be set directly on os.environ after apply")
-        os.environ.pop("OPENAI_API_KEY", None)
+        self.assertIsNone(
+            os.environ.get("OPENAI_API_KEY"),
+            "Profile-scoped onboarding must not write credentials to process-global os.environ",
+        )
 
     def test_no_key_provided_does_not_set_environ(self):
         """If no api_key is given (key already present), os.environ is not clobbered."""

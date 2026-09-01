@@ -457,12 +457,19 @@ let clearCronDetailCalls = 0;
 let _editingCronId = 'old-job';
 let _cronPreFormDetail = {{ id: 'old-job' }};
 let _cronIsDuplicate = true;
+let _providersLoadGeneration = 0;
+let _customModelEditorUid = 'old-provider';
+let _customModelEditorDirty = true;
+let _customModelData = {{providers:[{{id:'old'}}]}};
+let _settingsSection = 'conversation';
 async function loadSkills() {{ skillLoads += 1; }}
 async function loadMemory() {{ memoryLoads += 1; }}
 async function loadCrons() {{ taskLoads += 1; }}
 async function loadKanban() {{ kanbanLoads += 1; }}
 async function loadProfilesPanel() {{ profileLoads += 1; }}
 async function loadWorkspacesPanel() {{ workspaceLoads += 1; }}
+async function loadProvidersPanel() {{}}
+function _customModelProfile() {{ return 'default'; }}
 function _clearCronDetail() {{ clearCronDetailCalls += 1; }}
 {profile_switch_panel_load}
 (async () => {{

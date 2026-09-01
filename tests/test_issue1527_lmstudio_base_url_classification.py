@@ -9,13 +9,11 @@ hostname, but the config block already says which provider owns that base_url.
 from __future__ import annotations
 
 import json
-import socket
-import urllib.request
-
 import pytest
 
 import api.config as config
 import api.profiles as profiles
+from api import provider_endpoint_probe
 
 
 _API_KEY_ENV_VARS = (
@@ -42,6 +40,8 @@ _API_KEY_ENV_VARS = (
 
 
 class _ModelsResponse:
+    status = 200
+
     def __init__(self, model_ids: list[str]):
         self._model_ids = model_ids
 
@@ -51,8 +51,16 @@ class _ModelsResponse:
     def __exit__(self, *_args):
         return None
 
-    def read(self) -> bytes:
+    def read(self, _size=-1) -> bytes:
         return json.dumps({"data": [{"id": mid} for mid in self._model_ids]}).encode()
+
+
+class _ModelsOpener:
+    def __init__(self, model_ids: list[str]):
+        self._model_ids = model_ids
+
+    def open(self, _request, timeout=0):
+        return _ModelsResponse(self._model_ids)
 
 
 @pytest.fixture(autouse=True)
@@ -79,18 +87,35 @@ def _write_config(tmp_path, monkeypatch, text: str) -> None:
 
 
 def _mock_model_discovery(monkeypatch, model_ids: list[str], resolved_ip: str) -> None:
+    # Standalone WebUI uses the shared bounded/no-redirect opener. Explicitly
+    # configured self-hosted endpoints do not undergo a separate DNS preflight.
+    _ = resolved_ip
     monkeypatch.setattr(
-        urllib.request,
-        "urlopen",
-        lambda *_args, **_kwargs: _ModelsResponse(model_ids),
+        provider_endpoint_probe,
+        "DEFAULT_OPENER",
+        _ModelsOpener(model_ids),
     )
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *_args, **_kwargs: [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (resolved_ip, 0))
-        ],
-    )
+    # A paired Agent install is authoritative for provider catalogs and the
+    # WebUI asks hermes_cli.models.provider_model_ids("lmstudio") first. Patch
+    # that seam too when it is importable, preserving all unrelated providers.
+    try:
+        import hermes_cli.models as agent_models
+
+        original_provider_model_ids = agent_models.provider_model_ids
+
+        def provider_model_ids(provider, *args, **kwargs):
+            if str(provider or "").strip().lower() == "lmstudio":
+                return list(model_ids)
+            return original_provider_model_ids(provider, *args, **kwargs)
+
+        monkeypatch.setattr(agent_models, "provider_model_ids", provider_model_ids)
+    except ImportError:
+        pass
+    # This test pins provider ownership and the complete live catalog, not the
+    # separate foreground budget/degraded-fallback behavior. Paired Agent plugin
+    # discovery can legitimately consume part of the default 4s budget, so force
+    # the documented synchronous mode for this contract.
+    monkeypatch.setattr(config, "_LIVE_REBUILD_BUDGET_SECONDS", 0.0)
 
 
 def _groups_by_id() -> dict[str, dict]:

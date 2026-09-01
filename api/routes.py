@@ -24048,6 +24048,7 @@ def _start_chat_stream_for_session(
                 source=source,
                 moa_config=moa_config,
                 external_runtime_owned=external_runtime_owned,
+                regeneration=regeneration,
             )
     except RunAdmissionRejected as exc:
         return {**exc.payload, "_status": 503}
@@ -24067,6 +24068,7 @@ def _start_chat_stream_for_session_admitted(
     source: str = "webui",
     moa_config=None,
     external_runtime_owned: bool | None = None,
+    regeneration=None,
 ):
     """Persist pending state, register an SSE channel, and start an admitted turn."""
     if external_runtime_owned is None:
@@ -24340,6 +24342,7 @@ def _start_run(
                 diag=diag,
                 moa_config=moa_config,
                 gateway_chat_enabled=gateway_chat_enabled,
+                regeneration=regeneration,
             )
     except RunAdmissionRejected as exc:
         return {**exc.payload, "_status": 503}
@@ -24359,6 +24362,7 @@ def _start_run_admitted(
     diag=None,
     moa_config=None,
     gateway_chat_enabled: bool | None = None,
+    regeneration=None,
 ):
     """Shared admitted start-run helper for browser and server-side turns.
 

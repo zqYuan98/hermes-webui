@@ -455,6 +455,73 @@ def _validate_config_containers(config_data: dict[str, Any]) -> None:
         raise CustomModelError("Hermes model config must be a mapping; no changes were applied.", 409)
 
 
+def _modern_entry_is_custom(
+    storage_key: str,
+    raw_entry: dict[str, Any],
+    config_data: dict[str, Any],
+) -> bool:
+    """Classify modern entries without losing legacy bare-key custom aliases.
+
+    New WebUI-managed endpoints use ``providers.custom:<slug>``. Older builds
+    also accepted a bare key such as ``providers.router``. A later Agent release
+    can add an official/plugin provider with that slug (Ramp Router is a real
+    collision), so registry membership alone cannot retroactively convert the
+    user's endpoint into an official provider block.
+
+    Preserve a bare entry as custom only when stored intent says so: the active
+    model explicitly selects ``custom:<key>``, the WebUI owns its key environment
+    variable, or the entry has the legacy custom-editor shape. An explicitly
+    active official provider always remains owned by its official card.
+    """
+    key = str(storage_key or "").strip()
+    lowered = key.lower()
+    if not lowered:
+        return False
+    if lowered.startswith("custom:"):
+        return True
+
+    is_known = False
+    try:
+        is_known = webui_config._is_known_model_provider(lowered)
+    except Exception:
+        pass
+    if not is_known:
+        return True
+
+    model_cfg = config_data.get("model")
+    active_provider = ""
+    if isinstance(model_cfg, dict):
+        active_provider = str(model_cfg.get("provider") or "").strip().lower()
+    if active_provider == lowered:
+        return False
+    if active_provider == f"custom:{lowered}":
+        return True
+    if raw_entry.get("webui_managed_key_env") is True:
+        return True
+
+    has_name = bool(str(raw_entry.get("name") or "").strip())
+    has_endpoint = bool(
+        str(
+            raw_entry.get("base_url")
+            or raw_entry.get("url")
+            or raw_entry.get("api")
+            or ""
+        ).strip()
+    )
+    has_legacy_custom_shape = any(
+        field in raw_entry
+        for field in (
+            "transport",
+            "api_mode",
+            "default_model",
+            "models",
+            "discover_models",
+            "context_length",
+        )
+    )
+    return has_name and has_endpoint and has_legacy_custom_shape
+
+
 def _modern_custom_entries(config_data: dict[str, Any]):
     providers = config_data.get("providers")
     if not isinstance(providers, dict):
@@ -467,13 +534,9 @@ def _modern_custom_entries(config_data: dict[str, Any]):
             continue
         key = str(storage_key or "").strip()
         # Built-in provider override blocks are owned by their built-in cards;
-        # this manager owns explicit custom identities and unknown endpoints.
-        is_known = False
-        try:
-            is_known = webui_config._is_known_model_provider(key)
-        except Exception:
-            pass
-        if is_known and not key.lower().startswith("custom:"):
+        # this manager owns explicit custom identities, unknown endpoints, and
+        # legacy bare-key custom aliases whose slug later became official.
+        if not _modern_entry_is_custom(key, raw_entry, config_data):
             continue
         provider_id = key if key.lower().startswith("custom:") else f"custom:{key}"
         yield f"providers:{key}", "providers", provider_id, raw_entry

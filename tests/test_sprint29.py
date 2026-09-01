@@ -711,13 +711,13 @@ class TestStartupWarning:
 
 
 class TestSSRFCheck:
-    def test_ssrf_guard_code_present_in_config(self):
-        """config.py must contain SSRF DNS resolution guard."""
-        src = pathlib.Path(__file__).parent.parent / "api" / "config.py"
+    def test_configured_endpoint_probe_is_bounded_and_no_redirect(self):
+        """Explicit self-hosted probes must bound reads and never forward on redirect."""
+        src = pathlib.Path(__file__).parent.parent / "api" / "provider_endpoint_probe.py"
         text = src.read_text()
-        assert "getaddrinfo" in text, "SSRF guard must resolve DNS with getaddrinfo"
-        assert "is_private" in text, "SSRF guard must check is_private IP"
-        assert "is_loopback" in text, "SSRF guard must check is_loopback IP"
+        assert "NoRedirectHandler" in text
+        assert "MAX_RESPONSE_BYTES" in text
+        assert "base_url must not contain embedded credentials" in text
 
     def test_known_local_providers_whitelisted(self):
         """Ollama and localhost endpoints should NOT be blocked by SSRF guard."""

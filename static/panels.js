@@ -11393,9 +11393,15 @@ function _customModelProfileMatches(owner){
   return owner===_customModelProfile();
 }
 
-function _confirmDiscardCustomModelEditor(){
+async function _confirmDiscardCustomModelEditor(){
   if(!_customModelEditorDirty) return true;
-  return confirm(t('providers_custom_discard_confirm'));
+  return showConfirmDialog({
+    title:t('providers_custom_title'),
+    message:t('providers_custom_discard_confirm'),
+    confirmLabel:t('dialog_confirm_btn'),
+    danger:true,
+    focusCancel:true,
+  });
 }
 
 function _renderCustomModelsSectionInPlace(){
@@ -11415,8 +11421,8 @@ function _renderCustomModelsSectionInPlace(){
   list.style.display='';
 }
 
-function _openCustomModelEditor(uid){
-  if(!_confirmDiscardCustomModelEditor()) return;
+async function _openCustomModelEditor(uid){
+  if(!(await _confirmDiscardCustomModelEditor())) return;
   // Invalidate a cold panel request so a late response cannot replace fields
   // the user starts typing into immediately after clicking Add/Edit.
   ++_providersLoadGeneration;
@@ -11429,7 +11435,7 @@ function _openCustomModelEditor(uid){
 function _wireProvidersAddCustomButton(){
   const addBtn=$('providersAddCustomBtn');
   if(!addBtn) return;
-  addBtn.onclick=()=>_openCustomModelEditor('new');
+  addBtn.onclick=()=>{ void _openCustomModelEditor('new'); };
 }
 
 async function _fetchProviderQuotaStatus(force=false){
@@ -12110,7 +12116,14 @@ async function _activateCustomModel(provider,button){
 async function _deleteCustomModel(provider,button){
   if(!_customModelProfileMatches(provider._profile)){loadProvidersPanel();return;}
   if(provider.is_active){showToast(t('providers_custom_delete_active_help'),5000,'error');return;}
-  if(!confirm(t('providers_custom_delete_confirm'))) return;
+  const confirmed=await showConfirmDialog({
+    title:t('providers_custom_delete'),
+    message:t('providers_custom_delete_confirm'),
+    confirmLabel:t('providers_custom_delete'),
+    danger:true,
+    focusCancel:true,
+  });
+  if(!confirmed) return;
   const previous=button.textContent;
   button.disabled=true;
   button.textContent=t('providers_removing');
@@ -12239,8 +12252,8 @@ function _buildCustomModelEditor(provider){
     _testCustomModelEditor(editor);
   };
   editor.saveBtn.onclick=()=>_saveCustomModelEditor(editor);
-  card.querySelector('[data-provider-action="cancel"]').onclick=()=>{
-    if(!_confirmDiscardCustomModelEditor()) return;
+  card.querySelector('[data-provider-action="cancel"]').onclick=async()=>{
+    if(!(await _confirmDiscardCustomModelEditor())) return;
     _customModelEditorDirty=false;
     _customModelEditorUid=null;
     _renderCustomModelsSectionInPlace();

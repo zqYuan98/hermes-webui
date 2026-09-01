@@ -168,7 +168,9 @@ setImmediate(() => {
 
 @pytest.mark.skipif(NODE is None, reason="node is required")
 def test_open_custom_editor_renders_locally_without_network(tmp_path):
-    source = extract_function(PANELS, "_openCustomModelEditor")
+    source = extract_function(PANELS, "_openCustomModelEditor").replace(
+        "function _openCustomModelEditor", "async function _openCustomModelEditor", 1
+    )
     script = tmp_path / "provider-open-local.js"
     script.write_text(
         """
@@ -181,8 +183,10 @@ const _confirmDiscardCustomModelEditor = () => true;
 const _customModelProfile = () => 'work';
 const _renderCustomModelsSectionInPlace = () => { renders += 1; };
 const fn = %s;
-fn('new');
-process.stdout.write(JSON.stringify({generation: _providersLoadGeneration, dirty: _customModelEditorDirty, uid: _customModelEditorUid, profile: _customModelData.profile, renders}));
+(async()=>{
+  await fn('new');
+  process.stdout.write(JSON.stringify({generation: _providersLoadGeneration, dirty: _customModelEditorDirty, uid: _customModelEditorUid, profile: _customModelData.profile, renders}));
+})().catch(error=>{console.error(error);process.exit(1);});
 """ % source,
         encoding="utf-8",
     )

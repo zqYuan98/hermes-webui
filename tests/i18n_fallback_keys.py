@@ -40,4 +40,16 @@ CUSTOM_PROVIDER_FALLBACK_KEYS = frozenset({
     "providers_custom_delete_active_help",
     "providers_custom_load_failed",
     "providers_custom_discard_confirm",
+    "providers_custom_discover",
+    "providers_custom_discovering",
+    "providers_custom_discovered_models",
+    "providers_custom_use_model",
+    "providers_custom_discover_success",
+    "providers_custom_discover_failed",
+    "providers_custom_discover_empty",
+    "providers_custom_discover_url_required",
+    # Provider-management override notices intentionally use the English
+    # fallback until each locale receives reviewed translations.
+    "settings_model_override_warning",
+    "settings_model_override_toast",
 })

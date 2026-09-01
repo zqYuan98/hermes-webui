@@ -9,51 +9,44 @@ import os
 import pytest
 
 
-# ---------- Source-code analysis tests ----------
+# ---------- Current transport-policy contract ----------
 
-def test_ssrf_trusted_hosts_variable_exists():
-    """The _ssrf_trusted_hosts set must be built from custom_providers config."""
-    with open("api/config.py") as f:
-        src = f.read()
-    assert "_ssrf_trusted_hosts" in src
-    assert "_ssrf_trusted_hosts: set[str] = set()" in src
-
-
-def test_ssrf_trusted_hosts_populated_from_custom_providers():
-    """Trusted hosts are extracted by iterating custom_providers[].base_url."""
-    with open("api/config.py") as f:
-        src = f.read()
-    # Must read custom_providers from cfg
-    assert 'cfg.get("custom_providers"' in src
-    # Must extract base_url from each entry
-    assert '_cp.get("base_url")' in src
-    # Must parse hostname with urlparse
-    assert "_cp_parsed.hostname" in src
-    # Must add to trusted set
-    assert "_ssrf_trusted_hosts.add" in src
+def test_custom_catalog_uses_shared_bounded_probe():
+    """Custom-provider discovery must use the shared no-redirect fetcher."""
+    config_src = open("api/config.py", encoding="utf-8").read()
+    probe_src = open("api/provider_endpoint_probe.py", encoding="utf-8").read()
+    assert "from api.provider_endpoint_probe import probe_models_endpoint" in config_src
+    assert "NoRedirectHandler" in probe_src
+    assert "MAX_RESPONSE_BYTES" in probe_src
 
 
-def test_ssrf_check_uses_trusted_hosts():
-    """The SSRF check must consult _ssrf_trusted_hosts before blocking."""
-    with open("api/config.py") as f:
-        src = f.read()
-    # The is_known_local check must include _ssrf_trusted_hosts
-    assert "in _ssrf_trusted_hosts" in src
+def test_explicit_private_endpoints_do_not_use_dns_policy_preflight():
+    """Configured Ollama/LM Studio/vLLM endpoints may legitimately be private."""
+    probe_src = open("api/provider_endpoint_probe.py", encoding="utf-8").read()
+    assert "makes no DNS-based allow/deny decision before connecting" in probe_src
+    assert "DEFAULT_OPENER" in probe_src
+    assert "base_url must not contain embedded credentials" in probe_src
 
 
-def test_ssrf_known_local_still_present():
-    """Original hardcoded allowlist must still be present (no regression)."""
-    with open("api/config.py") as f:
+def test_probe_refuses_redirects_before_credentials_cross_origins():
+    probe_src = open("api/provider_endpoint_probe.py", encoding="utf-8").read()
+    assert "def redirect_request" in probe_src
+    assert "return None" in probe_src
+    assert "endpoint returned a redirect" in probe_src
+
+
+def test_known_local_providers_still_present():
+    """Ollama, LM Studio and localhost remain first-class configured endpoints."""
+    with open("api/config.py", encoding="utf-8") as f:
         src = f.read()
     for keyword in ("ollama", "localhost", "127.0.0.1", "lmstudio", "lm-studio"):
-        assert keyword in src, f"Missing hardcoded allowlist entry: {keyword}"
+        assert keyword in src, f"Missing local-provider support: {keyword}"
 
 
-def test_ssrf_block_still_present():
-    """SSRF ValueError must still be raised for unknown private IPs."""
-    with open("api/config.py") as f:
-        src = f.read()
-    assert 'SSRF: resolved hostname to private IP' in src
+def test_probe_rejects_credential_bearing_urls_and_unbounded_bodies():
+    probe_src = open("api/provider_endpoint_probe.py", encoding="utf-8").read()
+    assert "parsed.username or parsed.password" in probe_src
+    assert "MAX_RESPONSE_BYTES + 1" in probe_src
 
 
 # ---------- Functional tests (mocked socket) ----------

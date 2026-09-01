@@ -24,6 +24,11 @@ This file tracks UI bugs and polish items. Fixed items are kept for reference.
 
 ## Fixed
 
+### ~~Upstream sync broke chat admission and legacy custom-provider management~~ -- Fixed
+
+- **Was:** The synchronized WebUI called admitted run helpers with an undefined `regeneration` variable, so ordinary chat, wakeup, and drain paths could fail with `NameError`. The same paired upgrade introduced an Agent provider named `router`; WebUI then reclassified an existing legacy `providers.router` custom endpoint as the new official provider and hid it from custom-provider CRUD. Custom-provider discard/delete actions also still used native browser `confirm()` dialogs.
+- **Fix:** Restored the complete regeneration parameter chain, preserved legacy bare-key custom intent using stored configuration evidence while keeping explicitly active official providers on their own cards, and moved custom-provider confirmations to the shared asynchronous dialog. Added paired Agent/WebUI regression coverage, provider-slug collision positive/negative tests, Profile-scoped OAuth/config transaction checks, and current bounded no-redirect endpoint-probe contracts.
+
 ### ~~External directory views could not upload files~~ -- Fixed
 
 - **Was:** Escape-target grants were correctly read-only, but the workspace Upload button and OS drag/drop were blocked along with every mutation, so an explicitly opened external directory had no safe upload workflow.

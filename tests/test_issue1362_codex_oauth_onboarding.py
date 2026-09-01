@@ -566,13 +566,12 @@ def test_anthropic_onboarding_setup_allows_linked_oauth_without_api_key(monkeypa
     # for the test's scope. monkeypatch.delenv is a no-op if the var is unset.
     monkeypatch.delenv("HERMES_WEBUI_SKIP_ONBOARDING", raising=False)
 
-    cfg_path = tmp_path / "config.yaml"
     home = tmp_path / "home"
     home.mkdir()
+    cfg_path = home / "config.yaml"
     (home / "auth.json").write_text(json.dumps({
         "credential_pool": {"anthropic": [{"auth_type": "oauth", "source": "claude_code_linked"}]}
     }), encoding="utf-8")
-    monkeypatch.setattr(onboarding, "_get_config_path", lambda: cfg_path)
     monkeypatch.setattr(onboarding, "_get_active_hermes_home", lambda: home)
     monkeypatch.setattr(onboarding, "get_onboarding_status", lambda: {"ok": True})
     monkeypatch.setattr(onboarding, "reload_config", lambda: None)

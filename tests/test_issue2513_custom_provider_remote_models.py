@@ -1,13 +1,14 @@
 import json
-import urllib.request
-
 from api import config
+from api import provider_endpoint_probe
 
 
 def test_custom_provider_model_field_does_not_block_remote_catalog(monkeypatch, tmp_path):
     """custom_providers[].model is sticky metadata, not the whole picker catalog."""
 
     class FakeResponse:
+        status = 200
+
         def __init__(self, payload):
             self.payload = payload
 
@@ -17,7 +18,7 @@ def test_custom_provider_model_field_does_not_block_remote_catalog(monkeypatch, 
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def read(self):
+        def read(self, _size=-1):
             return json.dumps(self.payload).encode("utf-8")
 
     calls = []
@@ -44,7 +45,11 @@ def test_custom_provider_model_field_does_not_block_remote_catalog(monkeypatch, 
             )
         raise AssertionError(f"unexpected urlopen: {url}")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    class FakeOpener:
+        def open(self, req, timeout=10):
+            return fake_urlopen(req, timeout=timeout)
+
+    monkeypatch.setattr(provider_endpoint_probe, "DEFAULT_OPENER", FakeOpener())
     # This file pins the custom-provider catalog contract, not the separate
     # async provider-catalog budget fallback. Force the synchronous rebuild
     # path so a slow/loaded CI shard cannot blow the global 4s budget and
@@ -53,6 +58,9 @@ def test_custom_provider_model_field_does_not_block_remote_catalog(monkeypatch, 
     monkeypatch.setattr(config, "_LIVE_REBUILD_BUDGET_SECONDS", 0.0, raising=False)
     monkeypatch.setattr(config, "_models_cache_path", tmp_path / "models_cache.json")
     monkeypatch.setattr(config, "_get_auth_store_path", lambda: tmp_path / "auth.json")
+    # Keep get_available_models() from reloading the process's real config over
+    # this in-memory fixture when it performs its mtime freshness check.
+    monkeypatch.setattr(config, "_get_config_path", lambda: tmp_path / "missing-config.yaml")
     # Keep unrelated provider probes from replacing this complete catalog assertion with the bounded fallback.
     monkeypatch.setattr(config, "_LIVE_REBUILD_BUDGET_SECONDS", 0)
 
@@ -83,6 +91,7 @@ def test_custom_provider_model_field_does_not_block_remote_catalog(monkeypatch, 
             ],
         }
         config._cfg_mtime = 0.0
+        config._cfg_path = config._get_config_path()
         config._available_models_cache = None
         config._available_models_cache_ts = 0.0
         config._available_models_live_rebuild_ts = 0.0
