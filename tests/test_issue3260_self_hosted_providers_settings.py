@@ -309,6 +309,13 @@ def test_post_self_hosted_provider_rejects_invalid_provider(isolated_self_hosted
 def test_get_providers_exposes_self_hosted_flags_and_base_url(monkeypatch, tmp_path):
     _install_fake_hermes_cli(monkeypatch)
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    from api import providers as providers_api
+
+    # Use an explicit request snapshot. Depending on import order, ``config.cfg``
+    # may still alias an uninitialised disk cache whose first get_config() call
+    # reloads and discards this test override (paired-Agent CI exposed this).
+    monkeypatch.setattr(providers_api, "get_config", lambda: config.cfg)
+    providers_api.invalidate_providers_cache()
     old_cfg = dict(config.cfg)
     old_mtime = config._cfg_mtime
     config.cfg.clear()
@@ -319,9 +326,7 @@ def test_get_providers_exposes_self_hosted_flags_and_base_url(monkeypatch, tmp_p
     }
     try:
         config._cfg_mtime = 0.0
-        from api.providers import get_providers
-
-        result = get_providers()
+        result = providers_api.get_providers()
         by_id = {p["id"]: p for p in result["providers"]}
         assert by_id["ollama"]["is_self_hosted"] is True
         assert by_id["ollama"]["base_url"] == "http://127.0.0.1:11434/v1"
@@ -330,6 +335,7 @@ def test_get_providers_exposes_self_hosted_flags_and_base_url(monkeypatch, tmp_p
         assert by_id["lmstudio"]["base_url"] == "http://127.0.0.1:1234/v1"
         assert by_id["ollama-cloud"]["is_self_hosted"] is False
     finally:
+        providers_api.invalidate_providers_cache()
         config.cfg.clear()
         config.cfg.update(old_cfg)
         config._cfg_mtime = old_mtime
