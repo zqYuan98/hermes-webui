@@ -199,6 +199,18 @@ jobs:
       - uses: actions/checkout@v4
         if: needs.changes.outputs.docs_only != 'true'
 
+      # Local profile/skill/provider mutations share an authoritative lock with
+      # Hermes Agent and deliberately fail closed when that module is absent.
+      # Test the paired product instead of producing the same false failure in
+      # every Python/shard job. Pin the accepted Agent side of this WebUI release.
+      - name: Check out paired Hermes Agent
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: zqYuan98/hermes-agent
+          ref: 129f20d32683dbfe9c7937e1e65a3f4be58a38c9
+          path: .paired-hermes-agent
+
       - name: Set up Python ${{ matrix.python-version }}
         if: needs.changes.outputs.docs_only != 'true'
         uses: actions/setup-python@v5
@@ -216,6 +228,9 @@ jobs:
           python -m pip install --upgrade pip
           # Office parsers stay optional at runtime; CI installs them explicitly for the workspace preview tests.
           pip install "pyyaml>=6.0" pytest pytest-timeout pytest-asyncio pytest-shard python-docx openpyxl python-pptx playwright
+          # Install the paired Agent into this interpreter so direct imports and
+          # subprocess tests use the same shared-lock/runtime contracts.
+          pip install -e .paired-hermes-agent
           # ruff is installed so tests/test_ruff_forward_lint.py runs its E9/F821
           # tree-clean assertions in-suite (mirrors how eslint is available for
           # tests/test_static_js_runtime_lint.py). If install fails the test
@@ -249,4 +264,7 @@ jobs:
 
       - name: Run tests (shard ${{ matrix.shard }} of 5)
         if: needs.changes.outputs.docs_only != 'true'
+        env:
+          HERMES_WEBUI_AGENT_DIR: ${{ github.workspace }}/.paired-hermes-agent
+          PYTHONPATH: ${{ github.workspace }}/.paired-hermes-agent
         run: pytest tests/ -v --timeout=60 --shard-id=${{ matrix.shard }} --num-shards=5
