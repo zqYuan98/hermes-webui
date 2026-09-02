@@ -205,11 +205,15 @@ jobs:
       # every Python/shard job. Pin the accepted Agent side of this WebUI release.
       - name: Check out paired Hermes Agent
         if: needs.changes.outputs.docs_only != 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: zqYuan98/hermes-agent
-          ref: 129f20d32683dbfe9c7937e1e65a3f4be58a38c9
-          path: .paired-hermes-agent
+        env:
+          PAIRED_AGENT_SHA: 129f20d32683dbfe9c7937e1e65a3f4be58a38c9
+        run: |
+          # Keep the second repository outside github.workspace: several WebUI
+          # lint/tests intentionally scan "." and must not lint Agent's tree.
+          git init "${RUNNER_TEMP}/paired-hermes-agent"
+          git -C "${RUNNER_TEMP}/paired-hermes-agent" remote add origin https://github.com/zqYuan98/hermes-agent.git
+          git -C "${RUNNER_TEMP}/paired-hermes-agent" fetch --depth=1 origin "${PAIRED_AGENT_SHA}"
+          git -C "${RUNNER_TEMP}/paired-hermes-agent" checkout --detach FETCH_HEAD
 
       - name: Set up Python ${{ matrix.python-version }}
         if: needs.changes.outputs.docs_only != 'true'
@@ -230,7 +234,7 @@ jobs:
           pip install "pyyaml>=6.0" pytest pytest-timeout pytest-asyncio pytest-shard python-docx openpyxl python-pptx playwright
           # Install the paired Agent into this interpreter so direct imports and
           # subprocess tests use the same shared-lock/runtime contracts.
-          pip install -e .paired-hermes-agent
+          pip install -e "${RUNNER_TEMP}/paired-hermes-agent"
           # ruff is installed so tests/test_ruff_forward_lint.py runs its E9/F821
           # tree-clean assertions in-suite (mirrors how eslint is available for
           # tests/test_static_js_runtime_lint.py). If install fails the test
@@ -265,6 +269,6 @@ jobs:
       - name: Run tests (shard ${{ matrix.shard }} of 5)
         if: needs.changes.outputs.docs_only != 'true'
         env:
-          HERMES_WEBUI_AGENT_DIR: ${{ github.workspace }}/.paired-hermes-agent
-          PYTHONPATH: ${{ github.workspace }}/.paired-hermes-agent
+          HERMES_WEBUI_AGENT_DIR: ${{ runner.temp }}/paired-hermes-agent
+          PYTHONPATH: ${{ runner.temp }}/paired-hermes-agent
         run: pytest tests/ -v --timeout=60 --shard-id=${{ matrix.shard }} --num-shards=5

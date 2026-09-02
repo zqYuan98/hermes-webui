@@ -2549,6 +2549,31 @@ def get_provider_cost_history(provider_id: str | None = None, days: int = 7) -> 
 # SECTION: Public API
 
 
+def _provider_base_url_from_snapshot(config_snapshot: dict, provider_id: str) -> str | None:
+    """Resolve a provider URL from the same config snapshot used for the response.
+
+    Reading ``api.config.cfg`` again inside the provider loop can observe a
+    different generation when profile reload/plugin discovery runs concurrently,
+    producing a card whose provider list and base URL come from different homes.
+    """
+    providers = config_snapshot.get("providers") or {}
+    if isinstance(providers, dict):
+        provider_cfg = providers.get(provider_id) or {}
+        if isinstance(provider_cfg, dict):
+            explicit = str(provider_cfg.get("base_url") or "").strip().rstrip("/")
+            if explicit:
+                return explicit
+
+    model_cfg = config_snapshot.get("model") or {}
+    if isinstance(model_cfg, dict):
+        active_provider = str(model_cfg.get("provider") or "").strip().lower()
+        if active_provider == str(provider_id).strip().lower():
+            fallback = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+            if fallback:
+                return fallback
+    return None
+
+
 def get_providers(*, include_live: bool = True) -> dict[str, Any]:
     """Return known providers with local status and optional live enrichment.
 
@@ -2806,11 +2831,9 @@ def get_providers(*, include_live: bool = True) -> dict[str, Any]:
                     models_total = len(models)
 
         is_self_hosted = pid in _SELF_HOSTED_PROVIDER_IDS
-        try:
-            from api.config import _get_provider_base_url
-            provider_base_url = _get_provider_base_url(pid) if is_self_hosted else None
-        except Exception:
-            provider_base_url = None
+        provider_base_url = (
+            _provider_base_url_from_snapshot(cfg, pid) if is_self_hosted else None
+        )
         _is_plugin = is_plugin_model_provider(pid)
         providers.append({
             "id": pid,
